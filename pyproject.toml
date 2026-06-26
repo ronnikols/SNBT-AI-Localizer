@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snbt-ai-localizer"
+version = "1.0.0"
+description = "Advanced SNBT quest localizer using AI key pools"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "PyQt6>=6.4.0",
+    "httpx>=0.24.0",
+    "aiofiles>=23.1.0",
+]
+
+[project.scripts]
+snbt-tr = "main:main"
+
+[tool.setuptools]
+py-modules = ["config", "core", "gui", "main"]

@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+cache.sqlite
+*.bak
+.aider*
+*.log
+*.log
+litellm_config.yaml
+run.sh
+.pytest_cache/

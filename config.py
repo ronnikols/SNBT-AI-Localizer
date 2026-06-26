@@ -1,0 +1,276 @@
+import os
+import sys
+import argparse
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional
+
+try:
+    from PyQt6.QtCore import QSettings
+except ImportError:
+    QSettings = None
+
+PROVIDER_ALIASES = {
+    "google": "Google Translate (Free)",
+    "google_free": "Google Translate (Free)",
+    "gemini": "Google Gemini (Free API)",
+    "ollama": "Ollama (Local / Free)",
+    "groq": "Groq Cloud (Fast)",
+    "openrouter": "OpenRouter (Cloud AI)",
+    "nvidia": "NVIDIA NIM",
+    "nim": "NVIDIA NIM",
+    "sambanova": "Sambanova",
+    "mixed": "Mixed Providers",
+    "mix": "Mixed Providers",
+}
+
+PROVIDER_DEFAULTS = {
+    "Google Translate (Free)": None,
+    "Google Gemini (Free API)": "models/gemini-3.1-flash-lite",
+    "Ollama (Local / Free)": "qwen2.5:7b",
+    "Groq Cloud (Fast)": "llama-3.3-70b-versatile",
+    "OpenRouter (Cloud AI)": "google/gemma-4-31b:free",
+    "NVIDIA NIM": "nvidia/nemotron-4-340b-instruct",
+    "Sambanova": "Meta-Llama-3.1-8B-Instruct",
+}
+
+PROVIDER_ENDPOINTS = {
+    "Google Gemini (Free API)": "https://generativelanguage.googleapis.com/v1beta/openai/models",
+    "Groq Cloud (Fast)": "https://api.groq.com/openai/v1/models",
+    "OpenRouter (Cloud AI)": "https://openrouter.ai/api/v1/models",
+    "NVIDIA NIM": "https://integrate.api.nvidia.com/v1/models",
+    "Ollama (Local / Free)": "http://localhost:11434/v1/models",
+    "Sambanova": "https://api.sambanova.ai/v1/models",
+}
+
+LANG_ALIASES = {
+    "ru": ("Russian", "ru_ru"),
+    "en": ("English", "en_us"),
+    "es": ("Spanish", "es_es"),
+    "zh": ("Chinese Simplified", "zh_cn"),
+    "zh-cn": ("Chinese Simplified", "zh_cn"),
+    "zh-tw": ("Chinese Traditional", "zh_tw"),
+    "de": ("German", "de_de"),
+    "fr": ("French", "fr_fr"),
+    "pt": ("Portuguese", "pt_br"),
+    "pt-br": ("Portuguese", "pt_br"),
+    "ja": ("Japanese", "ja_jp"),
+    "ko": ("Korean", "ko_kr"),
+}
+
+ENV_KEY_MAP = {
+    "Google Gemini (Free API)": "GEMINI_API_KEY",
+    "Groq Cloud (Fast)": "GROQ_API_KEY",
+    "OpenRouter (Cloud AI)": "OPENROUTER_API_KEY",
+    "NVIDIA NIM": "NVIDIA_API_KEY",
+    "Sambanova": "SAMBANOVA_API_KEY",
+}
+
+SETTINGS_KEY_MAP = {
+    "Google Gemini (Free API)": "gemini_api_key",
+    "Groq Cloud (Fast)": "groq_api_key",
+    "OpenRouter (Cloud AI)": "openrouter_api_key",
+    "NVIDIA NIM": "nvidia_api_key",
+    "Sambanova": "sambanova_api_key",
+}
+
+class ConfigManager:
+    AVAILABLE_PROVIDERS = ["Groq Cloud (Fast)", "NVIDIA NIM", "OpenRouter (Cloud AI)"]
+
+    def __init__(self):
+        self.quest_dir: Optional[Path] = None
+        self.target_lang: str = "ru_ru"
+        self.concurrency: int = 3
+        self.provider: str = "Google Translate (Free)"
+        self.model: Optional[str] = None
+        self.custom_context: str = ""
+        self.policy: str = "Complement (Дополнить)"
+        self.api_keys_pool: Dict[str, List[str]] = {}
+
+        self.load_from_settings()
+
+    def _settings(self):
+        if QSettings is None:
+            return None
+        return QSettings("MineAI", "SNBT-Localizer")
+
+    def load_from_settings(self):
+        s = self._settings()
+        if s is None:
+            return
+
+        self.provider = s.value("provider", self.provider)
+        self.model = s.value("model", self.model)
+        self.target_lang = s.value("target_lang", self.target_lang)
+        self.concurrency = int(s.value("concurrency_limit", self.concurrency))
+        self.custom_context = s.value("custom_context", self.custom_context)
+        self.policy = s.value("policy", self.policy)
+
+        for prov in PROVIDER_ALIASES.values():
+            raw = s.value(f"api_keys_pool_{prov}", "")
+            if raw:
+                lines = [line.strip() for line in str(raw).splitlines() if line.strip()]
+                seen = set()
+                unique = []
+                for k in lines:
+                    if k not in seen:
+                        seen.add(k)
+                        unique.append(k)
+                self.api_keys_pool[prov] = unique[:10]
+            else:
+                self.api_keys_pool[prov] = []
+
+    def save_to_settings(self):
+        s = self._settings()
+        if s is None:
+            return
+
+        s.setValue("provider", self.provider)
+        s.setValue("model", self.model or "")
+        s.setValue("target_lang", self.target_lang)
+        s.setValue("concurrency_limit", self.concurrency)
+        s.setValue("custom_context", self.custom_context)
+        s.setValue("policy", self.policy)
+
+        for prov, keys in self.api_keys_pool.items():
+            s.setValue(f"api_keys_pool_{prov}", "\n".join(keys))
+
+    def parse_cli_args(self, args: Optional[List[str]] = None):
+        """Parse command-line arguments and override current config values."""
+        parser = argparse.ArgumentParser(prog='snbt-tr', add_help=False)
+        parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
+        parser.add_argument("-p", "--provider", help="Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova)")
+        parser.add_argument("-m", "--model", help="Model name (default: provider default)")
+        parser.add_argument("-k", "--key", help="API key(s), comma-separated (env/QSettings fallback)")
+        parser.add_argument("-l", "--lang", default="ru", help="Language code (default: ru)")
+        parser.add_argument("-d", "--dir", default=".", help="Path to quests directory (default: .)")
+        parser.add_argument("-c", "--context", default="", help="Custom translation context")
+        parser.add_argument("--policy", default="complement", choices=["complement", "overwrite", "skip"],
+                            help="Existing files policy: complement, overwrite, skip (default: complement)")
+        parser.add_argument("--concurrency", type=int, default=3,
+                            help="Number of parallel translation threads (1-10, default: 3)")
+        parser.add_argument("--list-models", action="store_true", help="List available models for provider and exit")
+        parser.add_argument("--fastdir", "--fd", action="store_true", help="Scan launcher paths for instances and exit")
+        parser.add_argument("--clear-cache", "--clear", action="store_true", help="Clear translation cache and exit")
+        parser.add_argument("--debug", action="store_true", help="Enable debug logging to console")
+
+        parsed = parser.parse_args(args)
+
+        if parsed.provider:
+            alias = parsed.provider.lower()
+            if alias in PROVIDER_ALIASES:
+                self.provider = PROVIDER_ALIASES[alias]
+            else:
+                logging.getLogger("snbt_localizer.cli").error(f"Unknown provider alias: {parsed.provider}")
+                sys.exit(1)
+
+        if parsed.model:
+            self.model = parsed.model
+
+        if parsed.lang:
+            lang_input = parsed.lang.lower()
+            if lang_input in LANG_ALIASES:
+                self.target_lang = LANG_ALIASES[lang_input][1]
+            else:
+                for alias, (name, code) in LANG_ALIASES.items():
+                    if lang_input == code or lang_input == name.lower():
+                        self.target_lang = code
+                        break
+                else:
+                    logging.getLogger("snbt_localizer.cli").error(f"Unknown language: {parsed.lang}")
+                    sys.exit(1)
+
+        if parsed.dir:
+            self.quest_dir = Path(parsed.dir)
+
+        if parsed.context:
+            self.custom_context = parsed.context
+
+        if parsed.policy:
+            mapping = {
+                "complement": "Complement (Дополнить)",
+                "overwrite": "Overwrite (Перезаписать)",
+                "skip": "Skip (Пропустить)",
+            }
+            self.policy = mapping.get(parsed.policy, "Complement (Дополнить)")
+
+        if parsed.concurrency:
+            self.concurrency = max(1, min(parsed.concurrency, 10))
+
+        if parsed.key:
+            keys = [k.strip() for k in parsed.key.split(",") if k.strip()]
+            seen = set()
+            unique = []
+            for k in keys:
+                if k not in seen:
+                    seen.add(k)
+                    unique.append(k)
+            self.api_keys_pool[self.provider] = unique[:10]
+
+        return parsed
+
+    def get_api_keys(self, provider: Optional[str] = None) -> List[str]:
+        """Return the list of API keys for the given provider (or current provider)."""
+        prov = provider or self.provider
+        return self.api_keys_pool.get(prov, [])
+
+    def set_api_keys(self, provider: str, keys: List[str]):
+        """Store a list of API keys for a provider (max 10)."""
+        seen = set()
+        unique = []
+        for k in keys:
+            k = k.strip()
+            if k and k not in seen:
+                seen.add(k)
+                unique.append(k)
+        self.api_keys_pool[provider] = unique[:10]
+
+    def smart_parse_key(self, entry: str) -> tuple[str, str]:
+        entry = entry.strip()
+        if "\\" in entry:
+            parts = entry.split("\\", 1)
+            key = parts[0].strip()
+            model = parts[1].strip() if parts[1].strip() else ""
+            if model:
+                return key, model
+            # Trailing backslash with no model - use key part for prefix detection
+            entry = key
+        
+        if entry.startswith("gsk_"):
+            return entry, "llama-3.3-70b-versatile"
+        if entry.startswith("nvapi-"):
+            return entry, "nvidia/nemotron-3-ultra"
+        if entry.startswith("sk-or-"):
+            return entry, "meta-llama/llama-3.3-70b-instruct:free"
+        
+        raise ValueError(f"Unknown key format or provider prefix: {entry[:10]}...")
+
+    def get_all_available_keys(self) -> list[tuple[str, str, str]]:
+        result = []
+        for provider in self.AVAILABLE_PROVIDERS:
+            keys = self.get_api_keys(provider)
+            if not keys:
+                continue
+            
+            saved_model = ""
+            if QSettings is not None:
+                settings = QSettings("MineAI", "SNBT-Localizer")
+                saved_model = settings.value(f"model_{provider}", "") or ""
+            
+            default_model = PROVIDER_DEFAULTS.get(provider, "")
+            model = saved_model if saved_model else default_model
+            
+            for key in keys:
+                result.append((provider, key, model))
+        
+        return result
+
+    def resolve_language(self, lang_input: str) -> tuple:
+        """Return (lang_name, lang_code) for a given input string."""
+        lang_input = lang_input.lower()
+        if lang_input in LANG_ALIASES:
+            return LANG_ALIASES[lang_input]
+        for alias, (name, code) in LANG_ALIASES.items():
+            if lang_input == code or lang_input == name.lower():
+                return (name, code)
+        raise ValueError(f"Unknown language: {lang_input}")
