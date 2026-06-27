@@ -119,6 +119,10 @@ class ConfigManager:
 
         self.provider = s.value("provider", self.provider)
         self.model = s.value("model", self.model)
+        if self.provider and self.provider != "Mixed Providers":
+            provider_model = s.value(f"model_{self.provider}", "")
+            if provider_model:
+                self.model = provider_model
         self.target_lang = s.value("target_lang", self.target_lang)
         self.concurrency = int(s.value("concurrency_limit", self.concurrency))
         self.custom_context = s.value("custom_context", self.custom_context)
@@ -145,6 +149,8 @@ class ConfigManager:
 
         s.setValue("provider", self.provider)
         s.setValue("model", self.model or "")
+        if self.provider and self.provider != "Mixed Providers":
+            s.setValue(f"model_{self.provider}", self.model or "")
         s.setValue("target_lang", self.target_lang)
         s.setValue("concurrency_limit", self.concurrency)
         s.setValue("custom_context", self.custom_context)
@@ -152,6 +158,7 @@ class ConfigManager:
 
         for prov, keys in self.api_keys_pool.items():
             s.setValue(f"api_keys_pool_{prov}", "\n".join(keys))
+        s.sync()
 
     def parse_cli_args(self, args: Optional[List[str]] = None):
         """Parse command-line arguments and override current config values."""
@@ -171,6 +178,8 @@ class ConfigManager:
         parser.add_argument("--fastdir", "--fd", action="store_true", help="Scan launcher paths for instances and exit")
         parser.add_argument("--clear-cache", "--clear", action="store_true", help="Clear translation cache and exit")
         parser.add_argument("--debug", action="store_true", help="Enable debug logging to console")
+        parser.add_argument('--mix', action='store_true', help='Enable Mixed Provider mode using QSettings key pool')
+        parser.add_argument('--gui', action='store_true', help='Launch Graphical User Interface (GUI)')
 
         parsed = parser.parse_args(args)
 
@@ -181,6 +190,9 @@ class ConfigManager:
             else:
                 logging.getLogger("snbt_localizer.cli").error(f"Unknown provider alias: {parsed.provider}")
                 sys.exit(1)
+
+        if parsed.mix:
+            self.provider = "Mixed Providers"
 
         if parsed.model:
             self.model = parsed.model

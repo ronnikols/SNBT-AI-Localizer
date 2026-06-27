@@ -1337,10 +1337,10 @@ class App(QMainWindow):
             self.settings.setValue("geometry", self.saveGeometry())
             event.accept()
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
-    
+
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.ColorRole.Window, QColor("#111216"))
     dark_palette.setColor(QPalette.ColorRole.WindowText, QColor("#e3e6ed"))
@@ -1349,22 +1349,25 @@ if __name__ == "__main__":
     dark_palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#171920"))
     dark_palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#e3e6ed"))
     dark_palette.setColor(QPalette.ColorRole.Text, QColor("#f2f4f8"))
-    
+
     dark_palette.setColor(QPalette.ColorRole.Button, QColor("#171920"))
     dark_palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e3e6ed"))
-    
+
     dark_palette.setColor(QPalette.ColorRole.BrightText, QColor("white"))
     dark_palette.setColor(QPalette.ColorRole.Link, QColor("#4a8df8"))
     dark_palette.setColor(QPalette.ColorRole.Highlight, QColor("#306fcb"))
     dark_palette.setColor(QPalette.ColorRole.HighlightedText, QColor("white"))
-    
+
     dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#4b5263"))
     dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#4b5263"))
     dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#4b5263"))
     dark_palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, QColor("#14151a"))
-    
+
     app.setPalette(dark_palette)
-    
+
     ex = App()
     ex.show()
     sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

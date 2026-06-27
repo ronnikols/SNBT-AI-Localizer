@@ -5,12 +5,14 @@ import httpx
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
-from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator
+from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider
 from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_DEFAULTS, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
 try:
     from PyQt6.QtCore import QSettings
 except ImportError:
     QSettings = None
+
+SERVICE_MODEL_KEYWORDS = {"orpheus", "tts", "whisper", "embed", "moderation", "safety", "guard", "reward"}
 
 def setup_logging(debug=False):
     """Configure logging for the CLI application."""
@@ -177,6 +179,7 @@ def save_cli_setting(key: str, value: str):
     settings = get_cli_settings()
     if settings:
         settings.setValue(key, value)
+        settings.sync()
 
 def load_cli_setting(key: str, default: str = "") -> str:
     settings = get_cli_settings()
@@ -185,7 +188,7 @@ def load_cli_setting(key: str, default: str = "") -> str:
         return str(val) if val else default
     return default
 
-async def run_setup_wizard() -> tuple[Path, str, str | None, str | None, str, str]:
+async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None, str | None, str, str]:
     print("\n=== SNBT AI Localizer - Setup Wizard ===\n")
 
     print("Step 1: Select modpack instance")
@@ -276,6 +279,18 @@ async def run_setup_wizard() -> tuple[Path, str, str | None, str | None, str, st
 
     print(f"\nSelected: {provider}\n")
 
+    if provider == "Mixed Providers":
+        save_cli_setting("cli_last_provider", provider)
+        result = await run_mix_setup_wizard(config)
+        if result is None:
+            die("Mixed mode setup cancelled")
+        quest_dir, lang_name, lang_code = result
+        config.provider = provider
+        config.target_lang = lang_code
+        config.quest_dir = quest_dir
+        config.save_to_settings()
+        return quest_dir, provider, None, None, lang_name, lang_code
+
     print("Step 3: API Key")
     api_key = None
     if provider not in ("Google Translate (Free)", "Ollama (Local / Free)"):
@@ -286,11 +301,11 @@ async def run_setup_wizard() -> tuple[Path, str, str | None, str | None, str, st
             user_key = input(f"Use saved key [{masked}]: ").strip()
             if user_key:
                 api_key = user_key
-                settings_key = SETTINGS_KEY_MAP.get(provider)
-                if settings_key:
-                    save_cli_setting(settings_key, api_key)
             else:
                 api_key = env_key
+            settings_key = SETTINGS_KEY_MAP.get(provider)
+            if settings_key and api_key:
+                save_cli_setting(settings_key, api_key)
         else:
             while True:
                 api_key = input("API Key: ").strip()
@@ -309,7 +324,7 @@ async def run_setup_wizard() -> tuple[Path, str, str | None, str | None, str, st
             for i in range(len(models)):
                 if "gemini-3.1-flash-lite" in models[i] and not models[i].endswith(" [RECOMMENDED]"):
                     models[i] = models[i] + " [RECOMMENDED]"
-        last_model = load_cli_setting("cli_last_model", "")
+        last_model = load_cli_setting(f"cli_last_model_{provider}", "")
         default_model = PROVIDER_DEFAULTS.get(provider)
         
         def sort_key(m):
@@ -340,7 +355,7 @@ async def run_setup_wizard() -> tuple[Path, str, str | None, str | None, str, st
                 if 0 <= idx < len(models):
                     model = models[idx]
                     model = model.replace(" [RECOMMENDED]", "")
-                    save_cli_setting("cli_last_model", model)
+                    save_cli_setting(f"cli_last_model_{provider}", model)
                     break
             except ValueError:
                 if choice.lower() == "all":
@@ -391,7 +406,171 @@ async def run_setup_wizard() -> tuple[Path, str, str | None, str | None, str, st
     print(f"\nSelected: {lang_name} ({lang_code})\n")
     print("Starting translation...\n")
 
+    config.provider = provider
+    config.model = model
+    config.target_lang = lang_code
+    config.quest_dir = quest_dir
+    config.custom_context = ""
+    config.policy = "Complement (Дополнить)"
+    if api_key:
+        config.set_api_keys(provider, [api_key])
+    config.save_to_settings()
     return quest_dir, provider, api_key, model, lang_name, lang_code
+
+async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] | None:
+    print("\n=== SNBT AI Localizer - Mixed Mode Setup ===\n")
+
+    launcher_paths = get_launcher_paths()
+    instances = []
+    for base, launcher_name in launcher_paths:
+        if not base.exists():
+            continue
+        try:
+            for sub in base.iterdir():
+                if sub.is_dir():
+                    quests_path = sub / "config" / "ftbquests" / "quests"
+                    if not quests_path.exists():
+                        quests_path = sub / "minecraft" / "config" / "ftbquests" / "quests"
+                    if quests_path.exists() and quests_path.is_dir():
+                        instances.append((sub.name, str(sub), launcher_name))
+        except Exception:
+            pass
+
+    if not instances:
+        print("No modpack instances with FTB Quests found.")
+        custom_path = input("Enter path to modpack manually: ").strip()
+        if not custom_path:
+            return None
+        quest_dir = normalize_path(custom_path)
+    else:
+        last_instance = load_cli_setting("cli_last_instance", "")
+        default_idx = 0
+        if last_instance:
+            for i, (_, path, _) in enumerate(instances):
+                if path == last_instance:
+                    instances.insert(0, instances.pop(i))
+                    default_idx = 0
+                    break
+
+        print("Found instances:")
+        for i, (name, path, launcher) in enumerate(instances):
+            marker = " (last used)" if i == 0 and last_instance else ""
+            print(f"  {i + 1}) {name} [{launcher}]{marker}")
+        print(f"  {len(instances) + 1}) Enter path manually...")
+
+        while True:
+            choice = input(f"Choice [{default_idx + 1}]: ").strip()
+            choice = choice or str(default_idx + 1)
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(instances):
+                    quest_dir = Path(instances[idx][1])
+                    save_cli_setting("cli_last_instance", str(quest_dir))
+                    break
+                elif idx == len(instances):
+                    custom_path = input("Enter path to modpack: ").strip()
+                    if not custom_path:
+                        continue
+                    quest_dir = normalize_path(custom_path)
+                    save_cli_setting("cli_last_instance", str(quest_dir))
+                    break
+            except ValueError:
+                pass
+            print("Invalid choice")
+
+    print(f"\nSelected: {quest_dir}\n")
+
+    providers = [p for p in dict.fromkeys(PROVIDER_ALIASES.values()) if p != "Mixed Providers"]
+    print("Select providers for Mixed mode (enter numbers separated by space, or press Enter to use saved keys):")
+    for i, p in enumerate(providers, 1):
+        print(f"  {i}) {p}")
+
+    choice = input("Choice: ").strip()
+    if choice:
+        selected_indices = []
+        for part in choice.split():
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(providers):
+                    selected_indices.append(idx)
+            except:
+                pass
+        if not selected_indices:
+            print("No valid providers selected.")
+            return None
+        selected_providers = [providers[i] for i in selected_indices]
+        settings = QSettings("MineAI", "SNBT-Localizer")
+        settings.setValue("mixed_providers", selected_providers)
+        settings.sync()
+
+        for prov in selected_providers:
+            api_key = load_key_from_env_or_settings(prov)
+            if not api_key:
+                api_key = input(f"API Key for {prov}: ").strip()
+                if api_key:
+                    settings_key = SETTINGS_KEY_MAP.get(prov, f"{prov}_api_key")
+                    save_cli_setting(settings_key, api_key)
+                    config.set_api_keys(prov, [api_key])
+                else:
+                    print(f"Skipping {prov} - no API key provided.")
+                    continue
+
+            models = await fetch_models(prov, api_key)
+            if models:
+                print(f"\nSelect model for {prov}:")
+                for i, m in enumerate(models, 1):
+                    print(f"  {i}) {m}")
+                model_choice = input("Choice [1]: ").strip() or "1"
+                try:
+                    model_idx = int(model_choice) - 1
+                    model = models[model_idx] if 0 <= model_idx < len(models) else PROVIDER_DEFAULTS.get(prov, "")
+                except:
+                    model = PROVIDER_DEFAULTS.get(prov, "")
+            else:
+                model = PROVIDER_DEFAULTS.get(prov, "")
+            save_cli_setting(f"cli_last_model_{prov}", model)
+
+    seen_codes = set()
+    unique_langs = []
+    for alias, (name, code) in LANG_ALIASES.items():
+        if code not in seen_codes:
+            seen_codes.add(code)
+            unique_langs.append((alias, (name, code)))
+
+    langs = unique_langs
+    last_lang = load_cli_setting("cli_last_lang", "")
+    default_idx = 0
+    if last_lang:
+        for i, (_, (name, code)) in enumerate(langs):
+            if code == last_lang or name == last_lang:
+                default_idx = i
+                break
+
+    print("Available languages:")
+    for i, (alias, (name, code)) in enumerate(langs):
+        marker = " (last used)" if i == default_idx else ""
+        print(f"  {i + 1}) {name} ({code}){marker}")
+
+    while True:
+        choice = input(f"Choice [{default_idx + 1}]: ").strip()
+        choice = choice or str(default_idx + 1)
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(langs):
+                lang_name, lang_code = langs[idx][1]
+                save_cli_setting("cli_last_lang", lang_code)
+                break
+        except ValueError:
+            pass
+        print("Invalid choice")
+
+    print(f"\nSelected: {lang_name} ({lang_code})\n")
+    print("Starting translation...\n")
+    config.provider = "Mixed Providers"
+    config.target_lang = lang_code
+    config.quest_dir = quest_dir
+    config.save_to_settings()
+    return quest_dir, lang_name, lang_code
 
 def die(msg: str, code: int = 1) -> None:
     try:
@@ -464,7 +643,8 @@ async def fetch_models(provider: str, api_key: str | None) -> list[str]:
             resp = await client.get(endpoint, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
-                return [m["id"] for m in data.get("data", [])]
+                models = [m["id"] for m in data.get("data", [])]
+                return [m for m in models if not any(kw in m.lower() for kw in SERVICE_MODEL_KEYWORDS)]
     except Exception:
         pass
     return []
@@ -621,35 +801,44 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         logging.getLogger("snbt_localizer.cli").info("API Keys: Not Set")
 
     limit = concurrency if concurrency is not None else config.concurrency
-    first_key = api_keys[0] if api_keys else ""
-    m = SNBTManager(first_key, provider, model or "", config.custom_context, lang_name, lang_code, concurrency_limit=limit)
-
-    mixed_pool = None
+    mixed_pool = []
     if provider == "Mixed Providers":
         pairs = parse_key_model_pairs(api_keys)
+        all_providers = ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI"]
+        if QSettings is not None:
+            settings = QSettings("MineAI", "SNBT-Localizer")
+            selected_providers = set(settings.value("mixed_providers", []))
+        else:
+            selected_providers = set()
+        if not selected_providers:
+            selected_providers = set(all_providers)
         saved_keys_by_provider = {}
         saved_models_by_provider = {}
         default_models_by_provider = {}
-        for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)"]:
-            saved_keys_by_provider[p] = config.get_api_keys(p)
-            if QSettings is not None:
-                settings = QSettings("MineAI", "SNBT-Localizer")
-                saved_models_by_provider[p] = settings.value(f"model_{p}", "")
-            else:
-                saved_models_by_provider[p] = ""
-            default_models_by_provider[p] = PROVIDER_DEFAULTS.get(p, "")
-        
+        for p in all_providers:
+            if p in selected_providers:
+                saved_keys_by_provider[p] = config.get_api_keys(p)
+                if QSettings is not None:
+                    settings = QSettings("MineAI", "SNBT-Localizer")
+                    saved_models_by_provider[p] = settings.value(f"model_{p}", "")
+                else:
+                    saved_models_by_provider[p] = ""
+                default_models_by_provider[p] = PROVIDER_DEFAULTS.get(p, "")
+
         from core import resolve_mixed_pool
         mixed_pool = resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider)
         
         if not mixed_pool:
             logging.getLogger("snbt_localizer.cli").error("No API keys available for Mixed Providers. Configure keys for other providers first.")
             return 1
-        
-        api_keys = [item["api_key"] for item in mixed_pool]
-    
-    m.translator = UnifiedTranslator(api_keys, provider, model or "", config.custom_context, lang_name, lang_code, mixed_pool=mixed_pool)
-    target_dir = m.find_quests_dir(quest_dir)
+    else:
+        if api_keys:
+            for key in api_keys:
+                base = get_base_url(provider)
+                mixed_pool.append({"provider": provider, "api_key": key, "model": model or "", "base_url": base})
+
+    translator = UnifiedTranslator(api_keys, provider, model or "", config.custom_context, lang_name, lang_code, mixed_pool=mixed_pool)
+    target_dir = SNBTManager("", "", "").find_quests_dir(quest_dir)
     files = [p for p in target_dir.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
     if not files:
         logging.getLogger("snbt_localizer.cli").warning("No .snbt files found")
@@ -660,8 +849,7 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     )
     logging.getLogger("snbt_localizer.cli").info(f"Found {total_files} files")
     policy = resolve_policy(config.policy)
-    current_file_idx = 0
-    current_chunk_progress = 0.0
+    file_progress = {idx: 0.0 for idx in range(total_files)}
 
     def log_with_bar(msg):
         nonlocal first_file
@@ -671,29 +859,58 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         else:
             first_file = False
         print(msg)
-        overall = current_file_idx + current_chunk_progress
+        overall = sum(file_progress.values())
         render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
 
-    def file_progress_callback(chunk_idx, total_chunks):
-        nonlocal current_chunk_progress
-        if total_chunks > 0:
-            current_chunk_progress = chunk_idx / total_chunks
-        else:
-            current_chunk_progress = 0.0
-        overall = current_file_idx + current_chunk_progress
-        render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
+    def make_file_progress_callback(idx):
+        def callback(chunk_idx, total_chunks):
+            if total_chunks > 0:
+                file_progress[idx] = chunk_idx / total_chunks
+            else:
+                file_progress[idx] = 0.0
+            overall = sum(file_progress.values())
+            render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
+        return callback
 
+    semaphore = asyncio.Semaphore(concurrency) if concurrency else asyncio.Semaphore(1)
+
+    async def process_single_file(idx, f):
+        async with semaphore:
+            while True:
+                try:
+                    local_manager = SNBTManager(
+                        "",
+                        provider,
+                        model or "",
+                        config.custom_context,
+                        lang_name,
+                        lang_code,
+                        concurrency_limit=1,
+                        translator=translator
+                    )
+                    log_with_bar(f"Processing: {f.name}")
+                    file_callback = make_file_progress_callback(idx)
+                    await local_manager.process_file(f, True, True, True, log_with_bar, None, policy, progress_callback=file_callback)
+                    file_progress[idx] = 1.0
+                    overall = sum(file_progress.values())
+                    render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    break
+                except (AbortException, ValueError):
+                    if not translator.mixed_pool:
+                        raise
+                    continue
+                except Exception:
+                    raise
+
+    tasks = [process_single_file(idx, f) for idx, f in enumerate(files)]
     first_file = True
-    for idx, f in enumerate(files):
-        current_file_idx = idx
-        current_chunk_progress = 0.0
-        log_with_bar(f"Processing: {f.name}")
-        await m.process_file(f, True, True, True, log_with_bar, None, policy, progress_callback=file_progress_callback)
-        current_chunk_progress = 1.0
-        overall = current_file_idx + current_chunk_progress
-        render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
-        sys.stdout.write('\n')
-        sys.stdout.flush()
+    try:
+        await asyncio.gather(*tasks)
+    except (AbortException, ValueError):
+        logging.getLogger("snbt_localizer.cli").error("Критическая ошибка: все ключи невалидны. Перевод прерван.")
+        return 1
     sys.stdout.write('\n')
     sys.stdout.flush()
     logging.getLogger("snbt_localizer.cli").info("Finished.")
@@ -703,20 +920,41 @@ async def main_async() -> int:
     config = ConfigManager()
     parsed = config.parse_cli_args()
     setup_logging(debug=parsed.debug)
+
+    if parsed.gui:
+        from gui import main as gui_main
+        gui_main()
+        return 0
     cli_logger = logging.getLogger("snbt_localizer.cli")
     
-    if len(sys.argv) == 1:
-        quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard()
-        config.provider = provider
-        config.model = model
-        config.target_lang = lang_code
-        config.quest_dir = quest_dir
-        config.custom_context = ""
-        config.policy = "Complement (Дополнить)"
-        config.set_api_keys(provider, [api_key] if api_key else [])
-        config.save_to_settings()
-        api_keys = config.get_api_keys()
-        concurrency = max(1, min(config.concurrency, 10))
+    if len(sys.argv) == 1 or (len(sys.argv) == 2 and parsed.mix):
+        if parsed.mix:
+            result = await run_mix_setup_wizard(config)
+            if result is None:
+                return 1
+            quest_dir, lang_name, lang_code = result
+            provider = "Mixed Providers"
+            model = None
+            api_keys = []
+            config.provider = provider
+            config.target_lang = lang_code
+            config.quest_dir = quest_dir
+            config.custom_context = ""
+            config.policy = "Complement (Дополнить)"
+            config.save_to_settings()
+        else:
+            quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config)
+            if config.provider == "Mixed Providers":
+                api_keys = []
+                for prov in config.api_keys_pool:
+                    api_keys.extend(config.api_keys_pool[prov])
+            else:
+                api_keys = config.get_api_keys()
+            config.save_to_settings()
+        if parsed.mix:
+            concurrency = max(config.concurrency, len(api_keys), 5)
+        else:
+            concurrency = max(1, min(config.concurrency, 10))
         return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
     
     if parsed.clear_cache:
@@ -727,8 +965,8 @@ async def main_async() -> int:
                 return 0
         cache = TranslationCache()
         cache.clear_all()
-        logging.getLogger("snbt_localizer.cli").info("Translation cache cleared successfully.")
-        return 0
+        print("Кэш переводов SQLite успешно очищен.")
+        sys.exit(0)
 
     if parsed.fastdir:
         quest_dir = cmd_fastdir()
@@ -736,8 +974,23 @@ async def main_async() -> int:
             logging.getLogger("snbt_localizer.cli").warning("No instance selected. Exiting.")
             return 1
 
+        if parsed.mix:
+            provider = "Mixed Providers"
+            model = None
+            api_keys = []
+            lang_name, lang_code = config.resolve_language(config.target_lang)
+            if not lang_name:
+                lang_name, lang_code = "Russian", "ru_ru"
+            concurrency = max(config.concurrency, len(api_keys), 5)
+            return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
+
         provider = config.provider
-        api_keys = config.get_api_keys()
+        if config.provider == "Mixed Providers":
+            api_keys = []
+            for prov in config.api_keys_pool:
+                api_keys.extend(config.api_keys_pool[prov])
+        else:
+            api_keys = config.get_api_keys()
         model = config.model
         lang_name, lang_code = config.resolve_language(config.target_lang)
 
@@ -750,33 +1003,41 @@ async def main_async() -> int:
             need_wizard = True
 
         if need_wizard and is_interactive():
-            quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard()
-            config.provider = provider
-            config.model = model
-            config.target_lang = lang_code
-            config.quest_dir = quest_dir
-            config.custom_context = ""
-            config.policy = "Complement (Дополнить)"
-            config.set_api_keys(provider, [api_key] if api_key else [])
-            config.save_to_settings()
+            quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config)
+            if config.provider == "Mixed Providers":
+                api_keys = []
+                for prov in config.api_keys_pool:
+                    api_keys.extend(config.api_keys_pool[prov])
+            else:
+                api_keys = config.get_api_keys()
         else:
             if not provider:
                 provider = config.provider
-            if not api_keys:
-                api_keys = config.get_api_keys()
             if not model and provider != "Google Translate (Free)":
                 model = config.model
             if not lang_name:
                 lang_name, lang_code = config.resolve_language(config.target_lang)
 
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir)
+        if provider == "Mixed Providers":
+            concurrency = max(config.concurrency, len(api_keys), 5)
+        else:
+            concurrency = max(1, min(config.concurrency, 10))
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
     else:
         quest_dir = normalize_path(parsed.dir)
         provider = config.provider
-        api_keys = config.get_api_keys()
+        if config.provider == "Mixed Providers":
+            api_keys = []
+            for prov in config.api_keys_pool:
+                api_keys.extend(config.api_keys_pool[prov])
+        else:
+            api_keys = config.get_api_keys()
         model = config.model
         lang_name, lang_code = config.resolve_language(config.target_lang)
-        concurrency = max(1, min(config.concurrency, 10))
+        if provider == "Mixed Providers":
+            concurrency = max(config.concurrency, len(api_keys), 5)
+        else:
+            concurrency = max(1, min(config.concurrency, 10))
         return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
 
 def main() -> None:

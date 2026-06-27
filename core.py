@@ -11,6 +11,7 @@ import aiofiles
 import logging
 from pathlib import Path
 from typing import List, Dict
+from config import PROVIDER_DEFAULTS
 
 logger = logging.getLogger("snbt_localizer.core")
 
@@ -140,6 +141,8 @@ class TranslationCache:
             self.conn.commit()
             self.conn.execute("VACUUM")
             self.conn.commit()
+            self.conn.execute("VACUUM")
+            self.conn.commit()
 
     def clear_all(self):
         with self.lock:
@@ -148,6 +151,8 @@ class TranslationCache:
             tables = cursor.fetchall()
             for (table_name,) in tables:
                 self.conn.execute(f"DELETE FROM {table_name}")
+            self.conn.commit()
+            self.conn.execute("VACUUM")
             self.conn.commit()
             self.conn.execute("VACUUM")
             self.conn.commit()
@@ -192,24 +197,9 @@ def detect_provider(api_key: str, model_name: str = "") -> str:
     return None
 
 def get_default_model(provider: str) -> str:
-    if not provider or not isinstance(provider, str): return "gpt-4o-mini"
-    if "Groq" in provider:
-        return "llama-3.3-70b-versatile"
-    if "Gemini" in provider:
-        return "gemini-2.5-flash"
-    if "NVIDIA NIM" in provider:
-        return "meta/llama-3.1-70b-instruct"
-    if "OpenRouter" in provider:
-        return "meta-llama/llama-3.3-70b-instruct:free"
-    if "Sambanova" in provider:
-        return "Meta-Llama-3.1-8B-Instruct"
-    if "Ollama" in provider:
-        return "qwen2.5:7b"
-    if "OpenAI" in provider:
+    if not provider or not isinstance(provider, str):
         return "gpt-4o-mini"
-    if "Mistral" in provider:
-        return "mistral-large-latest"
-    return "gpt-4o-mini"
+    return PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
 
 def get_base_url(provider: str) -> str:
     if not provider or not isinstance(provider, str): return "https://api.openai.com/v1"
@@ -290,7 +280,8 @@ class UnifiedTranslator:
         self.api_keys = cleaned
         self.api_key = cleaned[0] if cleaned else ""
         self.provider = provider
-        if not model or model in ["Enter API Key to load models", "Loading live models...", "None (Free Engine)", "Defined per key in pool", "N/A"]:
+        model_lower = model.lower() if model else ""
+        if not model or any(kw.lower() in model_lower for kw in ["enter api key", "loading", "n/a", "none"]):
             model = get_default_model(provider)
         self.model = model
         self.target_lang_code = target_lang_code
@@ -298,7 +289,9 @@ class UnifiedTranslator:
         self.timeout = 180.0 if "Ollama" in provider else 30.0
         self.key_index = 0
         self.key_cooldown_until = {}
+        self.key_backoff = {}
         self.mixed_pool = []
+        self.pool_lock = asyncio.Lock()
         if not model:
             model = get_default_model(provider)
         if provider == "Mixed Providers":
@@ -421,8 +414,11 @@ class UnifiedTranslator:
                         async with httpx.AsyncClient(timeout=self.timeout) as client:
                             resp = await client.post(url, headers=headers, json=payload)
                             if resp.status_code == 429 or resp.status_code >= 500:
-                                self.key_cooldown_until[entry["api_key"]] = now + 150.0
-                                logging.getLogger("snbt_localizer.core").warning(f"Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Cooldown 150s.")
+                                current_backoff = self.key_backoff.get(entry["api_key"], 0)
+                                delay = 0.2 * (2 ** current_backoff)
+                                self.key_cooldown_until[entry["api_key"]] = now + delay
+                                self.key_backoff[entry["api_key"]] = current_backoff + 1
+                                logging.getLogger("snbt_localizer.core").warning(f"Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Backoff: {delay:.1f}s.")
                                 tried += 1
                                 continue
                             resp.raise_for_status()
@@ -436,6 +432,7 @@ class UnifiedTranslator:
                             parsed_res = extract_json_array(content)
                             if isinstance(parsed_res, list) and len(parsed_res) == len(texts):
                                 res = parsed_res
+                                self.key_backoff[entry["api_key"]] = 0
                                 break
                             else:
                                 logging.getLogger("snbt_localizer.core").warning(f"API Format Error (Attempt {attempt+1}/{max_attempts}). Array mismatch.")
@@ -461,11 +458,20 @@ class UnifiedTranslator:
                                 f"HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix})"
                             )
                         if status in (401, 403):
-                            self.mixed_pool.pop(idx)
-                            self.key_index = 0
-                            pool_size = len(self.mixed_pool)
-                            if pool_size == 0:
-                                raise AbortException("All API keys failed with 401/403.")
+                            async with self.pool_lock:
+                                if entry in self.mixed_pool:
+                                    self.mixed_pool.remove(entry)
+                                self.key_index = 0
+                                if not self.mixed_pool:
+                                    raise AbortException("All API keys failed with 401/403.")
+                            continue
+                        elif status == 429:
+                            current_backoff = self.key_backoff.get(entry["api_key"], 0)
+                            delay = 0.2 * (2 ** current_backoff)
+                            self.key_cooldown_until[entry["api_key"]] = now + delay
+                            self.key_backoff[entry["api_key"]] = current_backoff + 1
+                            logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
+                            tried += 1
                             continue
                         break
                     except Exception as e:
@@ -496,12 +502,8 @@ class UnifiedTranslator:
                             if remaining > 0 and (min_cooldown is None or remaining < min_cooldown):
                                 min_cooldown = remaining
                     wait = max(min_cooldown or 2.0, 2.0)
-                    await countdown_sleep(
-                        int(wait),
-                        "All keys exhausted or in cooldown",
-                        logging.getLogger("snbt_localizer.core").warning,
-                        check_status
-                    )
+                    logging.getLogger("snbt_localizer.core").warning(f"All keys exhausted or in cooldown. Sleeping for {int(wait)}s...")
+                    await asyncio.sleep(wait)
 
             if res is None:
                 raise ValueError("Failed to translate chunk as a valid JSON array of correct length.")
@@ -514,15 +516,18 @@ class UnifiedTranslator:
         return restored_res
 
 class SNBTManager:
-    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None):
+    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None):
         self.cache = TranslationCache(target_lang_code=target_lang_code)
         self.target_lang_code = target_lang_code
         self.provider = provider
         self.skip_mode = (api_key == "SKIP")
         self.concurrency_limit = max(1, min(concurrency_limit, 10))
         self.is_aborted = False
-        keys = [api_key] if api_key and api_key != "SKIP" else []
-        self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool)
+        if translator is not None:
+            self.translator = translator
+        else:
+            keys = [api_key] if api_key and api_key != "SKIP" else []
+            self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool)
 
     def close(self):
         self.cache.close()
@@ -669,6 +674,8 @@ class SNBTManager:
                 try:
                     res = await self.translator.translate(chunk_to_send, logger, check_status)
                     new_map = dict(zip(chunk_to_send, res))
+                except (AbortException, ValueError):
+                    raise
                 except Exception as e:
                     logger(f"Chunk failed ({repr(e)}). Activating instant 1-by-1 fallback...")
                     logging.getLogger("snbt_localizer.core").error(f"Chunk failed ({repr(e)}). Activating instant 1-by-1 fallback...")
@@ -678,6 +685,8 @@ class SNBTManager:
                         try:
                             res_single = await self.translator.translate([item], logger, check_status)
                             new_map[item] = res_single[0]
+                        except (AbortException, ValueError):
+                            raise
                         except Exception:
                             new_map[item] = item
                             
@@ -686,7 +695,12 @@ class SNBTManager:
                 
                 for orig, trans in new_map.items():
                     if orig != trans:
-                        logger(f"Translated: \"{orig[:40]}...\" -> \"{trans[:40]}...\"")
+                        provider_name = self.translator.provider
+                        model_name = self.translator.model
+                        if self.translator.mixed_pool:
+                            provider_name = "Mixed"
+                            model_name = "Multiple"
+                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig[:40]}...\" -> \"{trans[:40]}...\"")
                 
                 if "Ollama" not in self.provider and "Google Translate" not in self.provider:
                     next_chunk = to_trans[i+chunk_size:i+chunk_size*2]
