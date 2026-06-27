@@ -157,70 +157,42 @@ class TranslationCache:
 
 class GoogleFreeTranslator:
     async def translate(self, texts: List[str], target_lang_code: str = "ru_ru") -> List[str]:
-        if "Google Translate" in self.provider:
-            return await self.free_google.translate(texts, target_lang_code)
-        import json, time, httpx, re
-        payload = {
-            "model": "",
-            "messages": [
-                {"role": "system", "content": self.prompt},
-                {"role": "user", "content": json.dumps(texts, ensure_ascii=False)}
-            ],
-            "response_format": {"type": "json_object"}
-        }
-        max_attempts = len(self.mixed_pool) * 2
-        for attempt in range(max_attempts):
-            if not self.mixed_pool:
-                raise Exception("No active API keys left in the pool")
-            idx = self.key_index % len(self.mixed_pool)
-            self.key_index += 1
-            entry = self.mixed_pool[idx]
-            now = time.time()
-            if entry["api_key"] in self.key_cooldown_until and now < self.key_cooldown_until[entry["api_key"]]:
-                continue
-            url = f"{entry['base_url']}/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {entry['api_key']}"
-            }
-            payload["model"] = entry["model"]
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.post(url, headers=headers, json=payload)
-                    if resp.status_code in [401, 403]:
-                        self.mixed_pool.pop(idx)
-                        self.key_index = 0
-                        continue
-                    if resp.status_code == 429 or resp.status_code >= 500:
-                        self.key_cooldown_until[entry["api_key"]] = now + 15.0
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"]
-                    if "<think>" in content:
-                        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
-                    result = json.loads(content)
-                    if isinstance(result, dict):
-                        for k, v in result.items():
-                            if isinstance(v, list):
-                                result = v
-                                break
-                    if isinstance(result, list):
-                        return result
-            except Exception:
-                self.key_cooldown_until[entry["api_key"]] = now + 15.0
-                continue
-        raise Exception("Failed to translate after maximum attempts")
+        import httpx
+        import urllib.parse
+        import json
+        try:
+            lang = target_lang_code.split('_')[0]
+            query = urllib.parse.quote(json.dumps(texts, ensure_ascii=False))
+            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={lang}&dt=t&q={query}"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list) and len(data[0]) > 0:
+                    return [item[0] for item in data[0]]
+                return texts
+        except Exception as e:
+            logging.getLogger("snbt_localizer.core").error(f"Google Translate Error: {repr(e)}")
+            return texts
 def detect_provider(api_key: str, model_name: str = "") -> str:
     if api_key.startswith("gsk_"):
-        return "Groq"
+        return "Groq Cloud (Fast)"
     if api_key.startswith("nvapi-"):
         return "NVIDIA NIM"
+    if api_key.startswith("sk-or-"):
+        return "OpenRouter (Cloud AI)"
     if api_key.startswith("AIza") or api_key.startswith("AQ."):
-        return "Gemini"
-    return "OpenAI"
+        return "Google Gemini (Free API)"
+    if api_key.startswith("sn-") or (len(api_key) == 36 and api_key.count('-') == 4):
+        return "Sambanova"
+    if len(api_key) == 32 and api_key.isalnum():
+        return "Mistral AI"
+    if api_key.startswith("sk-proj-") or (api_key.startswith("sk-") and not api_key.startswith("sk-or-")):
+        return "OpenAI"
+    return None
 
 def get_default_model(provider: str) -> str:
+    if not provider or not isinstance(provider, str): return "gpt-4o-mini"
     if "Groq" in provider:
         return "llama-3.3-70b-versatile"
     if "Gemini" in provider:
@@ -233,9 +205,14 @@ def get_default_model(provider: str) -> str:
         return "Meta-Llama-3.1-8B-Instruct"
     if "Ollama" in provider:
         return "qwen2.5:7b"
+    if "OpenAI" in provider:
+        return "gpt-4o-mini"
+    if "Mistral" in provider:
+        return "mistral-large-latest"
     return "gpt-4o-mini"
 
 def get_base_url(provider: str) -> str:
+    if not provider or not isinstance(provider, str): return "https://api.openai.com/v1"
     if "Groq" in provider:
         return "https://api.groq.com/openai/v1"
     if "NVIDIA NIM" in provider:
@@ -248,6 +225,10 @@ def get_base_url(provider: str) -> str:
         return "https://api.sambanova.ai/v1"
     if "Ollama" in provider:
         return "http://localhost:11434/v1"
+    if "OpenAI" in provider:
+        return "https://api.openai.com/v1"
+    if "Mistral" in provider:
+        return "https://api.mistral.ai/v1"
     return "https://api.openai.com/v1"
 
 def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider):
@@ -258,7 +239,9 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
             "NVIDIA NIM",
             "Google Gemini (Free API)",
             "Sambanova",
-            "OpenRouter (Cloud AI)"
+            "OpenRouter (Cloud AI)",
+            "Mistral AI",
+            "OpenAI"
         ]
         for prov in providers:
             keys = saved_keys_by_provider.get(prov, [])
@@ -276,21 +259,21 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
             continue
 
         detected_prov = None
-        if key.startswith("gsk_"):
-            detected_prov = "Groq Cloud (Fast)"
-        elif key.startswith("nvapi-"):
-            detected_prov = "NVIDIA NIM"
-        elif key.startswith("sk-or-"):
-            detected_prov = "OpenRouter (Cloud AI)"
-        elif key.startswith("AIza") or key.startswith("AQ."):
-            detected_prov = "Google Gemini (Free API)"
+
+        for prov, keys in saved_keys_by_provider.items():
+            if key in [k.strip() for k in keys]:
+                detected_prov = prov
+                break
+
+        if not detected_prov:
+            detected_prov = detect_provider(key, model)
+
+        if not detected_prov:
+            continue
 
         if not model and detected_prov:
             saved_model = saved_models_by_provider.get(detected_prov, "")
             model = saved_model if saved_model else default_models_by_provider.get(detected_prov, "")
-
-        if not detected_prov:
-            detected_prov = "OpenRouter (Cloud AI)"
 
         resolved.append({"api_key": key, "model": model or "", "provider": detected_prov, "base_url": get_base_url(detected_prov)})
     return resolved
@@ -307,6 +290,8 @@ class UnifiedTranslator:
         self.api_keys = cleaned
         self.api_key = cleaned[0] if cleaned else ""
         self.provider = provider
+        if not model or model in ["Enter API Key to load models", "Loading live models...", "None (Free Engine)", "Defined per key in pool", "N/A"]:
+            model = get_default_model(provider)
         self.model = model
         self.target_lang_code = target_lang_code
         self.free_google = GoogleFreeTranslator()
@@ -314,6 +299,8 @@ class UnifiedTranslator:
         self.key_index = 0
         self.key_cooldown_until = {}
         self.mixed_pool = []
+        if not model:
+            model = get_default_model(provider)
         if provider == "Mixed Providers":
             if mixed_pool:
                 self.mixed_pool = mixed_pool
@@ -327,6 +314,8 @@ class UnifiedTranslator:
                         key_part = entry
                         model_part = ""
                     prov = detect_provider(key_part, model_part)
+                    if not prov:
+                        prov = "OpenAI"
                     if not model_part:
                         if key_part.startswith("gsk_"):
                             model_part = "llama-3.3-70b-versatile"
@@ -396,7 +385,7 @@ class UnifiedTranslator:
                 raise ValueError("No providers configured in mixed pool")
 
             user_content = f"Instructions: {self.prompt}\n\nJSON array to translate: {json.dumps(shielded_texts, ensure_ascii=False)}"
-            max_attempts = 1 if any("Ollama" in entry["provider"] for entry in self.mixed_pool) else 3
+            max_attempts = 1 if any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 3
             res = None
 
             for attempt in range(max_attempts):
@@ -437,7 +426,12 @@ class UnifiedTranslator:
                                 tried += 1
                                 continue
                             resp.raise_for_status()
-                            content = resp.json()['choices'][0]['message']['content'].strip()
+                            resp_data = resp.json()
+                            if 'choices' in resp_data and len(resp_data['choices']) > 0:
+                                content = resp_data['choices'][0]['message']['content'].strip()
+                            else:
+                                error_msg = resp_data.get("error", {}).get("message", "Unknown API error (empty choices)")
+                                raise ValueError(error_msg)
                             content = re.sub(r'<' + 'think>.*?</' + 'think>', '', content, flags=re.DOTALL).strip()
                             parsed_res = extract_json_array(content)
                             if isinstance(parsed_res, list) and len(parsed_res) == len(texts):
@@ -453,7 +447,19 @@ class UnifiedTranslator:
                         continue
                     except httpx.HTTPStatusError as e:
                         status = e.response.status_code
-                        logging.getLogger("snbt_localizer.core").error(f"HTTP Error: {status} on key ...{entry['api_key'][-4:]}")
+                        reason = getattr(e.response, 'reason_phrase', '') or ''
+                        provider_name = entry.get("provider") or self.provider
+                        model_name = entry.get("model", self.model) or ''
+                        raw_key = entry.get("api_key") or ""
+                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                        if model_name:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix})"
+                            )
+                        else:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix})"
+                            )
                         if status in (401, 403):
                             self.mixed_pool.pop(idx)
                             self.key_index = 0
@@ -463,7 +469,18 @@ class UnifiedTranslator:
                             continue
                         break
                     except Exception as e:
-                        logging.getLogger("snbt_localizer.core").error(f"Network/Execution Error: {repr(e)}")
+                        provider_name = entry.get("provider") or self.provider
+                        model_name = entry.get("model", self.model) or ''
+                        raw_key = entry.get("api_key") or ""
+                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                        if model_name:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix})"
+                            )
+                        else:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix})"
+                            )
                         break
 
                 if res is not None:
@@ -479,10 +496,12 @@ class UnifiedTranslator:
                             if remaining > 0 and (min_cooldown is None or remaining < min_cooldown):
                                 min_cooldown = remaining
                     wait = max(min_cooldown or 2.0, 2.0)
-                    logging.getLogger("snbt_localizer.core").warning(f"All keys exhausted or in cooldown. Waiting {wait:.1f}s before retry.")
-                    await asyncio.sleep(wait)
-                    if check_status:
-                        await check_status()
+                    await countdown_sleep(
+                        int(wait),
+                        "All keys exhausted or in cooldown",
+                        logging.getLogger("snbt_localizer.core").warning,
+                        check_status
+                    )
 
             if res is None:
                 raise ValueError("Failed to translate chunk as a valid JSON array of correct length.")
@@ -495,7 +514,7 @@ class UnifiedTranslator:
         return restored_res
 
 class SNBTManager:
-    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3):
+    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None):
         self.cache = TranslationCache(target_lang_code=target_lang_code)
         self.target_lang_code = target_lang_code
         self.provider = provider
@@ -503,7 +522,7 @@ class SNBTManager:
         self.concurrency_limit = max(1, min(concurrency_limit, 10))
         self.is_aborted = False
         keys = [api_key] if api_key and api_key != "SKIP" else []
-        self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code)
+        self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool)
 
     def close(self):
         self.cache.close()

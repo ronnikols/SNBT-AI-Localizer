@@ -22,6 +22,8 @@ PROVIDER_ALIASES = {
     "sambanova": "Sambanova",
     "mixed": "Mixed Providers",
     "mix": "Mixed Providers",
+    "openai": "OpenAI",
+    "mistral": "Mistral AI",
 }
 
 PROVIDER_DEFAULTS = {
@@ -31,7 +33,9 @@ PROVIDER_DEFAULTS = {
     "Groq Cloud (Fast)": "llama-3.3-70b-versatile",
     "OpenRouter (Cloud AI)": "google/gemma-4-31b:free",
     "NVIDIA NIM": "nvidia/nemotron-4-340b-instruct",
-    "Sambanova": "Meta-Llama-3.1-8B-Instruct",
+    "Sambanova": "DeepSeek-V3.1",
+    "OpenAI": "gpt-4o-mini",
+    "Mistral AI": "mistral-large-latest",
 }
 
 PROVIDER_ENDPOINTS = {
@@ -41,6 +45,8 @@ PROVIDER_ENDPOINTS = {
     "NVIDIA NIM": "https://integrate.api.nvidia.com/v1/models",
     "Ollama (Local / Free)": "http://localhost:11434/v1/models",
     "Sambanova": "https://api.sambanova.ai/v1/models",
+    "OpenAI": "https://api.openai.com/v1/models",
+    "Mistral AI": "https://api.mistral.ai/v1/models",
 }
 
 LANG_ALIASES = {
@@ -64,6 +70,8 @@ ENV_KEY_MAP = {
     "OpenRouter (Cloud AI)": "OPENROUTER_API_KEY",
     "NVIDIA NIM": "NVIDIA_API_KEY",
     "Sambanova": "SAMBANOVA_API_KEY",
+    "OpenAI": "OPENAI_API_KEY",
+    "Mistral AI": "MISTRAL_API_KEY",
 }
 
 SETTINGS_KEY_MAP = {
@@ -72,10 +80,20 @@ SETTINGS_KEY_MAP = {
     "OpenRouter (Cloud AI)": "openrouter_api_key",
     "NVIDIA NIM": "nvidia_api_key",
     "Sambanova": "sambanova_api_key",
+    "OpenAI": "openai_api_key",
+    "Mistral AI": "mistral_api_key",
 }
 
 class ConfigManager:
-    AVAILABLE_PROVIDERS = ["Groq Cloud (Fast)", "NVIDIA NIM", "OpenRouter (Cloud AI)"]
+    AVAILABLE_PROVIDERS = [
+        "Groq Cloud (Fast)",
+        "NVIDIA NIM",
+        "OpenRouter (Cloud AI)",
+        "Google Gemini (Free API)",
+        "Sambanova",
+        "OpenAI",
+        "Mistral AI"
+    ]
 
     def __init__(self):
         self.quest_dir: Optional[Path] = None

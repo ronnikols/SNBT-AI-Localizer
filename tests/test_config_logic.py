@@ -28,7 +28,7 @@ def test_smart_parse_key_sk_or_with_model():
 def test_get_all_available_keys(mock_get_api_keys):
     mock_get_api_keys.side_effect = lambda provider: {
         "Groq Cloud (Fast)": ["gsk_key1", "gsk_key2"],
-        "NVIDIA NIM": ["nvapi_key1"],
+        "NVIDIA NIM": ["nvapi-key1"],
         "OpenRouter (Cloud AI)": [],
         "Google Gemini (Free API)": [],
         "Sambanova": [],

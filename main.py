@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator
 from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_DEFAULTS, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
 try:
@@ -594,6 +594,16 @@ def resolve_policy(policy: str) -> str:
     }
     return mapping.get(policy, "Complement (Дополнить)")
 
+def parse_key_model_pairs(api_keys: List[str]) -> List[Dict[str, str | None]]:
+    pairs = []
+    for k in api_keys:
+        if "\\" in k:
+            parts = k.split("\\", 1)
+            pairs.append({"key": parts[0].strip(), "model": parts[1].strip() if len(parts) > 1 else None})
+        else:
+            pairs.append({"key": k, "model": None})
+    return pairs
+
 async def run_translation(config: ConfigManager, provider: str, model: str | None, api_keys: List[str], lang_name: str, lang_code: str, quest_dir: Path, concurrency: Optional[int] = None) -> int:
     logging.getLogger("snbt_localizer.cli").info(f"Provider: {provider}")
     if model:
@@ -609,14 +619,14 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         logging.getLogger("snbt_localizer.cli").info(f"API Keys: {', '.join(masked_keys)}")
     else:
         logging.getLogger("snbt_localizer.cli").info("API Keys: Not Set")
-    
+
     limit = concurrency if concurrency is not None else config.concurrency
     first_key = api_keys[0] if api_keys else ""
     m = SNBTManager(first_key, provider, model or "", config.custom_context, lang_name, lang_code, concurrency_limit=limit)
-    
+
     mixed_pool = None
     if provider == "Mixed Providers":
-        pairs = [{"key": k, "model": None} for k in api_keys]
+        pairs = parse_key_model_pairs(api_keys)
         saved_keys_by_provider = {}
         saved_models_by_provider = {}
         default_models_by_provider = {}
@@ -645,6 +655,9 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         logging.getLogger("snbt_localizer.cli").warning("No .snbt files found")
         return 0
     total_files = len(files)
+    logging.getLogger("snbt_localizer.cli").info(
+        f"Starting localization. Active Provider: {provider}, Active Model: {model or 'N/A'}, Keys in Pool: {len(api_keys)}"
+    )
     logging.getLogger("snbt_localizer.cli").info(f"Found {total_files} files")
     policy = resolve_policy(config.policy)
     current_file_idx = 0

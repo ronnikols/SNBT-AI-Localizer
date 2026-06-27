@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QLabel, QComboBox, QListView, QCheckBox, 
                              QCompleter, QStyleFactory, QProgressBar, QMessageBox,
                              QSpinBox)
-from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut
 import httpx
 from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator
@@ -185,6 +185,26 @@ def load_key_from_env_or_file(provider, env_cache=None):
         settings = QSettings("MineAI", "SNBT-Localizer")
         saved_val = settings.value("sambanova_api_key", "")
         return str(saved_val) if saved_val is not None else ""
+    elif "OpenAI" in provider:
+        var_name = "OPENAI_API_KEY"
+        val = os.getenv(var_name)
+        if val:
+            return val
+        if env_cache is not None and var_name in env_cache:
+            return env_cache[var_name]
+        settings = QSettings("MineAI", "SNBT-Localizer")
+        saved_val = settings.value(var_name.lower(), "")
+        return str(saved_val) if saved_val else ""
+    elif "Mistral" in provider:
+        var_name = "MISTRAL_API_KEY"
+        val = os.getenv(var_name)
+        if val:
+            return val
+        if env_cache is not None and var_name in env_cache:
+            return env_cache[var_name]
+        settings = QSettings("MineAI", "SNBT-Localizer")
+        saved_val = settings.value(var_name.lower(), "")
+        return str(saved_val) if saved_val else ""
     else:
         return ""
 
@@ -279,7 +299,7 @@ def detect_instances() -> dict:
     return detected
 
 class ModelLoader(QThread):
-    loaded = pyqtSignal(list, str, int)
+    loaded = pyqtSignal(list, str, int, str)
     def __init__(self, provider, api_key=None, loader_id=0):
         super().__init__()
         self.provider = provider
@@ -340,9 +360,25 @@ class ModelLoader(QThread):
                         models = [m["id"] for m in data.get("data", [])]
                     elif resp.status_code in (401, 403):
                         error_msg = f"Sambanova API error {resp.status_code}: Invalid or missing API key"
+                elif "OpenAI" in self.provider and self.api_key:
+                    headers = {"Authorization": f"Bearer {self.api_key}"}
+                    resp = await client.get("https://api.openai.com/v1/models", headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"OpenAI API error {resp.status_code}: Invalid or missing API key"
+                elif "Mistral" in self.provider and self.api_key:
+                    headers = {"Authorization": f"Bearer {self.api_key}"}
+                    resp = await client.get("https://api.mistral.ai/v1/models", headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"Mistral API error {resp.status_code}: Invalid or missing API key"
         except Exception as e:
             error_msg = f"Connection error: {str(e)}"
-        self.loaded.emit(models, error_msg, self.loader_id)
+        self.loaded.emit(models, error_msg, self.loader_id, self.provider)
 
 class Worker(QThread):
     log = pyqtSignal(str)
@@ -350,7 +386,7 @@ class Worker(QThread):
     progress_batch = pyqtSignal(int, int)
     chunk_progress = pyqtSignal(int, int, int, int)
     
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3):
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None):
         super().__init__()
         self.files = files
         self.keys = keys  # list of api keys
@@ -363,6 +399,7 @@ class Worker(QThread):
         self.policy = policy
         self.target_lang = target_lang
         self.concurrency = concurrency
+        self.mixed_pool = mixed_pool
         self.is_aborted = False
         self.is_paused = False
 
@@ -389,8 +426,7 @@ class Worker(QThread):
             
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
-        m = SNBTManager(first_key, self.provider, self.model, self.custom_context, target_lang_name, target_lang_code, concurrency_limit=self.concurrency)
-        m.translator = UnifiedTranslator(self.keys, self.provider, self.model, self.custom_context, target_lang_name, target_lang_code)
+        m = SNBTManager(first_key, self.provider, self.model, self.custom_context, target_lang_name, target_lang_code, concurrency_limit=self.concurrency, mixed_pool=self.mixed_pool)
         target_dir = m.find_quests_dir(Path(self.files[0]).parent)
         self.log.emit(f"Target directory resolved: {target_dir}")
         logging.getLogger("snbt_localizer.gui").info(f"Target directory resolved: {target_dir}")
@@ -470,6 +506,10 @@ class App(QMainWindow):
         self.config = ConfigManager()
         self._is_updating_models = False
         self.current_provider = "RESERVED_INIT_STATE"
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.timeout.connect(self._perform_debounced_save)
+        self._pending_save_provider = None
         layout = QVBoxLayout()
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -489,6 +529,8 @@ class App(QMainWindow):
             "OpenRouter (Cloud AI)",
             "NVIDIA NIM",
             "Sambanova",
+            "OpenAI",
+            "Mistral AI",
             "Mixed Providers"
         ])
         self.provider_box.currentTextChanged.connect(self.on_provider_changed)
@@ -501,7 +543,9 @@ class App(QMainWindow):
         self.model_box = QComboBox()
         self.model_box.setView(QListView())
         self.model_box.setEditable(True)
-        
+        self.model_box.currentTextChanged.connect(self.on_model_changed)
+        self.loader = None
+
         self.completer = QCompleter(self)
         self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
@@ -570,7 +614,7 @@ class App(QMainWindow):
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setRange(1, 10)
         self.concurrency_spin.setValue(int(self.settings.value("concurrency_limit", 3)))
-        self.concurrency_spin.valueChanged.connect(self.save_current_settings)
+        self.concurrency_spin.valueChanged.connect(lambda: self.save_timer.start(500))
         concurrency_layout.addWidget(concurrency_label)
         concurrency_layout.addWidget(self.concurrency_spin)
         layout.addLayout(concurrency_layout)
@@ -730,8 +774,9 @@ class App(QMainWindow):
         if self._is_updating_models and provider_to_save is None:
             return
         provider = provider_to_save or self.config.provider
-        
-        self.config.provider = self.provider_box.currentText()
+
+        if provider_to_save is None:
+            self.config.provider = self.provider_box.currentText()
         
         model_text = self.model_box.currentText()
         if model_text and model_text not in ["", "Loading live models...", "None (Free Engine)", "Defined per key in pool"]:
@@ -748,9 +793,10 @@ class App(QMainWindow):
         self.config.target_lang = self.lang_box.currentText()
         self.config.policy = self.policy_box.currentText()
         
-        keys_text = self.key_pool_edit.toPlainText().strip()
-        keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
-        self.config.set_api_keys(provider, keys)
+        if provider != "Google Translate (Free)":
+            keys_text = self.key_pool_edit.toPlainText().strip()
+            keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
+            self.config.set_api_keys(provider, keys)
         self.config.concurrency = self.concurrency_spin.value()
         self.config.save_to_settings()
 
@@ -903,6 +949,11 @@ class App(QMainWindow):
             self.pb_batch.setValue(int(overall))
         self.pb_batch.setFormat(f"Total Progress: {overall:.1f} / {total_files} files")
 
+    def _perform_debounced_save(self):
+        provider = self._pending_save_provider
+        self._pending_save_provider = None
+        self.save_current_settings(provider_to_save=provider)
+
     def copy_logs(self):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.out.toPlainText())
@@ -937,88 +988,97 @@ class App(QMainWindow):
             self.btn_toggle_keys.setText("▼ API Keys Pool")
 
     def key_pool_changed(self):
-        self.save_current_settings()
+        self.save_timer.start(500)
+
+    def on_model_changed(self, text):
+        if not self._is_updating_models:
+            self.save_timer.start(500)
 
     def on_provider_changed(self, new_provider: str):
         if new_provider == self.current_provider and not getattr(self, '_is_initializing', False):
             return
 
-        if self.current_provider and self.current_provider != "INIT_STATE":
+        if self.current_provider != "INIT_STATE" and self.current_provider != new_provider:
             self.save_current_settings(provider_to_save=self.current_provider)
+
+        self.save_timer.stop()
 
         self.current_provider = new_provider
         self.config.provider = new_provider
-        
+
         self.provider_box.blockSignals(True)
+        self.key_pool_edit.blockSignals(True)
+        self.model_box.blockSignals(True)
         self._is_updating_models = True
-        saved_keys = self.config.get_api_keys(new_provider)
-        if saved_keys:
-            self.key_pool_edit.setPlainText("\n".join(saved_keys))
-        else:
-            k = load_key_from_env_or_file(new_provider, self.env_cache)
-            self.key_pool_edit.setPlainText(k if k else "")
-        self._is_updating_models = False
-        
-        if "Google Translate" in new_provider or "Ollama" in new_provider:
+
+        if new_provider == "Google Translate (Free)":
+            self.key_pool_edit.clear()
             self.key_pool_edit.setEnabled(False)
+            self.key_pool_edit.setPlaceholderText("No key required for free Google Translate")
+            self.btn_toggle_keys.setEnabled(False)
+        elif "Ollama" in new_provider:
+            self.key_pool_edit.clear()
+            self.key_pool_edit.setEnabled(False)
+            self.key_pool_edit.setPlaceholderText("No key required for local Ollama")
             self.btn_toggle_keys.setEnabled(False)
         else:
             self.key_pool_edit.setEnabled(True)
+            self.key_pool_edit.setPlaceholderText("Enter up to 10 API keys, one per line")
             self.btn_toggle_keys.setEnabled(True)
+            saved_keys = self.config.get_api_keys(new_provider)
+            if saved_keys:
+                self.key_pool_edit.setPlainText("\n".join(saved_keys))
+            else:
+                k = load_key_from_env_or_file(new_provider, self.env_cache)
+                self.key_pool_edit.setPlainText(k if k else "")
+
+        self._is_updating_models = False
+        self.key_pool_edit.blockSignals(False)
+        self.model_box.blockSignals(False)
         self.provider_box.blockSignals(False)
-        
+
         self.update_models()
 
     def update_models(self):
         provider = self.provider_box.currentText()
+        self.model_box.blockSignals(True)
+        self._is_updating_models = True
+
         if "Google Translate" in provider:
-            self.model_box.blockSignals(True)
             self.model_box.clear()
             self.model_box.addItem("None (Free Engine)")
             self.model_box.setCurrentIndex(0)
-            self.model_box.blockSignals(False)
             self.model_box.setEnabled(False)
-            self.key_pool_edit.setEnabled(False)
-            self.key_pool_edit.setPlaceholderText("No key required")
             self.completer.setModel(QStringListModel(["None (Free Engine)"]))
-            self.update_run_status()
-            self._is_updating_models = False
         elif provider == "Mixed Providers":
-            self.model_box.blockSignals(True)
             self.model_box.clear()
             self.model_box.addItem("Defined per key in pool")
             self.model_box.setCurrentIndex(0)
-            self.model_box.blockSignals(False)
             self.model_box.setEnabled(False)
-            self.key_pool_edit.setEnabled(True)
-            self.key_pool_edit.setPlaceholderText("Enter pairs: API_KEY\\MODEL_NAME (one per line)")
             self.completer.setModel(QStringListModel(["Defined per key in pool"]))
-            self.update_run_status()
-            self._is_updating_models = False
         elif "Ollama" in provider:
             self.model_box.setEnabled(True)
-            self.key_pool_edit.setEnabled(False)
-            self.key_pool_edit.setPlaceholderText("No key required for local Ollama")
             self._trigger_loader(provider, "")
         else:
             self.model_box.setEnabled(True)
-            self.key_pool_edit.setEnabled(True)
-            self.key_pool_edit.setPlaceholderText("Enter API Key")
-            
+
             keys_text = self.key_pool_edit.toPlainText().strip()
             keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
             if not keys:
-                self.model_box.blockSignals(True)
                 self.model_box.clear()
                 self.model_box.addItem("Enter API Key to load models")
-                self.model_box.blockSignals(False)
                 self.completer.setModel(QStringListModel(["Enter API Key to load models"]))
                 self.out.append("API Key is empty")
-                self.update_run_status()
+                self.model_box.blockSignals(False)
                 self._is_updating_models = False
+                self.update_run_status()
                 return
-                
+
             self._trigger_loader(provider, keys[0])
+
+        self.model_box.blockSignals(False)
+        self._is_updating_models = False
+        self.update_run_status()
 
     def _trigger_loader(self, provider, key):
         self.model_box.blockSignals(True)
@@ -1041,7 +1101,9 @@ class App(QMainWindow):
         self.loader.start()
         self.running_loaders.append(self.loader)
 
-    def on_models_loaded(self, models, error_msg=""):
+    def on_models_loaded(self, models, error_msg="", loader_id=0, loader_provider=""):
+        if loader_provider and loader_provider != self.provider_box.currentText():
+            return
         self.model_box.blockSignals(True)
         self.model_box.clear()
         provider = self.provider_box.currentText()
@@ -1073,6 +1135,10 @@ class App(QMainWindow):
                     "google/gemma-2-27b-it",
                     "meta/llama-3.1-8b-instruct"
                 ]
+            elif "OpenAI" in provider:
+                fallbacks = ["gpt-4o-mini", "gpt-4o"]
+            elif "Mistral" in provider:
+                fallbacks = ["mistral-large-latest", "open-mistral-nemo"]
             else:
                 fallbacks = [
                     "google/gemma-4-31b:free", 
@@ -1127,7 +1193,7 @@ class App(QMainWindow):
         if hasattr(self, 'w') and self.w.isRunning():
             return
         
-        self.save_current_settings()
+        self.save_timer.start(500)
         prov = self.config.provider
         policy = self.config.policy
         
@@ -1201,8 +1267,7 @@ class App(QMainWindow):
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
         first_key = unique_keys[0] if unique_keys else ""
-        m = SNBTManager(first_key, prov, model, custom_context, target_lang_name, target_lang_code, concurrency_limit=concurrency)
-        m.translator = UnifiedTranslator(unique_keys, prov, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool)
+        m = SNBTManager(first_key, prov, model, custom_context, target_lang_name, target_lang_code, concurrency_limit=concurrency, mixed_pool=mixed_pool)
         target_dir = m.find_quests_dir(Path(dir_path))
         
         all_files = [p for p in target_dir.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
@@ -1232,8 +1297,9 @@ class App(QMainWindow):
         self.pb_batch.setRange(0, len(files))
         self.pb_batch.setValue(0)
         self.files_progress = {}
-        
-        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency)
+        self.out.append(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
+
+        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool)
         self.w.is_aborted = False
         self.w.is_paused = False
         self.w.log.connect(self.out.append)
