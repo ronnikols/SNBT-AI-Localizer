@@ -730,6 +730,75 @@ def test_translation_memory_tab_save_changes(qtbot):
         if os.path.exists(db_path):
             os.remove(db_path)
 
+def test_bidirectional_language_sync(qtbot):
+    from gui import App, TranslationMemoryTab
+    from core import TranslationCache
+    import tempfile
+    import os
+
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"test1": "тест1", "test2": "тест2"})
+        cache.close()
+
+        from PyQt6.QtCore import QSettings
+        QSettings("MineAI", "SNBT-Localizer").clear()
+
+        app = App()
+        qtbot.addWidget(app)
+        qtbot.wait(100)
+
+        app.translation_memory_tab.cache.close()
+        app.translation_memory_tab.db_path = db_path
+        app.translation_memory_tab.set_language_code("ru_ru")
+        app.translation_memory_tab.lang_filter.setCurrentText("Russian (ru_ru)")
+        qtbot.wait(100)
+
+        assert app.lang_box.currentText() == app.translation_memory_tab.lang_filter.currentText()
+
+        app.lang_box.setCurrentText("Spanish (es_es)")
+        qtbot.wait(600)
+        assert app.translation_memory_tab.lang_filter.currentText() == "Spanish (es_es)"
+        assert app.translation_memory_tab.cache.table_name == "cache_es_es"
+
+        app.translation_memory_tab.lang_filter.setCurrentText("German (de_de)")
+        qtbot.wait(600)
+        assert app.lang_box.currentText() == "German (de_de)"
+        assert app.translation_memory_tab.cache.table_name == "cache_de_de"
+
+        assert app.settings.value("target_lang") == "German (de_de)"
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_language_sync_no_infinite_loop(qtbot):
+    from gui import App
+    from PyQt6.QtCore import QSettings
+    QSettings("MineAI", "SNBT-Localizer").clear()
+
+    app = App()
+    qtbot.addWidget(app)
+    qtbot.wait(100)
+
+    call_count = 0
+    def count_calls(text):
+        nonlocal call_count
+        call_count += 1
+
+    app.lang_box.blockSignals(True)
+    app.lang_box.setCurrentText("Russian (ru_ru)")
+    app.lang_box.blockSignals(False)
+    qtbot.wait(100)
+
+    app.lang_box.currentTextChanged.disconnect()
+    app.lang_box.currentTextChanged.connect(count_calls)
+    app.lang_box.setCurrentText("German (de_de)")
+    qtbot.wait(100)
+
+    assert call_count == 1
+
 def test_modpack_column_migration():
     with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
         db_path = f.name

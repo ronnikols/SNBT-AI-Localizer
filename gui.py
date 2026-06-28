@@ -338,9 +338,12 @@ def detect_instances() -> tuple[dict, dict]:
     return detected, quest_dirs_mapping
 
 class TranslationMemoryTab(QWidget):
+    language_changed = pyqtSignal(str)
+
     def __init__(self, cache, parent=None):
         super().__init__(parent)
         self.cache = cache
+        self.db_path = cache.db_path
         self.pending_updates = {}
         self.pending_deletions = set()
         self.offset = 0
@@ -361,6 +364,15 @@ class TranslationMemoryTab(QWidget):
         self.search_input.setPlaceholderText("Search by original or translation...")
         self.search_input.textChanged.connect(self._on_search_changed)
         search_layout.addWidget(self.search_input)
+
+        self.lang_filter = QComboBox()
+        self.lang_filter.addItems([
+            "Russian (ru_ru)", "Spanish (es_es)", "Chinese Simplified (zh_cn)",
+            "Chinese Traditional (zh_tw)", "German (de_de)", "French (fr_fr)",
+            "Portuguese (pt_br)", "Japanese (ja_jp)", "Korean (ko_kr)"
+        ])
+        self.lang_filter.currentTextChanged.connect(self._on_lang_filter_changed)
+        search_layout.addWidget(self.lang_filter)
 
         self.modpack_filter = QComboBox()
         self.modpack_filter.addItem("All Modpacks")
@@ -505,6 +517,18 @@ class TranslationMemoryTab(QWidget):
                 self.refresh_modpack_filter()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Cache clear error: {e}")
+
+    def _on_lang_filter_changed(self, lang_text):
+        lang_name, lang_code = parse_target_lang(lang_text)
+        self.set_language_code(lang_code)
+        self.language_changed.emit(lang_text)
+
+    def set_language_code(self, lang_code):
+        self.cache.close()
+        self.cache = TranslationCache(db_path=self.db_path, target_lang_code=lang_code)
+        self.offset = 0
+        self.refresh_modpack_filter()
+        self._load_data()
 
     def refresh_modpack_filter(self):
         self.modpack_filter.blockSignals(True)
@@ -848,6 +872,7 @@ class App(QMainWindow):
             "Korean (ko_kr)"
         ])
         self.lang_box.setCurrentText(self.settings.value("target_lang", "Russian (ru_ru)"))
+        self.lang_box.currentTextChanged.connect(self.on_lang_box_changed)
         lang_layout.addWidget(lang_label)
         lang_layout.addWidget(self.lang_box)
         workspace_layout.addLayout(lang_layout)
@@ -924,7 +949,7 @@ class App(QMainWindow):
         filters_layout.addWidget(self.cb_subs)
         filters_layout.addWidget(self.cb_desc)
         workspace_layout.addLayout(filters_layout)
-        
+
         dir_layout = QVBoxLayout()
         dir_label = QLabel("Target Modpack / Directory")
         self.dir_box = QComboBox()
@@ -946,7 +971,7 @@ class App(QMainWindow):
 
         self.out = QTextEdit(readOnly=True)
         workspace_layout.addWidget(self.out)
-        
+
         control_layout = QHBoxLayout()
         self.btn_run = QPushButton("Start Batch Translation")
         self.btn_run.setObjectName("btn_run")
@@ -974,11 +999,39 @@ class App(QMainWindow):
         workspace_tab.setLayout(workspace_layout)
         self.tabs.addTab(workspace_tab, "Workspace")
 
-        self.translation_memory_tab = TranslationMemoryTab(TranslationCache())
+        saved_lang = self.settings.value("target_lang", "Russian (ru_ru)")
+        lang_name, lang_code = parse_target_lang(saved_lang)
+        self.translation_memory_tab = TranslationMemoryTab(TranslationCache(target_lang_code=lang_code))
+        self.translation_memory_tab.language_changed.connect(self.on_tm_language_changed)
         self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
+
+    def on_lang_box_changed(self, lang_text):
+        if self._is_initializing:
+            return
+        if not hasattr(self, 'translation_memory_tab'):
+            return
+        self.translation_memory_tab.lang_filter.blockSignals(True)
+        self.translation_memory_tab.lang_filter.setCurrentText(lang_text)
+        self.translation_memory_tab.lang_filter.blockSignals(False)
+        lang_name, lang_code = parse_target_lang(lang_text)
+        self.translation_memory_tab.set_language_code(lang_code)
+        self.save_timer.start(500)
+
+    def on_tm_language_changed(self, lang_text):
+        if self._is_initializing:
+            return
+        self.lang_box.blockSignals(True)
+        self.lang_box.setCurrentText(lang_text)
+        self.lang_box.blockSignals(False)
+        self.save_timer.start(500)
 
     def _on_tab_changed(self, index):
         if index == 1:
+            self.translation_memory_tab.lang_filter.blockSignals(True)
+            self.translation_memory_tab.lang_filter.setCurrentText(self.lang_box.currentText())
+            self.translation_memory_tab.lang_filter.blockSignals(False)
+            lang_name, lang_code = parse_target_lang(self.lang_box.currentText())
+            self.translation_memory_tab.set_language_code(lang_code)
             self.translation_memory_tab.refresh_modpack_filter()
             self.translation_memory_tab._load_data()
 
