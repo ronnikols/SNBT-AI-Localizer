@@ -1,5 +1,7 @@
 # SNBT AI Localizer
 
+[English](README.md) | Русский
+
 Переводчик файлов квестов FTB для Minecraft (`.snbt`) с поддержкой локальных и облачных моделей. Обеспечивает асинхронную обработку, отказоустойчивость и сохранение форматирования Minecraft.
 
 ## Установка
@@ -83,11 +85,6 @@ snbt-tr --fastdir
 | Mistral AI              | mistral-large-latest                   | Нет        |
 | Ollama (Local / Free)   | qwen2.5:7b                             | Да         |
 | Google Translate (Free) | N/A                                    | Да         |
-
-## Тестирование
-```bash
-QT_QPA_PLATFORM=offscreen python -m pytest
-```
 
 ## Лицензия
 MIT License - подробности в файле [LICENSE](LICENSE).

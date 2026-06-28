@@ -13,8 +13,47 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut
 import httpx
-from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator
-from config import ConfigManager, PROVIDER_DEFAULTS
+from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS
+from config import ConfigManager
+
+def find_all_quest_dirs(instance_path: Path) -> list[Path]:
+    """Find all quests directories within an instance path."""
+    quest_dirs = []
+    MAX_DEPTH = 3
+
+    # Standard locations
+    standard_paths = [
+        instance_path / "config" / "ftbquests" / "quests",
+        instance_path / "minecraft" / "config" / "ftbquests" / "quests",
+    ]
+    for cp in standard_paths:
+        if cp.exists() and cp.is_dir():
+            quest_dirs.append(cp)
+
+    # Recursive scan for other locations
+    def scan(base: Path, depth: int = 0):
+        if depth > MAX_DEPTH:
+            return
+        try:
+            with os.scandir(base) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if entry.name.startswith('.'):
+                        continue
+                    path = Path(entry.path)
+                    if path.name == "quests" and path.parent.name == "ftbquests":
+                        if path not in quest_dirs:
+                            quest_dirs.append(path)
+                    if depth < MAX_DEPTH:
+                        scan(path, depth + 1)
+        except (PermissionError, Exception):
+            return
+
+    scan(instance_path)
+    if not quest_dirs and is_valid_custom_instance(instance_path):
+        quest_dirs.append(instance_path)
+    return quest_dirs
 
 class LogSignaler(QObject):
     log_signal = pyqtSignal(str)
@@ -208,17 +247,18 @@ def load_key_from_env_or_file(provider, env_cache=None):
     else:
         return ""
 
-def detect_instances() -> dict:
+def detect_instances() -> tuple[dict, dict]:
     detected = {}
+    quest_dirs_mapping = {}
     home = Path.home()
     MAX_DEPTH = 3
-    
+
     paths = []
     if sys.platform == "win32":
         appdata = Path(os.environ.get("APPDATA", home / "AppData/Roaming"))
         localappdata = Path(os.environ.get("LOCALAPPDATA", home / "AppData/Local"))
         userprofile = Path(os.environ.get("USERPROFILE", home))
-        
+
         paths.append((appdata / "PrismLauncher/instances", "Prism Launcher"))
         paths.append((appdata / "ElyPrismLauncher/instances", "ElyPrismLauncher"))
         paths.append((appdata / "MultiMC/instances", "MultiMC"))
@@ -246,57 +286,55 @@ def detect_instances() -> dict:
                 pass
         return fallback
 
-    def scan_dir(base: Path, depth: int = 0):
-        if depth > MAX_DEPTH:
-            return
-        try:
-            with os.scandir(base) as it:
-                for entry in it:
-                    if not entry.is_dir(follow_symlinks=False):
-                        continue
-                    if entry.name.startswith('.'):
-                        continue
-                    path = Path(entry.path)
-                    yield path
-                    if depth < MAX_DEPTH:
-                        yield from scan_dir(path, depth + 1)
-        except PermissionError:
-            return
-        except Exception:
-            return
-
     for base_path, launcher_name in paths:
         if not base_path.exists():
             continue
-        
+
         if launcher_name != "TLauncher/Vanilla":
-            for sub in scan_dir(base_path):
-                check_paths = [
-                    sub / "minecraft" / "config" / "ftbquests" / "quests",
-                    sub / "config" / "ftbquests" / "quests"
-                ]
-                for cp in check_paths:
-                    if cp.exists() and cp.is_dir():
-                        title = get_quest_title(cp, sub.name)
-                        title = re.sub(r'&[0-9a-fA-Fk-orK-OR]', '', title)
-                        detected[f"{title} [{sub.name}] ({launcher_name})"] = sub
-                        break
+            try:
+                with os.scandir(base_path) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'):
+                            instance_path = Path(entry.path)
+                            quest_dirs = find_all_quest_dirs(instance_path)
+                            if quest_dirs:
+                                title = get_quest_title(quest_dirs[0], instance_path.name)
+                                title = re.sub(r'&[0-9a-fA-Fk-orK-OR]', '', title)
+                                display_name = f"{title} [{instance_path.name}] ({launcher_name})"
+                                if len(quest_dirs) > 1:
+                                    display_name += " [Multiple Folders]"
+                                detected[display_name] = instance_path
+                                quest_dirs_mapping[instance_path] = quest_dirs
+            except Exception:
+                pass
         else:
             cp = base_path / "config" / "ftbquests" / "quests"
             if cp.exists() and cp.is_dir():
                 title = get_quest_title(cp, "Active Pack")
                 title = re.sub(r'&[0-9a-fA-Fk-orK-OR]', '', title)
-                detected[f"{title} (TLauncher/Vanilla)"] = base_path
-            
+                display_name = f"{title} (TLauncher/Vanilla)"
+                detected[display_name] = base_path
+                quest_dirs_mapping[base_path] = [cp]
+
             versions_path = base_path / "versions"
             if versions_path.exists() and versions_path.is_dir():
-                for sub in scan_dir(versions_path):
-                    cp_ver = sub / "config" / "ftbquests" / "quests"
-                    if cp_ver.exists() and cp_ver.is_dir():
-                        title = get_quest_title(cp_ver, sub.name)
-                        title = re.sub(r'&[0-9a-fA-Fk-orK-OR]', '', title)
-                        detected[f"{title} [{sub.name}] (TLauncher Version)"] = sub
-    return detected
+                try:
+                    with os.scandir(versions_path) as it:
+                        for entry in it:
+                            if entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'):
+                                instance_path = Path(entry.path)
+                                quest_dirs = find_all_quest_dirs(instance_path)
+                                if quest_dirs:
+                                    title = get_quest_title(quest_dirs[0], instance_path.name)
+                                    title = re.sub(r'&[0-9a-fA-Fk-orK-OR]', '', title)
+                                    display_name = f"{title} [{instance_path.name}] (TLauncher Version)"
+                                    if len(quest_dirs) > 1:
+                                        display_name += " [Multiple Folders]"
+                                    detected[display_name] = instance_path
+                                    quest_dirs_mapping[instance_path] = quest_dirs
+                except Exception:
+                    pass
+    return detected, quest_dirs_mapping
 
 class ModelLoader(QThread):
     loaded = pyqtSignal(list, str, int, str)
@@ -427,10 +465,7 @@ class Worker(QThread):
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
         m = SNBTManager(first_key, self.provider, self.model, self.custom_context, target_lang_name, target_lang_code, concurrency_limit=self.concurrency, mixed_pool=self.mixed_pool)
-        target_dir = m.find_quests_dir(Path(self.files[0]).parent)
-        self.log.emit(f"Target directory resolved: {target_dir}")
-        logging.getLogger("snbt_localizer.gui").info(f"Target directory resolved: {target_dir}")
-        
+
         total_files = len(self.files)
         self.log.emit(f"Files to process: {total_files}")
         logging.getLogger("snbt_localizer.gui").info(f"Files to process: {total_files}")
@@ -502,8 +537,10 @@ class App(QMainWindow):
         self.running_loaders = []
         self.current_loader_id = 0
         self.settings = QSettings("MineAI", "SNBT-Localizer")
+        self.instance_quest_dirs = {}
         self.env_cache = self._load_env_cache()
         self.config = ConfigManager()
+        self.config.prune_invalid_paths()
         self._is_updating_models = False
         self.current_provider = "RESERVED_INIT_STATE"
         self.save_timer = QTimer(self)
@@ -613,7 +650,7 @@ class App(QMainWindow):
         concurrency_label = QLabel("Потоки:")
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setRange(1, 10)
-        self.concurrency_spin.setValue(int(self.settings.value("concurrency_limit", 3)))
+        self.concurrency_spin.setValue(int(self.settings.value("concurrency_limit", 2)))
         self.concurrency_spin.valueChanged.connect(lambda: self.save_timer.start(500))
         concurrency_layout.addWidget(concurrency_label)
         concurrency_layout.addWidget(self.concurrency_spin)
@@ -802,10 +839,19 @@ class App(QMainWindow):
 
     def populate_instances(self):
         self.dir_box.currentIndexChanged.disconnect()
-        
-        self.detected_instances = detect_instances()
+
+        self.detected_instances, self.instance_quest_dirs = detect_instances()
         self.dir_box.clear()
-        
+
+        for custom_path in self.config.custom_instances_paths:
+            p = Path(custom_path)
+            if is_valid_custom_instance(p) and p not in self.detected_instances.values():
+                name = f"{p.name} [Custom]"
+                self.detected_instances[name] = p
+                quest_dirs = find_all_quest_dirs(p)
+                if quest_dirs:
+                    self.instance_quest_dirs[p] = quest_dirs
+
         for name in sorted(self.detected_instances.keys()):
             self.dir_box.addItem(name, str(self.detected_instances[name]))
             
@@ -845,14 +891,29 @@ class App(QMainWindow):
             
             if d:
                 path_obj = Path(d)
-                custom_name = f"Custom: {path_obj.name}"
-                
+                custom_name = f"{path_obj.name} [Custom]"
+
+                quest_dirs = self.instance_quest_dirs.get(path_obj)
+                if not quest_dirs:
+                    quest_dirs = find_all_quest_dirs(path_obj)
+
+                all_files = []
+                if quest_dirs:
+                    for qd in quest_dirs:
+                        files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+                        all_files.extend(files)
+
+                if is_valid_custom_instance(path_obj) and all_files:
+                    self.config.add_custom_path(str(path_obj))
+                    if quest_dirs:
+                        self.instance_quest_dirs[path_obj] = quest_dirs
+
                 exists_idx = -1
                 for i in range(self.dir_box.count()):
                     if self.dir_box.itemData(i) == d:
                         exists_idx = i
                         break
-                
+
                 if exists_idx != -1:
                     self.dir_box.setCurrentIndex(exists_idx)
                     self.last_valid_index = exists_idx
@@ -860,9 +921,15 @@ class App(QMainWindow):
                     self.dir_box.insertItem(0, custom_name, d)
                     self.dir_box.setCurrentIndex(0)
                     self.last_valid_index = 0
-                    
+
                 self.settings.setValue("last_path", d)
                 self.out.append(f"Custom folder selected: {d}")
+
+                # Populate quest_dirs for custom path
+                path_obj = Path(d)
+                quest_dirs = find_all_quest_dirs(path_obj)
+                if quest_dirs:
+                    self.instance_quest_dirs[path_obj] = quest_dirs
             else:
                 self.dir_box.setCurrentIndex(self.last_valid_index)
                 
@@ -886,40 +953,31 @@ class App(QMainWindow):
         has_files = False
         if path_str and path_str != "MANUAL" and os.path.exists(path_str):
             path = Path(path_str)
-            target_dir = path / "config" / "ftbquests" / "quests"
-            if not target_dir.exists():
-                for root, dirs, _ in os.walk(path):
-                    dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
-                    if "ftbquests" in root and "quests" in root:
-                        target_dir = Path(root)
-                        break
-            
-            if target_dir.exists() and target_dir.is_dir():
-                try:
-                    files = [p for p in target_dir.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
-                    count = len(files)
-                    if count > 0:
-                        self.lbl_file_count.setText(f"✓ Detected: {count} quest files (.snbt)")
-                        has_files = True
-                        self.pb_batch.setRange(0, count)
-                        self.pb_batch.setValue(0)
-                    else:
-                        self.lbl_file_count.setText("⚠ Warning: No quest files (.snbt) found in this directory")
-                        self.pb_batch.setRange(0, 100)
-                        self.pb_batch.setValue(0)
-                except Exception:
-                    self.lbl_file_count.setText("⚠ Error reading directory")
-                    self.pb_batch.setRange(0, 100)
-                    self.pb_batch.setValue(0)
+            quest_dirs = self.instance_quest_dirs.get(path)
+            if not quest_dirs:
+                quest_dirs = find_all_quest_dirs(path)
+
+            all_files = []
+            if quest_dirs:
+                for qd in quest_dirs:
+                    files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+                    all_files.extend(files)
+
+            count = len(all_files)
+            if count > 0:
+                self.lbl_file_count.setText(f"✓ Detected: {count} quest files (.snbt)")
+                has_files = True
+                self.pb_batch.setRange(0, count)
+                self.pb_batch.setValue(0)
             else:
-                self.lbl_file_count.setText("⚠ Directory is empty or invalid")
+                self.lbl_file_count.setText("⚠ Warning: No quest files (.snbt) found in this directory")
                 self.pb_batch.setRange(0, 100)
                 self.pb_batch.setValue(0)
         else:
             self.lbl_file_count.setText("")
             self.pb_batch.setRange(0, 100)
             self.pb_batch.setValue(0)
-        
+
         self.btn_run.setEnabled(has_files and self.is_model_valid())
 
     def update_batch_progress(self, cur, tot):
@@ -1163,6 +1221,7 @@ class App(QMainWindow):
             else:
                 self.model_box.setCurrentIndex(0)
                 self.settings.setValue(f"model_{provider}", self.model_box.currentText())
+            self.config.model = self.model_box.currentText()
 
         self.update_run_status()
         self.model_box.blockSignals(False)
@@ -1263,14 +1322,27 @@ class App(QMainWindow):
         target_lang = self.config.target_lang
 
         dir_path = self.dir_box.itemData(self.dir_box.currentIndex())
-        
+        if dir_path == "MANUAL":
+            self.out.append("Error: Please select a valid directory first.")
+            return
+
+        dir_path_obj = Path(dir_path)
+        quest_dirs = self.instance_quest_dirs.get(dir_path_obj)
+        if not quest_dirs:
+            quest_dirs = find_all_quest_dirs(dir_path_obj)
+            if not quest_dirs:
+                self.out.append(f"Error: No quest directories found in {dir_path}")
+                return
+
+        all_files = []
+        for qd in quest_dirs:
+            files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+            all_files.extend(files)
+
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
         first_key = unique_keys[0] if unique_keys else ""
         m = SNBTManager(first_key, prov, model, custom_context, target_lang_name, target_lang_code, concurrency_limit=concurrency, mixed_pool=mixed_pool)
-        target_dir = m.find_quests_dir(Path(dir_path))
-        
-        all_files = [p for p in target_dir.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
         
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
         loc_files = [p for p in all_files if lang_pattern.match(p.name)]

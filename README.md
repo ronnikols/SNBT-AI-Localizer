@@ -1,5 +1,7 @@
 # SNBT AI Localizer
 
+English | [Русский](README_RU.md)
+
 Advanced asynchronous translator for Minecraft FTB Quests files (`.snbt`) with support for multiple local and cloud translation engines.
 
 ## Installation
@@ -83,11 +85,6 @@ snbt-tr --fastdir
 | Mistral AI            | mistral-large-latest             | No        |
 | Ollama (Local / Free) | qwen2.5:7b                       | Yes       |
 | Google Translate (Free)| N/A                              | Yes       |
-
-## Testing
-```bash
-QT_QPA_PLATFORM=offscreen python -m pytest
-```
 
 ## License
 MIT License - see [LICENSE](LICENSE) for details.

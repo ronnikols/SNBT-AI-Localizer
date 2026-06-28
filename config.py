@@ -4,6 +4,7 @@ import argparse
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional
+from core import is_valid_custom_instance, PROVIDER_DEFAULTS
 
 try:
     from PyQt6.QtCore import QSettings
@@ -24,18 +25,6 @@ PROVIDER_ALIASES = {
     "mix": "Mixed Providers",
     "openai": "OpenAI",
     "mistral": "Mistral AI",
-}
-
-PROVIDER_DEFAULTS = {
-    "Google Translate (Free)": None,
-    "Google Gemini (Free API)": "models/gemini-3.1-flash-lite",
-    "Ollama (Local / Free)": "qwen2.5:7b",
-    "Groq Cloud (Fast)": "llama-3.3-70b-versatile",
-    "OpenRouter (Cloud AI)": "google/gemma-4-31b:free",
-    "NVIDIA NIM": "nvidia/nemotron-4-340b-instruct",
-    "Sambanova": "DeepSeek-V3.1",
-    "OpenAI": "gpt-4o-mini",
-    "Mistral AI": "mistral-large-latest",
 }
 
 PROVIDER_ENDPOINTS = {
@@ -98,12 +87,13 @@ class ConfigManager:
     def __init__(self):
         self.quest_dir: Optional[Path] = None
         self.target_lang: str = "ru_ru"
-        self.concurrency: int = 3
+        self.concurrency: int = 2
         self.provider: str = "Google Translate (Free)"
         self.model: Optional[str] = None
         self.custom_context: str = ""
         self.policy: str = "Complement (Дополнить)"
         self.api_keys_pool: Dict[str, List[str]] = {}
+        self.custom_instances_paths: List[str] = []
 
         self.load_from_settings()
 
@@ -127,6 +117,10 @@ class ConfigManager:
         self.concurrency = int(s.value("concurrency_limit", self.concurrency))
         self.custom_context = s.value("custom_context", self.custom_context)
         self.policy = s.value("policy", self.policy)
+
+        raw = s.value("custom_instances_paths", "")
+        if raw:
+            self.custom_instances_paths = [p.strip() for p in str(raw).splitlines() if p.strip()]
 
         for prov in PROVIDER_ALIASES.values():
             raw = s.value(f"api_keys_pool_{prov}", "")
@@ -155,6 +149,7 @@ class ConfigManager:
         s.setValue("concurrency_limit", self.concurrency)
         s.setValue("custom_context", self.custom_context)
         s.setValue("policy", self.policy)
+        s.setValue("custom_instances_paths", "\n".join(self.custom_instances_paths))
 
         for prov, keys in self.api_keys_pool.items():
             s.setValue(f"api_keys_pool_{prov}", "\n".join(keys))
@@ -172,7 +167,7 @@ class ConfigManager:
         parser.add_argument("-c", "--context", default="", help="Custom translation context")
         parser.add_argument("--policy", default="complement", choices=["complement", "overwrite", "skip"],
                             help="Existing files policy: complement, overwrite, skip (default: complement)")
-        parser.add_argument("--concurrency", type=int, default=3,
+        parser.add_argument("--concurrency", type=int, default=2,
                             help="Number of parallel translation threads (1-10, default: 3)")
         parser.add_argument("--list-models", action="store_true", help="List available models for provider and exit")
         parser.add_argument("--fastdir", "--fd", action="store_true", help="Scan launcher paths for instances and exit")
@@ -304,3 +299,18 @@ class ConfigManager:
             if lang_input == code or lang_input == name.lower():
                 return (name, code)
         raise ValueError(f"Unknown language: {lang_input}")
+
+    def add_custom_path(self, path: str):
+        path = str(Path(path).resolve())
+        if path not in self.custom_instances_paths:
+            self.custom_instances_paths.append(path)
+            self.save_to_settings()
+
+    def prune_invalid_paths(self):
+        valid_paths = []
+        for p in self.custom_instances_paths:
+            if is_valid_custom_instance(Path(p)):
+                valid_paths.append(p)
+        if valid_paths != self.custom_instances_paths:
+            self.custom_instances_paths = valid_paths
+            self.save_to_settings()

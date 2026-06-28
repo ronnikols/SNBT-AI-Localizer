@@ -386,3 +386,83 @@ def test_cli_mix_true_concurrency():
 
         assert mock_m.process_file.call_count == 5
         assert mock_m.find_quests_dir.called
+
+def test_fuzzy_cache_exact_match():
+    import tempfile
+    import os
+    from core import TranslationCache
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"hello world": "привет мир"})
+        assert cache.get("hello world") == "привет мир"
+        cache.close()
+    finally:
+        os.unlink(db_path)
+
+def test_fuzzy_cache_high_similarity():
+    import tempfile
+    import os
+    from core import TranslationCache
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"hello world": "привет мир"})
+        result = cache.get("hello world!")
+        assert result == "привет мир!"
+        cache.close()
+    finally:
+        os.unlink(db_path)
+
+def test_fuzzy_cache_pluralization_guard():
+    import tempfile
+    import os
+    from core import TranslationCache
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"item 1": "предмет 1", "item 2": "предмет 2"})
+        assert cache.get("item 10") is None
+        assert cache.get("item 1") == "предмет 1"
+        cache.close()
+    finally:
+        os.unlink(db_path)
+
+def test_fuzzy_cache_tail_preservation():
+    import tempfile
+    import os
+    from core import TranslationCache
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"hello": "привет"})
+        result = cache.get("hello§a")
+        assert result == "привет§a"
+        result = cache.get("hello.")
+        assert result == "привет."
+        result = cache.get("hello! ")
+        assert result == "привет! "
+        cache.close()
+    finally:
+        os.unlink(db_path)
+
+def test_fuzzy_cache_edge_cases():
+    import tempfile
+    import os
+    from core import TranslationCache
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        assert cache.get("") is None
+        assert cache.get("   ") is None
+        assert cache.get("§a") is None
+        assert cache.get(".") is None
+        assert cache.get("a") is None
+        cache.close()
+    finally:
+        os.unlink(db_path)

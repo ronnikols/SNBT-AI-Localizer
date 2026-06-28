@@ -1,12 +1,55 @@
+# Python
 venv/
+build/
+dist/
+*.egg-info/
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+
+# Local Databases & Caches
+*.db
+*.sqlite
+cache.db
 cache.sqlite
+
+# Backups & Temporary Artifacts
+backups/
+*.tmp
 *.bak
+MANIFEST_*.md
+
+# IDEs & AI Agent Workspaces
+.continue/
 .aider*
-*.log
-*.log
+.vscode/
+.idea/
+.env
+
+# Testing
+.pytest_cache/
+
+# Local configs
 litellm_config.yaml
 run.sh
-.pytest_cache/
+.python-version
+poetry.lock
+
+# Logs
+*.log
+
+# SQLite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Testing
+.mypy_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Flask
+instance/

@@ -3,6 +3,7 @@ import re
 import json
 import sqlite3
 import asyncio
+import difflib
 import httpx
 import urllib.parse
 import threading
@@ -11,13 +12,35 @@ import aiofiles
 import logging
 from pathlib import Path
 from typing import List, Dict
-from config import PROVIDER_DEFAULTS
+
+PROVIDER_DEFAULTS = {
+    "Google Translate (Free)": None,
+    "Google Gemini (Free API)": "models/gemini-3.1-flash-lite",
+    "Ollama (Local / Free)": "qwen2.5:7b",
+    "Groq Cloud (Fast)": "llama-3.3-70b-versatile",
+    "OpenRouter (Cloud AI)": "google/gemma-4-31b:free",
+    "NVIDIA NIM": "nvidia/nemotron-4-340b-instruct",
+    "Sambanova": "DeepSeek-V3.1",
+    "OpenAI": "gpt-4o-mini",
+    "Mistral AI": "mistral-large-latest",
+}
 
 logger = logging.getLogger("snbt_localizer.core")
 
 EXCLUDED_DIRS = {'waydroid', 'flatpak', '.steam', '.cache', 'Trash', 'trash', '.git', 'node_modules', 'saves', 'backups', 'simplebackups'}
+
+def is_valid_custom_instance(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    try:
+        files = [p for p in path.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+        return len(files) > 0
+    except:
+        return False
+
 ID_PATTERN = re.compile(r'^#?\w+:[a-z0-9_/]+$')
 UUID_PATTERN = re.compile(r'^[0-9a-fA-F\-]{36}$')
+TAIL_PATTERN = re.compile(r'(?:[.,!?;:\s]|§[0-9a-fk-orA-FK-ORr])+$')
 
 class AbortException(Exception):
     pass
@@ -114,10 +137,43 @@ class TranslationCache:
 
     def get(self, text: str):
         with self.lock:
+            if not text:
+                return None
+
+            tail_match = TAIL_PATTERN.search(text)
+            if tail_match and tail_match.end() - tail_match.start() == len(text):
+                return None
+
+            tail_input = tail_match.group(0) if tail_match else ""
+            text_without_tail = re.sub(TAIL_PATTERN, '', text)
+
             cursor = self.conn.cursor()
             cursor.execute(f"SELECT trans FROM {self.table_name} WHERE orig=?", (text,))
             res = cursor.fetchone()
-            return res[0] if res else None
+            if res:
+                return res[0]
+
+            max_diff = max(3, int(len(text_without_tail) * 0.15))
+            cursor.execute(
+                f"SELECT orig, trans FROM {self.table_name} WHERE abs(length(orig) - ?) <= ? LIMIT 100",
+                (len(text_without_tail), max_diff)
+            )
+            candidates = cursor.fetchall()
+
+            input_numbers = re.findall(r'\d+', text_without_tail)
+
+            for orig, trans in candidates:
+                candidate_numbers = re.findall(r'\d+', orig)
+                if input_numbers != candidate_numbers:
+                    continue
+
+                orig_without_tail = re.sub(TAIL_PATTERN, '', orig)
+                ratio = difflib.SequenceMatcher(None, text_without_tail, orig_without_tail).ratio()
+                if ratio >= 0.90:
+                    cleaned_trans = re.sub(TAIL_PATTERN, '', trans)
+                    return cleaned_trans + tail_input
+
+            return None
 
     def save_batch(self, mapping: Dict[str, str]):
         with self.lock:
@@ -353,7 +409,7 @@ class UnifiedTranslator:
             "Keep placeholders like __TAG_X__ exactly as they are without translation, spacing or modification."
         )
 
-    async def translate(self, texts: List[str], logger=print, check_status=None) -> List[str]:
+    async def translate(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
         if not texts:
             return []
 
@@ -378,7 +434,8 @@ class UnifiedTranslator:
                 raise ValueError("No providers configured in mixed pool")
 
             user_content = f"Instructions: {self.prompt}\n\nJSON array to translate: {json.dumps(shielded_texts, ensure_ascii=False)}"
-            max_attempts = 1 if any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 3
+            BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+            max_attempts = len(BACKOFF_DELAYS) if not any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 1
             res = None
 
             for attempt in range(max_attempts):
@@ -415,10 +472,10 @@ class UnifiedTranslator:
                             resp = await client.post(url, headers=headers, json=payload)
                             if resp.status_code == 429 or resp.status_code >= 500:
                                 current_backoff = self.key_backoff.get(entry["api_key"], 0)
-                                delay = 0.2 * (2 ** current_backoff)
+                                delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
                                 self.key_cooldown_until[entry["api_key"]] = now + delay
                                 self.key_backoff[entry["api_key"]] = current_backoff + 1
-                                logging.getLogger("snbt_localizer.core").warning(f"Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Backoff: {delay:.1f}s.")
+                                logging.getLogger("snbt_localizer.core").warning(f"[{context}] Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Backoff: {delay:.1f}s (Attempt {attempt+1}/{max_attempts}).")
                                 tried += 1
                                 continue
                             resp.raise_for_status()
@@ -439,7 +496,7 @@ class UnifiedTranslator:
                                 break
                     except httpx.TimeoutException:
                         self.key_cooldown_until[entry["api_key"]] = now + 150.0
-                        logging.getLogger("snbt_localizer.core").error(f"Timeout on key ending ...{entry['api_key'][-4:]}. Cooldown 150s.")
+                        logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{entry['api_key'][-4:]}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
                         tried += 1
                         continue
                     except httpx.HTTPStatusError as e:
@@ -451,11 +508,11 @@ class UnifiedTranslator:
                         key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
                         if model_name:
                             logging.getLogger("snbt_localizer.core").error(
-                                f"HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix})"
+                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
                             )
                         else:
                             logging.getLogger("snbt_localizer.core").error(
-                                f"HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix})"
+                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
                             )
                         if status in (401, 403):
                             async with self.pool_lock:
@@ -467,7 +524,7 @@ class UnifiedTranslator:
                             continue
                         elif status == 429:
                             current_backoff = self.key_backoff.get(entry["api_key"], 0)
-                            delay = 0.2 * (2 ** current_backoff)
+                            delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
                             self.key_cooldown_until[entry["api_key"]] = now + delay
                             self.key_backoff[entry["api_key"]] = current_backoff + 1
                             logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
@@ -481,11 +538,11 @@ class UnifiedTranslator:
                         key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
                         if model_name:
                             logging.getLogger("snbt_localizer.core").error(
-                                f"Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix})"
+                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
                             )
                         else:
                             logging.getLogger("snbt_localizer.core").error(
-                                f"Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix})"
+                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
                             )
                         break
 
@@ -654,9 +711,9 @@ class SNBTManager:
             to_trans = texts
         else:
             to_trans = [t for t in texts if not self.cache.get(t)]
-        for t in texts:
-            c = self.cache.get(t)
-            if c: mapping[t] = c
+            for t in texts:
+                c = self.cache.get(t)
+                if c: mapping[t] = c
 
         try:
             chunk_size = 5 if "Ollama" in self.provider else 15
@@ -672,7 +729,7 @@ class SNBTManager:
                     continue
                 
                 try:
-                    res = await self.translator.translate(chunk_to_send, logger, check_status)
+                    res = await self.translator.translate(chunk_to_send, logger, check_status, context=filepath.name)
                     new_map = dict(zip(chunk_to_send, res))
                 except (AbortException, ValueError):
                     raise
@@ -683,7 +740,7 @@ class SNBTManager:
                     for item in chunk_to_send:
                         if check_status: await check_status()
                         try:
-                            res_single = await self.translator.translate([item], logger, check_status)
+                            res_single = await self.translator.translate([item], logger, check_status, context=filepath.name)
                             new_map[item] = res_single[0]
                         except (AbortException, ValueError):
                             raise

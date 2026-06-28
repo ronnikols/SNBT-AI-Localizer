@@ -5,14 +5,51 @@ import httpx
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
-from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider
-from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_DEFAULTS, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
+from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider, is_valid_custom_instance, PROVIDER_DEFAULTS
+from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
 try:
     from PyQt6.QtCore import QSettings
 except ImportError:
     QSettings = None
 
 SERVICE_MODEL_KEYWORDS = {"orpheus", "tts", "whisper", "embed", "moderation", "safety", "guard", "reward"}
+
+def find_all_quest_dirs(instance_path: Path) -> list[Path]:
+    """Find all quests directories within an instance path."""
+    quest_dirs = []
+    MAX_DEPTH = 3
+
+    standard_paths = [
+        instance_path / "config" / "ftbquests" / "quests",
+        instance_path / "minecraft" / "config" / "ftbquests" / "quests",
+    ]
+    for cp in standard_paths:
+        if cp.exists() and cp.is_dir():
+            quest_dirs.append(cp)
+
+    def scan(base: Path, depth: int = 0):
+        if depth > MAX_DEPTH:
+            return
+        try:
+            with os.scandir(base) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if entry.name.startswith('.'):
+                        continue
+                    path = Path(entry.path)
+                    if path.name == "quests" and path.parent.name == "ftbquests":
+                        if path not in quest_dirs:
+                            quest_dirs.append(path)
+                    if depth < MAX_DEPTH:
+                        scan(path, depth + 1)
+        except (PermissionError, Exception):
+            return
+
+    scan(instance_path)
+    if not quest_dirs and is_valid_custom_instance(instance_path):
+        quest_dirs.append(instance_path)
+    return quest_dirs
 
 def setup_logging(debug=False):
     """Configure logging for the CLI application."""
@@ -208,12 +245,23 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
         except Exception:
             pass
 
+    for custom_path in config.custom_instances_paths:
+        p = Path(custom_path)
+        if is_valid_custom_instance(p) and not any(str(p) == path_str for _, path_str, _ in instances):
+            instances.append((p.name, str(p), "Custom"))
+
+    for custom_path in config.custom_instances_paths:
+        p = Path(custom_path)
+        if is_valid_custom_instance(p) and not any(str(p) == path_str for _, path_str, _ in instances):
+            instances.append((p.name, str(p), "Custom"))
+
     if not instances:
         print("No modpack instances with FTB Quests found.")
         custom_path = input("Enter path to modpack manually: ").strip()
         if not custom_path:
             die("No path provided")
         quest_dir = normalize_path(custom_path)
+        config.add_custom_path(str(quest_dir))
     else:
         last_instance = load_cli_setting("cli_last_instance", "")
         default_idx = 0
@@ -244,6 +292,7 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                     if not custom_path:
                         continue
                     quest_dir = normalize_path(custom_path)
+                    config.add_custom_path(str(quest_dir))
                     save_cli_setting("cli_last_instance", str(quest_dir))
                     break
             except ValueError:
@@ -442,6 +491,7 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
         if not custom_path:
             return None
         quest_dir = normalize_path(custom_path)
+        config.add_custom_path(str(quest_dir))
     else:
         last_instance = load_cli_setting("cli_last_instance", "")
         default_idx = 0
@@ -472,6 +522,7 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                     if not custom_path:
                         continue
                     quest_dir = normalize_path(custom_path)
+                    config.add_custom_path(str(quest_dir))
                     save_cli_setting("cli_last_instance", str(quest_dir))
                     break
             except ValueError:
@@ -718,22 +769,32 @@ async def cmd_list_models(provider: str) -> int:
         logging.getLogger("snbt_localizer.cli").info(f"  {m}")
     return 0
 
-def cmd_fastdir() -> Path | None:
+def cmd_fastdir(config: ConfigManager = None) -> tuple[Path, list[Path]] | None:
     launcher_paths = get_launcher_paths()
     instances = []
+    root_to_quest_dirs = {}
+
     for base, launcher_name in launcher_paths:
         if not base.exists():
             continue
         try:
             for sub in base.iterdir():
                 if sub.is_dir():
-                    quests_path = sub / "config" / "ftbquests" / "quests"
-                    if not quests_path.exists():
-                        quests_path = sub / "minecraft" / "config" / "ftbquests" / "quests"
-                    if quests_path.exists() and quests_path.is_dir():
-                        instances.append((sub.name, str(sub), launcher_name))
+                    quest_dirs = find_all_quest_dirs(sub)
+                    if quest_dirs:
+                        instances.append((sub.name, str(sub), launcher_name, quest_dirs))
+                        root_to_quest_dirs[str(sub)] = quest_dirs
         except Exception:
             pass
+
+    if config is not None:
+        for custom_path in config.custom_instances_paths:
+            p = Path(custom_path)
+            if is_valid_custom_instance(p):
+                quest_dirs = find_all_quest_dirs(p)
+                if quest_dirs and str(p) not in root_to_quest_dirs:
+                    instances.append((p.name, str(p), "Custom", quest_dirs))
+                    root_to_quest_dirs[str(p)] = quest_dirs
 
     if not instances:
         logging.getLogger("snbt_localizer.cli").warning("No modpack instances with FTB Quests found.")
@@ -742,16 +803,17 @@ def cmd_fastdir() -> Path | None:
     last_instance = load_cli_setting("cli_last_instance", "")
     default_idx = 0
     if last_instance:
-        for i, (_, path, _) in enumerate(instances):
+        for i, (_, path, _, _) in enumerate(instances):
             if path == last_instance:
                 instances.insert(0, instances.pop(i))
                 default_idx = 0
                 break
 
     logging.getLogger("snbt_localizer.cli").info("Found instances:")
-    for i, (name, path, launcher) in enumerate(instances):
+    for i, (name, path, launcher, quest_dirs) in enumerate(instances):
         marker = " (last used)" if i == 0 and last_instance else ""
-        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} [{launcher}]{marker}")
+        folder_note = " [Multiple Folders]" if len(quest_dirs) > 1 else ""
+        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} [{launcher}]{marker}{folder_note}")
 
     while True:
         choice = input(f"Choice [{default_idx + 1}]: ").strip()
@@ -759,9 +821,10 @@ def cmd_fastdir() -> Path | None:
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(instances):
-                quest_dir = Path(instances[idx][1])
+                name, path_str, launcher, quest_dirs = instances[idx]
+                quest_dir = Path(path_str)
                 save_cli_setting("cli_last_instance", str(quest_dir))
-                return quest_dir
+                return (quest_dir, quest_dirs)
         except ValueError:
             pass
         print("Invalid choice")
@@ -784,7 +847,7 @@ def parse_key_model_pairs(api_keys: List[str]) -> List[Dict[str, str | None]]:
             pairs.append({"key": k, "model": None})
     return pairs
 
-async def run_translation(config: ConfigManager, provider: str, model: str | None, api_keys: List[str], lang_name: str, lang_code: str, quest_dir: Path, concurrency: Optional[int] = None) -> int:
+async def run_translation(config: ConfigManager, provider: str, model: str | None, api_keys: List[str], lang_name: str, lang_code: str, quest_dirs: list[Path], concurrency: Optional[int] = None) -> int:
     logging.getLogger("snbt_localizer.cli").info(f"Provider: {provider}")
     if model:
         logging.getLogger("snbt_localizer.cli").info(f"Model: {model}")
@@ -827,7 +890,7 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
 
         from core import resolve_mixed_pool
         mixed_pool = resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider)
-        
+
         if not mixed_pool:
             logging.getLogger("snbt_localizer.cli").error("No API keys available for Mixed Providers. Configure keys for other providers first.")
             return 1
@@ -838,8 +901,18 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 mixed_pool.append({"provider": provider, "api_key": key, "model": model or "", "base_url": base})
 
     translator = UnifiedTranslator(api_keys, provider, model or "", config.custom_context, lang_name, lang_code, mixed_pool=mixed_pool)
-    target_dir = SNBTManager("", "", "").find_quests_dir(quest_dir)
-    files = [p for p in target_dir.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+
+    if isinstance(quest_dirs, Path):
+        quest_dirs = [quest_dirs]
+
+    all_files = []
+    for qd in quest_dirs:
+        try:
+            target_dir = SNBTManager("", "", "").find_quests_dir(qd)
+        except Exception:
+            target_dir = qd
+        files = [p for p in target_dir.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+        all_files.extend(files)
     if not files:
         logging.getLogger("snbt_localizer.cli").warning("No .snbt files found")
         return 0
@@ -918,6 +991,7 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
 
 async def main_async() -> int:
     config = ConfigManager()
+    config.prune_invalid_paths()
     parsed = config.parse_cli_args()
     setup_logging(debug=parsed.debug)
 
@@ -933,6 +1007,7 @@ async def main_async() -> int:
             if result is None:
                 return 1
             quest_dir, lang_name, lang_code = result
+            quest_dirs = find_all_quest_dirs(quest_dir)
             provider = "Mixed Providers"
             model = None
             api_keys = []
@@ -944,6 +1019,7 @@ async def main_async() -> int:
             config.save_to_settings()
         else:
             quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config)
+            quest_dirs = find_all_quest_dirs(quest_dir)
             if config.provider == "Mixed Providers":
                 api_keys = []
                 for prov in config.api_keys_pool:
@@ -955,7 +1031,7 @@ async def main_async() -> int:
             concurrency = max(config.concurrency, len(api_keys), 5)
         else:
             concurrency = max(1, min(config.concurrency, 10))
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
     
     if parsed.clear_cache:
         if is_interactive():
@@ -969,10 +1045,11 @@ async def main_async() -> int:
         sys.exit(0)
 
     if parsed.fastdir:
-        quest_dir = cmd_fastdir()
-        if quest_dir is None:
+        result = cmd_fastdir(config)
+        if result is None:
             logging.getLogger("snbt_localizer.cli").warning("No instance selected. Exiting.")
             return 1
+        quest_dir, quest_dirs = result
 
         if parsed.mix:
             provider = "Mixed Providers"
@@ -982,7 +1059,7 @@ async def main_async() -> int:
             if not lang_name:
                 lang_name, lang_code = "Russian", "ru_ru"
             concurrency = max(config.concurrency, len(api_keys), 5)
-            return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
+            return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
 
         provider = config.provider
         if config.provider == "Mixed Providers":
@@ -1003,7 +1080,8 @@ async def main_async() -> int:
             need_wizard = True
 
         if need_wizard and is_interactive():
-            quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config)
+            new_quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config)
+            quest_dirs = find_all_quest_dirs(new_quest_dir)
             if config.provider == "Mixed Providers":
                 api_keys = []
                 for prov in config.api_keys_pool:
@@ -1022,9 +1100,13 @@ async def main_async() -> int:
             concurrency = max(config.concurrency, len(api_keys), 5)
         else:
             concurrency = max(1, min(config.concurrency, 10))
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
     else:
         quest_dir = normalize_path(parsed.dir)
+        quest_dirs = find_all_quest_dirs(quest_dir)
+        if not quest_dirs:
+            logging.getLogger("snbt_localizer.cli").error(f"No quest directories found in {quest_dir}")
+            return 1
         provider = config.provider
         if config.provider == "Mixed Providers":
             api_keys = []
@@ -1038,7 +1120,7 @@ async def main_async() -> int:
             concurrency = max(config.concurrency, len(api_keys), 5)
         else:
             concurrency = max(1, min(config.concurrency, 10))
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dir, concurrency)
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
 
 def main() -> None:
     try:
