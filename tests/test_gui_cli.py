@@ -3,6 +3,7 @@ import pytest
 import tempfile
 import sqlite3
 import os
+import shutil
 from pathlib import Path
 from unittest.mock import patch, AsyncMock
 from PyQt6.QtCore import Qt, QSettings
@@ -872,3 +873,25 @@ def test_get_unique_modpacks():
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+def test_sqlite_guard_and_indexing():
+    with pytest.raises(ValueError):
+        TranslationCache("/nonexistent_root_dir_xyz_123/nested/cache.sqlite", "ru_ru")
+
+    temp_dir = tempfile.mkdtemp()
+    nested_db = os.path.join(temp_dir, "new_sub_folder", "cache.sqlite")
+
+    cache = TranslationCache(nested_db, "ru_ru")
+    assert os.path.exists(nested_db)
+
+    cursor = cache.conn.cursor()
+    cursor.execute("PRAGMA journal_mode")
+    mode = cursor.fetchone()[0]
+    assert mode == "wal"
+
+    cursor.execute(f"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_{cache.table_name}_orig_modpack'")
+    index_exists = cursor.fetchone() is not None
+    assert index_exists
+
+    cache.conn.close()
+    shutil.rmtree(temp_dir)

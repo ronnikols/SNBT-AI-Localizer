@@ -5,6 +5,7 @@ import httpx
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
+from logging.handlers import RotatingFileHandler
 from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider, is_valid_custom_instance, PROVIDER_DEFAULTS
 from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
 try:
@@ -52,20 +53,29 @@ def find_all_quest_dirs(instance_path: Path) -> list[Path]:
     return quest_dirs
 
 def setup_logging(debug=False):
-    """Configure logging for the CLI application."""
     root_logger = logging.getLogger("snbt_localizer")
-    root_logger.setLevel(logging.DEBUG)  # capture all levels; handlers filter
+    if root_logger.handlers:
+        return
+    root_logger.setLevel(logging.DEBUG)
+
+    log_dir = os.path.expanduser("~/.snbt_localizer/logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    file_handler = RotatingFileHandler(
+        os.path.join(log_dir, "app.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
+    root_logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
     console_format = logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s")
     console_handler.setFormatter(console_format)
     root_logger.addHandler(console_handler)
-
-    file_handler = logging.FileHandler("snbt_localizer.log", encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(console_format)
-    root_logger.addHandler(file_handler)
 
     root_logger.propagate = False
 
@@ -226,9 +236,8 @@ def load_cli_setting(key: str, default: str = "") -> str:
     return default
 
 async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None, str | None, str, str]:
-    print("\n=== SNBT AI Localizer - Setup Wizard ===\n")
-
-    print("Step 1: Select modpack instance")
+    logging.getLogger("snbt_localizer.cli").info("=== SNBT AI Localizer - Setup Wizard ===")
+    logging.getLogger("snbt_localizer.cli").info("Step 1: Select modpack instance")
     launcher_paths = get_launcher_paths()
     instances = []
     for base, launcher_name in launcher_paths:
@@ -256,7 +265,7 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
             instances.append((p.name, str(p), "Custom"))
 
     if not instances:
-        print("No modpack instances with FTB Quests found.")
+        logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
         custom_path = input("Enter path to modpack manually: ").strip()
         if not custom_path:
             die("No path provided")
@@ -272,11 +281,11 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                     default_idx = 0
                     break
 
-        print("Found instances:")
+        logging.getLogger("snbt_localizer.cli").info("Found instances:")
         for i, (name, path, launcher) in enumerate(instances):
             marker = " (last used)" if i == 0 and last_instance else ""
-            print(f"  {i + 1}) {name} [{launcher}]{marker}")
-        print(f"  {len(instances) + 1}) Enter path manually...")
+            logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} [{launcher}]{marker}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {len(instances) + 1}) Enter path manually...")
 
         while True:
             choice = input(f"Choice [{default_idx + 1}]: ").strip()
@@ -297,21 +306,21 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                     break
             except ValueError:
                 pass
-            print("Invalid choice")
+            logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    print(f"\nSelected: {quest_dir}\n")
+    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {quest_dir}")
 
-    print("Step 2: Select translation provider")
+    logging.getLogger("snbt_localizer.cli").info("Step 2: Select translation provider")
     providers = list(dict.fromkeys(PROVIDER_ALIASES.values()))
     last_provider = load_cli_setting("cli_last_provider", "")
     default_idx = 0
     if last_provider and last_provider in providers:
         default_idx = providers.index(last_provider)
 
-    print("Available providers:")
+    logging.getLogger("snbt_localizer.cli").info("Available providers:")
     for i, p in enumerate(providers):
         marker = " (last used)" if i == default_idx else ""
-        print(f"  {i + 1}) {p}{marker}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {p}{marker}")
 
     while True:
         choice = input(f"Choice [{default_idx + 1}]: ").strip()
@@ -324,9 +333,9 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                 break
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    print(f"\nSelected: {provider}\n")
+    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {provider}")
 
     if provider == "Mixed Providers":
         save_cli_setting("cli_last_provider", provider)
@@ -346,7 +355,7 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
         env_key = load_key_from_env_or_settings(provider)
         if env_key:
             masked = "*" * (len(env_key) - 4) + env_key[-4:] if len(env_key) > 4 else "****"
-            print(f"API key detected in system. Press Enter to use it or enter a new one:")
+            logging.getLogger("snbt_localizer.cli").info(f"API key detected in system. Press Enter to use it or enter a new one:")
             user_key = input(f"Use saved key [{masked}]: ").strip()
             if user_key:
                 api_key = user_key
@@ -363,9 +372,9 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                     if settings_key:
                         save_cli_setting(settings_key, api_key)
                     break
-                print("API Key cannot be empty")
+                logging.getLogger("snbt_localizer.cli").warning("API Key cannot be empty")
 
-    print(f"\nStep 4: Model and Language")
+    logging.getLogger("snbt_localizer.cli").info("\nStep 4: Model and Language")
     model = None
     if provider != "Google Translate (Free)":
         models = await fetch_models(provider, api_key)
@@ -391,11 +400,11 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
         all_models = list(models)
         
         while True:
-            print("Available models:")
+            logging.getLogger("snbt_localizer.cli").info("Available models:")
             for i, m in enumerate(models):
                 base = m.replace(" [RECOMMENDED]", "")
                 marker = " (last used)" if i == 0 and base == last_model else ""
-                print(f"  {i + 1}) {m}{marker}")
+                logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {m}{marker}")
             
             choice = input(f"Choice [1]: ").strip()
             choice = choice or "1"
@@ -414,7 +423,7 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                 if filtered:
                     models = filtered
                     continue
-                print("Invalid choice")
+                logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
     else:
         model = None
 
@@ -434,10 +443,10 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                 default_idx = i
                 break
 
-    print("Available languages:")
+    logging.getLogger("snbt_localizer.cli").info("Available languages:")
     for i, (alias, (name, code)) in enumerate(langs):
         marker = " (last used)" if i == default_idx else ""
-        print(f"  {i + 1}) {name} ({code}){marker}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} ({code}){marker}")
 
     while True:
         choice = input(f"Choice [{default_idx + 1}]: ").strip()
@@ -450,10 +459,10 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
                 break
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    print(f"\nSelected: {lang_name} ({lang_code})\n")
-    print("Starting translation...\n")
+    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {lang_name} ({lang_code})")
+    logging.getLogger("snbt_localizer.cli").info("Starting translation...")
 
     config.provider = provider
     config.model = model
@@ -467,7 +476,7 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
     return quest_dir, provider, api_key, model, lang_name, lang_code
 
 async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] | None:
-    print("\n=== SNBT AI Localizer - Mixed Mode Setup ===\n")
+    logging.getLogger("snbt_localizer.cli").info("=== SNBT AI Localizer - Mixed Mode Setup ===")
 
     launcher_paths = get_launcher_paths()
     instances = []
@@ -486,7 +495,7 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
             pass
 
     if not instances:
-        print("No modpack instances with FTB Quests found.")
+        logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
         custom_path = input("Enter path to modpack manually: ").strip()
         if not custom_path:
             return None
@@ -502,11 +511,11 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                     default_idx = 0
                     break
 
-        print("Found instances:")
+        logging.getLogger("snbt_localizer.cli").info("Found instances:")
         for i, (name, path, launcher) in enumerate(instances):
             marker = " (last used)" if i == 0 and last_instance else ""
-            print(f"  {i + 1}) {name} [{launcher}]{marker}")
-        print(f"  {len(instances) + 1}) Enter path manually...")
+            logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} [{launcher}]{marker}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {len(instances) + 1}) Enter path manually...")
 
         while True:
             choice = input(f"Choice [{default_idx + 1}]: ").strip()
@@ -527,14 +536,14 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                     break
             except ValueError:
                 pass
-            print("Invalid choice")
+            logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    print(f"\nSelected: {quest_dir}\n")
+    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {quest_dir}")
 
     providers = [p for p in dict.fromkeys(PROVIDER_ALIASES.values()) if p != "Mixed Providers"]
-    print("Select providers for Mixed mode (enter numbers separated by space, or press Enter to use saved keys):")
+    logging.getLogger("snbt_localizer.cli").info("Select providers for Mixed mode (enter numbers separated by space, or press Enter to use saved keys):")
     for i, p in enumerate(providers, 1):
-        print(f"  {i}) {p}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i}) {p}")
 
     choice = input("Choice: ").strip()
     if choice:
@@ -547,7 +556,7 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
             except:
                 pass
         if not selected_indices:
-            print("No valid providers selected.")
+            logging.getLogger("snbt_localizer.cli").error("No valid providers selected.")
             return None
         selected_providers = [providers[i] for i in selected_indices]
         settings = QSettings("MineAI", "SNBT-Localizer")
@@ -563,14 +572,14 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                     save_cli_setting(settings_key, api_key)
                     config.set_api_keys(prov, [api_key])
                 else:
-                    print(f"Skipping {prov} - no API key provided.")
+                    logging.getLogger("snbt_localizer.cli").warning(f"Skipping {prov} - no API key provided.")
                     continue
 
             models = await fetch_models(prov, api_key)
             if models:
-                print(f"\nSelect model for {prov}:")
+                logging.getLogger("snbt_localizer.cli").info(f"\nSelect model for {prov}:")
                 for i, m in enumerate(models, 1):
-                    print(f"  {i}) {m}")
+                    logging.getLogger("snbt_localizer.cli").info(f"  {i}) {m}")
                 model_choice = input("Choice [1]: ").strip() or "1"
                 try:
                     model_idx = int(model_choice) - 1
@@ -597,10 +606,10 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                 default_idx = i
                 break
 
-    print("Available languages:")
+    logging.getLogger("snbt_localizer.cli").info("Available languages:")
     for i, (alias, (name, code)) in enumerate(langs):
         marker = " (last used)" if i == default_idx else ""
-        print(f"  {i + 1}) {name} ({code}){marker}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} ({code}){marker}")
 
     while True:
         choice = input(f"Choice [{default_idx + 1}]: ").strip()
@@ -613,10 +622,10 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                 break
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    print(f"\nSelected: {lang_name} ({lang_code})\n")
-    print("Starting translation...\n")
+    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {lang_name} ({lang_code})")
+    logging.getLogger("snbt_localizer.cli").info("Starting translation...")
     config.provider = "Mixed Providers"
     config.target_lang = lang_code
     config.quest_dir = quest_dir
@@ -624,10 +633,7 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
     return quest_dir, lang_name, lang_code
 
 def die(msg: str, code: int = 1) -> None:
-    try:
-        logging.getLogger("snbt_localizer.cli").error(msg)
-    except Exception:
-        sys.stderr.write(f"ERROR: {msg}\n")
+    logging.getLogger("snbt_localizer.cli").error(msg)
     sys.exit(code)
 
 def load_key_from_env_or_settings(provider: str) -> str | None:
@@ -687,14 +693,21 @@ async def fetch_models(provider: str, api_key: str | None) -> list[str]:
     if not endpoint:
         return []
     headers = {}
-    if api_key and provider != "Ollama (Local / Free)":
-        headers["Authorization"] = f"Bearer {api_key}"
+    if api_key:
+        if "Anthropic" in provider:
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+        elif provider != "Ollama (Local / Free)":
+            headers["Authorization"] = f"Bearer {api_key}"
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.get(endpoint, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
-                models = [m["id"] for m in data.get("data", [])]
+                if "Cohere" in provider:
+                    models = [m["id"] for m in data.get("models", [])]
+                else:
+                    models = [m["id"] for m in data.get("data", [])]
                 return [m for m in models if not any(kw in m.lower() for kw in SERVICE_MODEL_KEYWORDS)]
     except Exception:
         pass
@@ -702,9 +715,9 @@ async def fetch_models(provider: str, api_key: str | None) -> list[str]:
 
 def select_provider_interactive() -> str:
     providers = list(dict.fromkeys(PROVIDER_ALIASES.values()))
-    print("Select provider:")
+    logging.getLogger("snbt_localizer.cli").info("Select provider:")
     for i, p in enumerate(providers, 1):
-        print(f"  {i}) {p}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i}) {p}")
     while True:
         choice = input("Choice [1]: ").strip()
         choice = choice or "1"
@@ -714,7 +727,7 @@ def select_provider_interactive() -> str:
                 return providers[idx]
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
 def select_model_interactive(models: list[str], provider: str) -> str:
     if not models:
@@ -722,11 +735,11 @@ def select_model_interactive(models: list[str], provider: str) -> str:
         if default:
             return default
         die("No models available and no default for provider")
-    print("Select model:")
+    logging.getLogger("snbt_localizer.cli").info("Select model:")
     for i, m in enumerate(models[:20], 1):
-        print(f"  {i}) {m}")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i}) {m}")
     if len(models) > 20:
-        print(f"  ... and {len(models) - 20} more")
+        logging.getLogger("snbt_localizer.cli").info(f"  ... and {len(models) - 20} more")
     default_model = PROVIDER_DEFAULTS.get(provider)
     default_idx = 1
     if default_model and default_model in models:
@@ -740,13 +753,13 @@ def select_model_interactive(models: list[str], provider: str) -> str:
                 return models[idx]
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
 def select_language_interactive() -> tuple[str, str]:
     langs = list(LANG_ALIASES.items())
-    print("Select language:")
+    logging.getLogger("snbt_localizer.cli").info("Select language:")
     for i, (alias, (name, code)) in enumerate(langs, 1):
-        print(f"  {i}) {name} ({code})")
+        logging.getLogger("snbt_localizer.cli").info(f"  {i}) {name} ({code})")
     while True:
         choice = input("Choice [1]: ").strip()
         choice = choice or "1"
@@ -756,7 +769,7 @@ def select_language_interactive() -> tuple[str, str]:
                 return langs[idx][1]
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
 async def cmd_list_models(provider: str) -> int:
     api_key = load_key_from_env_or_settings(provider)
@@ -827,7 +840,7 @@ def cmd_fastdir(config: ConfigManager = None) -> tuple[Path, list[Path]] | None:
                 return (quest_dir, quest_dirs)
         except ValueError:
             pass
-        print("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
 def resolve_policy(policy: str) -> str:
     mapping = {
@@ -931,7 +944,7 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
             sys.stdout.write('\033[F\033[K')
         else:
             first_file = False
-        print(msg)
+        logging.getLogger("snbt_localizer.cli").info(msg)
         overall = sum(file_progress.values())
         render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
 
@@ -1037,11 +1050,11 @@ async def main_async() -> int:
         if is_interactive():
             confirm = input("Are you sure you want to clear the entire translation cache? (y/n) [n]: ").strip().lower()
             if confirm not in ("y", "yes"):
-                print("Cancelled.")
+                logging.getLogger("snbt_localizer.cli").info("Cancelled.")
                 return 0
         cache = TranslationCache()
         cache.clear_all()
-        print("Кэш переводов SQLite успешно очищен.")
+        logging.getLogger("snbt_localizer.cli").info("Кэш переводов SQLite успешно очищен.")
         sys.exit(0)
 
     if parsed.fastdir:
@@ -1127,7 +1140,7 @@ def main() -> None:
         exit_code = asyncio.run(main_async())
         sys.exit(exit_code)
     except KeyboardInterrupt:
-        print("\n[SIGINT] Получен сигнал прерывания. Безопасная остановка (Graceful Shutdown)...")
+        logging.getLogger("snbt_localizer.cli").error("[SIGINT] Получен сигнал прерывания. Безопасная остановка (Graceful Shutdown)...")
         sys.exit(130)
     except Exception as e:
         logging.getLogger("snbt_localizer.cli").exception("Unexpected error")

@@ -25,6 +25,11 @@ PROVIDER_ALIASES = {
     "mix": "Mixed Providers",
     "openai": "OpenAI",
     "mistral": "Mistral AI",
+    "anthropic": "Anthropic (Claude)",
+    "claude": "Anthropic (Claude)",
+    "cohere": "Cohere",
+    "local": "Local LLM / Custom",
+    "custom": "Local LLM / Custom",
 }
 
 PROVIDER_ENDPOINTS = {
@@ -36,6 +41,9 @@ PROVIDER_ENDPOINTS = {
     "Sambanova": "https://api.sambanova.ai/v1/models",
     "OpenAI": "https://api.openai.com/v1/models",
     "Mistral AI": "https://api.mistral.ai/v1/models",
+    "Anthropic (Claude)": "https://api.anthropic.com/v1/messages",
+    "Cohere": "https://api.cohere.ai/v1/chat",
+    "Local LLM / Custom": "",
 }
 
 LANG_ALIASES = {
@@ -61,6 +69,9 @@ ENV_KEY_MAP = {
     "Sambanova": "SAMBANOVA_API_KEY",
     "OpenAI": "OPENAI_API_KEY",
     "Mistral AI": "MISTRAL_API_KEY",
+    "Anthropic (Claude)": "ANTHROPIC_API_KEY",
+    "Cohere": "COHERE_API_KEY",
+    "Local LLM / Custom": "",
 }
 
 SETTINGS_KEY_MAP = {
@@ -71,6 +82,9 @@ SETTINGS_KEY_MAP = {
     "Sambanova": "sambanova_api_key",
     "OpenAI": "openai_api_key",
     "Mistral AI": "mistral_api_key",
+    "Anthropic (Claude)": "anthropic_api_key",
+    "Cohere": "cohere_api_key",
+    "Local LLM / Custom": "",
 }
 
 class ConfigManager:
@@ -81,7 +95,12 @@ class ConfigManager:
         "Google Gemini (Free API)",
         "Sambanova",
         "OpenAI",
-        "Mistral AI"
+        "Mistral AI",
+        "Anthropic (Claude)",
+        "Cohere",
+        "Google Translate (Free)",
+        "Ollama (Local / Free)",
+        "Local LLM / Custom"
     ]
 
     def __init__(self):
@@ -94,6 +113,9 @@ class ConfigManager:
         self.policy: str = "Complement (Дополнить)"
         self.api_keys_pool: Dict[str, List[str]] = {}
         self.custom_instances_paths: List[str] = []
+        self.batch_size: int = 50
+        self.min_batch_size: int = 1
+        self.max_concurrent_requests: int = 10
 
         self.load_from_settings()
 
@@ -121,6 +143,10 @@ class ConfigManager:
         raw = s.value("custom_instances_paths", "")
         if raw:
             self.custom_instances_paths = [p.strip() for p in str(raw).splitlines() if p.strip()]
+
+        self.batch_size = int(s.value("batch_size", 50))
+        self.min_batch_size = int(s.value("min_batch_size", 1))
+        self.max_concurrent_requests = int(s.value("max_concurrent_requests", 10))
 
         for prov in PROVIDER_ALIASES.values():
             raw = s.value(f"api_keys_pool_{prov}", "")
@@ -153,6 +179,10 @@ class ConfigManager:
 
         for prov, keys in self.api_keys_pool.items():
             s.setValue(f"api_keys_pool_{prov}", "\n".join(keys))
+
+        s.setValue("batch_size", self.batch_size)
+        s.setValue("min_batch_size", self.min_batch_size)
+        s.setValue("max_concurrent_requests", self.max_concurrent_requests)
         s.sync()
 
     def parse_cli_args(self, args: Optional[List[str]] = None):
@@ -175,6 +205,12 @@ class ConfigManager:
         parser.add_argument("--debug", action="store_true", help="Enable debug logging to console")
         parser.add_argument('--mix', action='store_true', help='Enable Mixed Provider mode using QSettings key pool')
         parser.add_argument('--gui', action='store_true', help='Launch Graphical User Interface (GUI)')
+        parser.add_argument("--batch-size", type=int, default=50,
+                            help="Batch size for translation (default: 50)")
+        parser.add_argument("--min-batch-size", type=int, default=1,
+                            help="Minimum batch size before failing (default: 1)")
+        parser.add_argument("--max-concurrent-requests", type=int, default=10,
+                            help="Max concurrent API requests (default: 10)")
 
         parsed = parser.parse_args(args)
 
@@ -221,6 +257,13 @@ class ConfigManager:
 
         if parsed.concurrency:
             self.concurrency = max(1, min(parsed.concurrency, 10))
+
+        if parsed.batch_size:
+            self.batch_size = max(1, parsed.batch_size)
+        if parsed.min_batch_size:
+            self.min_batch_size = max(1, parsed.min_batch_size)
+        if parsed.max_concurrent_requests:
+            self.max_concurrent_requests = max(1, parsed.max_concurrent_requests)
 
         if parsed.key:
             keys = [k.strip() for k in parsed.key.split(",") if k.strip()]

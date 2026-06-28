@@ -10,8 +10,9 @@ import threading
 import time
 import aiofiles
 import logging
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 PROVIDER_DEFAULTS = {
     "Google Translate (Free)": None,
@@ -23,11 +24,200 @@ PROVIDER_DEFAULTS = {
     "Sambanova": "DeepSeek-V3.1",
     "OpenAI": "gpt-4o-mini",
     "Mistral AI": "mistral-large-latest",
+    "Anthropic (Claude)": "claude-3-5-sonnet-20241022",
+    "Cohere": "command-r-plus",
+    "Local LLM / Custom": "",
 }
 
 logger = logging.getLogger("snbt_localizer.core")
 
 EXCLUDED_DIRS = {'waydroid', 'flatpak', '.steam', '.cache', 'Trash', 'trash', '.git', 'node_modules', 'saves', 'backups', 'simplebackups'}
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str) -> List[str]:
+        pass
+
+    @abstractmethod
+    async def ping_key(self, api_key: str, model: str) -> str:
+        pass
+
+class OpenAIProvider(BaseProvider):
+    def __init__(self, custom_base_url: Optional[str] = None):
+        self.custom_base_url = custom_base_url or "https://api.openai.com/v1"
+
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str) -> List[str]:
+        user_content = f"Translate this JSON array of strings to Russian. Return ONLY a valid JSON array of the same length: {json.dumps(texts, ensure_ascii=False)}"
+        base_url = self.custom_base_url.rstrip('/')
+        url = f"{base_url}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": user_content}],
+            "temperature": 0.1
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data['choices'][0]['message']['content']
+            parsed = extract_json_array(content)
+            if isinstance(parsed, list) and len(parsed) == len(texts):
+                return [str(item) for item in parsed]
+            raise ValueError("Invalid response format")
+
+    async def ping_key(self, api_key: str, model: str) -> str:
+        base_url = self.custom_base_url.rstrip('/')
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{base_url}/models", headers=headers)
+                if resp.status_code == 200:
+                    return "Active"
+                if resp.status_code in (401, 403):
+                    return "Invalid"
+                return "Unreachable"
+        except Exception:
+            return "Unreachable"
+
+class AnthropicProvider(BaseProvider):
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str) -> List[str]:
+        user_content = f"Translate this JSON array of strings to Russian. Return ONLY a valid JSON array of the same length: {json.dumps(texts, ensure_ascii=False)}"
+        system_prompt = "You are a precise translation assistant. Always return a JSON array matching the input length."
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 4000,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_content}]
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data['content'][0]['text']
+            parsed = extract_json_array(content)
+            if isinstance(parsed, list) and len(parsed) == len(texts):
+                return [str(item) for item in parsed]
+            raise ValueError("Invalid response format")
+
+    async def ping_key(self, api_key: str, model: str) -> str:
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://api.anthropic.com/v1/messages", headers=headers)
+                if resp.status_code in (200, 405):
+                    return "Active"
+                if resp.status_code in (401, 403):
+                    return "Invalid"
+                return "Unreachable"
+        except Exception:
+            return "Unreachable"
+
+class CohereProvider(BaseProvider):
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str) -> List[str]:
+        user_content = f"Translate this JSON array of strings to Russian. Return ONLY a valid JSON array of the same length: {json.dumps(texts, ensure_ascii=False)}"
+        system_prompt = "You are a precise translation assistant. Always return a JSON array matching the input length."
+        url = "https://api.cohere.ai/v1/chat"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "content-type": "application/json"
+        }
+        payload = {
+            "model": model,
+            "message": user_content,
+            "preamble": system_prompt
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data['text']
+            parsed = extract_json_array(content)
+            if isinstance(parsed, list) and len(parsed) == len(texts):
+                return [str(item) for item in parsed]
+            raise ValueError("Invalid response format")
+
+    async def ping_key(self, api_key: str, model: str) -> str:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://api.cohere.ai/v1/models", headers=headers)
+                if resp.status_code == 200:
+                    return "Active"
+                if resp.status_code in (401, 403):
+                    return "Invalid"
+                return "Unreachable"
+        except Exception:
+            return "Unreachable"
+
+class OllamaProvider(BaseProvider):
+    def __init__(self, custom_base_url: Optional[str] = None):
+        self.custom_base_url = custom_base_url or "http://localhost:11434"
+
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str) -> List[str]:
+        user_content = f"Translate this JSON array of strings to Russian. Return ONLY a valid JSON array of the same length: {json.dumps(texts, ensure_ascii=False)}"
+        base_url = self.custom_base_url.rstrip('/')
+        url = f"{base_url}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": user_content}],
+            "temperature": 0.1
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data['choices'][0]['message']['content']
+            parsed = extract_json_array(content)
+            if isinstance(parsed, list) and len(parsed) == len(texts):
+                return [str(item) for item in parsed]
+            raise ValueError("Invalid response format")
+
+    async def ping_key(self, api_key: str, model: str) -> str:
+        base_url = self.custom_base_url.rstrip('/')
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{base_url}/api/tags")
+                return "Active" if resp.status_code == 200 else "Unreachable"
+        except Exception:
+            return "Unreachable"
+
+class GoogleProvider(BaseProvider):
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str) -> List[str]:
+        return await GoogleFreeTranslator().translate(texts, "ru_ru")
+
+    async def ping_key(self, api_key: str, model: str) -> str:
+        return "Active"
+
+def get_provider_class(provider: str, custom_base_url: Optional[str] = None) -> BaseProvider:
+    base_url = get_base_url(provider)
+    if custom_base_url:
+        base_url = custom_base_url
+    provider_map = {
+        "OpenAI": OpenAIProvider(base_url),
+        "Groq Cloud (Fast)": OpenAIProvider(base_url),
+        "Mistral AI": OpenAIProvider(base_url),
+        "NVIDIA NIM": OpenAIProvider(base_url),
+        "Sambanova": OpenAIProvider(base_url),
+        "OpenRouter (Cloud AI)": OpenAIProvider(base_url),
+        "Google Translate (Free)": GoogleProvider(),
+        "Google Gemini (Free API)": OpenAIProvider(base_url),
+        "Ollama (Local / Free)": OllamaProvider(base_url),
+        "Anthropic (Claude)": AnthropicProvider(),
+        "Cohere": CohereProvider(),
+        "Local LLM / Custom": OpenAIProvider(base_url),
+    }
+    return provider_map.get(provider, OpenAIProvider(base_url))
 
 def is_valid_custom_instance(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
@@ -126,10 +316,16 @@ def parse_snbt_map(content: str) -> Dict[str, str]:
 
 class TranslationCache:
     def __init__(self, db_path="cache.sqlite", target_lang_code="ru_ru"):
-        self.db_path = db_path
+        self.db_path = os.path.abspath(db_path)
+        parent_dir = os.path.dirname(self.db_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            try:
+                os.makedirs(parent_dir, exist_ok=True)
+            except OSError as e:
+                raise ValueError(f"Cannot create directory for database: {parent_dir}. Error: {e}")
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', target_lang_code)
         self.table_name = f"cache_{sanitized}"
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.lock = threading.Lock()
@@ -144,6 +340,7 @@ class TranslationCache:
             if "modpack" not in columns:
                 cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN modpack TEXT")
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_modpack ON {self.table_name}(modpack)")
+            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_orig_modpack ON {self.table_name}(orig, modpack)")
             self.conn.commit()
 
     def _sanitize_mapping(self, mapping):
@@ -346,7 +543,8 @@ def get_default_model(provider: str) -> str:
     return PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
 
 def get_base_url(provider: str) -> str:
-    if not provider or not isinstance(provider, str): return "https://api.openai.com/v1"
+    if not provider or not isinstance(provider, str):
+        return "https://api.openai.com/v1"
     if "Groq" in provider:
         return "https://api.groq.com/openai/v1"
     if "NVIDIA NIM" in provider:
@@ -363,6 +561,12 @@ def get_base_url(provider: str) -> str:
         return "https://api.openai.com/v1"
     if "Mistral" in provider:
         return "https://api.mistral.ai/v1"
+    if "Anthropic" in provider:
+        return "https://api.anthropic.com/v1"
+    if "Cohere" in provider:
+        return "https://api.cohere.ai/v1"
+    if "Local LLM" in provider or "Custom" in provider:
+        return ""
     return "https://api.openai.com/v1"
 
 def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider):
@@ -375,7 +579,12 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
             "Sambanova",
             "OpenRouter (Cloud AI)",
             "Mistral AI",
-            "OpenAI"
+            "OpenAI",
+            "Anthropic (Claude)",
+            "Cohere",
+            "Google Translate (Free)",
+            "Ollama (Local / Free)",
+            "Local LLM / Custom"
         ]
         for prov in providers:
             keys = saved_keys_by_provider.get(prov, [])
@@ -413,7 +622,7 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
     return resolved
 
 class UnifiedTranslator:
-    def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10):
+    def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, custom_base_url: Optional[str] = None):
         cleaned = []
         seen = set()
         for k in api_keys:
@@ -424,6 +633,7 @@ class UnifiedTranslator:
         self.api_keys = cleaned
         self.api_key = cleaned[0] if cleaned else ""
         self.provider = provider
+        self.custom_base_url = custom_base_url
         model_lower = model.lower() if model else ""
         if not model or any(kw.lower() in model_lower for kw in ["enter api key", "loading", "n/a", "none"]):
             model = get_default_model(provider)
@@ -473,24 +683,6 @@ class UnifiedTranslator:
         else:
             for key in cleaned:
                 self.mixed_pool.append({"provider": provider, "api_key": key, "model": model, "base_url": get_base_url(provider)})
-        if "Groq" in provider:
-            self.url = "https://api.groq.com/openai/v1/chat/completions"
-            self.base_headers = {"Content-Type": "application/json"}
-        elif "Gemini" in provider:
-            self.url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-            self.base_headers = {"Content-Type": "application/json"}
-        elif "Ollama" in provider:
-            self.url = "http://localhost:11434/v1/chat/completions"
-            self.base_headers = {"Content-Type": "application/json"}
-        elif "NVIDIA NIM" in provider:
-            self.url = "https://integrate.api.nvidia.com/v1/chat/completions"
-            self.base_headers = {"Content-Type": "application/json"}
-        elif "Sambanova" in provider:
-            self.url = "https://api.sambanova.ai/v1/chat/completions"
-            self.base_headers = {"Content-Type": "application/json"}
-        else:
-            self.url = "https://openrouter.ai/api/v1/chat/completions"
-            self.base_headers = {"Content-Type": "application/json"}
         context_str = f"<user_context>{custom_context}</user_context>" if custom_context else "Modpack FTB Quests context."
         self.prompt = (
             f"Translate the JSON array of strings to {target_lang_name}. "
@@ -500,6 +692,21 @@ class UnifiedTranslator:
             "Do not merge, skip, omit, or combine any array elements. Output ONLY a valid JSON array of strings. "
             "Keep placeholders like __TAG_X__ exactly as they are without translation, spacing or modification."
         )
+        self.provider_instances = {}
+        for entry in self.mixed_pool:
+            prov = entry["provider"]
+            if prov not in self.provider_instances:
+                base_url = entry.get("base_url", get_base_url(prov))
+                if custom_base_url and prov in ("Local LLM / Custom", "Ollama (Local / Free)"):
+                    base_url = custom_base_url
+                self.provider_instances[prov] = get_provider_class(prov, base_url)
+
+    async def ping_key(self, api_key: str, provider: str, model: str) -> str:
+        if "Google Translate" in provider or "Ollama" in provider:
+            return "Active"
+        if provider in self.provider_instances:
+            return await self.provider_instances[provider].ping_key(api_key, model)
+        return "Unreachable"
 
     async def translate(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
         if not texts:
@@ -595,108 +802,78 @@ class UnifiedTranslator:
                     tried += 1
                     continue
 
-                url = f"{entry['base_url']}/chat/completions"
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {entry['api_key']}"
-                }
-                payload = {
-                    "model": entry["model"],
-                    "messages": [{"role": "user", "content": user_content}],
-                    "temperature": 0.1
-                }
-
-                try:
-                    async with httpx.AsyncClient(timeout=self.timeout) as client:
-                        resp = await client.post(url, headers=headers, json=payload)
-                        if resp.status_code == 429 or resp.status_code >= 500:
+                provider_name = entry.get("provider") or self.provider
+                if provider_name == "Google Translate (Free)":
+                    try:
+                        res = await self.free_google.translate(texts, self.target_lang_code)
+                        self.key_backoff[entry["api_key"]] = 0
+                        break
+                    except Exception as e:
+                        model_name = entry.get("model", self.model) or ''
+                        raw_key = str(entry.get("api_key") or "")
+                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                        if model_name:
+                            logging.getLogger("snbt_localizer.core").error(f"[{context}] Google Translate Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})")
+                        else:
+                            logging.getLogger("snbt_localizer.core").error(f"[{context}] Google Translate Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})")
+                        break
+                provider_instance = self.provider_instances.get(provider_name)
+                if provider_instance:
+                    try:
+                        res = await provider_instance.send_request(texts, entry["api_key"], entry["model"], logger, check_status, context)
+                        self.key_backoff[entry["api_key"]] = 0
+                        break
+                    except httpx.TimeoutException:
+                        api_key = str(entry["api_key"])
+                        self.key_cooldown_until[entry["api_key"]] = now + 150.0
+                        key_suffix = api_key[-4:] if len(api_key) > 4 else api_key
+                        logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
+                        tried += 1
+                        continue
+                    except httpx.HTTPStatusError as e:
+                        status = e.response.status_code
+                        reason = getattr(e.response, 'reason_phrase', '') or ''
+                        model_name = entry.get("model", self.model) or ''
+                        raw_key = str(entry.get("api_key") or "")
+                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                        if model_name:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                            )
+                        else:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                            )
+                        if status in (401, 403):
+                            async with self.pool_lock:
+                                if entry in self.mixed_pool:
+                                    self.mixed_pool.remove(entry)
+                                self.key_index = 0
+                                if not self.mixed_pool:
+                                    raise AbortException("All API keys failed with 401/403.")
+                            continue
+                        elif status == 429:
                             current_backoff = self.key_backoff.get(entry["api_key"], 0)
                             delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
                             self.key_cooldown_until[entry["api_key"]] = now + delay
                             self.key_backoff[entry["api_key"]] = current_backoff + 1
-                            logging.getLogger("snbt_localizer.core").warning(f"[{context}] Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Backoff: {delay:.1f}s (Attempt {attempt+1}/{max_attempts}).")
+                            logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
                             tried += 1
                             continue
-                        resp.raise_for_status()
-                        resp_data = resp.json()
-                        if 'choices' in resp_data and len(resp_data['choices']) > 0:
-                            content = resp_data['choices'][0]['message']['content']
-                            if not isinstance(content, str):
-                                content = str(content)
-                            content = content.strip()
+                        break
+                    except Exception as e:
+                        model_name = entry.get("model", self.model) or ''
+                        raw_key = str(entry.get("api_key") or "")
+                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                        if model_name:
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                            )
                         else:
-                            error_msg = resp_data.get("error", {}).get("message", "Unknown API error (empty choices)")
-                            raise ValueError(error_msg)
-                        content = re.sub(r'<' + 'think>.*?</' + 'think>', '', content, flags=re.DOTALL).strip()
-                        parsed_res = extract_json_array(content)
-                        if isinstance(parsed_res, list) and len(parsed_res) == len(texts):
-                            res = []
-                            for item in parsed_res:
-                                if isinstance(item, dict):
-                                    val = item.get("translation") or item.get("translated") or item.get("text")
-                                    if not val:
-                                        val = next((str(v) for v in item.values() if isinstance(v, str)), str(item))
-                                    res.append(str(val))
-                                else:
-                                    res.append(str(item))
-                            self.key_backoff[entry["api_key"]] = 0
-                            break
-                        else:
-                            logging.getLogger("snbt_localizer.core").warning(f"API Format Error (Attempt {attempt+1}/{max_attempts}). Array mismatch.")
-                            break
-                except httpx.TimeoutException:
-                    api_key = str(entry["api_key"])
-                    self.key_cooldown_until[entry["api_key"]] = now + 150.0
-                    key_suffix = api_key[-4:] if len(api_key) > 4 else api_key
-                    logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
-                    tried += 1
-                    continue
-                except httpx.HTTPStatusError as e:
-                    status = e.response.status_code
-                    reason = getattr(e.response, 'reason_phrase', '') or ''
-                    provider_name = entry.get("provider") or self.provider
-                    model_name = entry.get("model", self.model) or ''
-                    raw_key = str(entry.get("api_key") or "")
-                    key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                    if model_name:
-                        logging.getLogger("snbt_localizer.core").error(
-                            f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                        )
-                    else:
-                        logging.getLogger("snbt_localizer.core").error(
-                            f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                        )
-                    if status in (401, 403):
-                        async with self.pool_lock:
-                            if entry in self.mixed_pool:
-                                self.mixed_pool.remove(entry)
-                            self.key_index = 0
-                            if not self.mixed_pool:
-                                raise AbortException("All API keys failed with 401/403.")
-                        continue
-                    elif status == 429:
-                        current_backoff = self.key_backoff.get(entry["api_key"], 0)
-                        delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
-                        self.key_cooldown_until[entry["api_key"]] = now + delay
-                        self.key_backoff[entry["api_key"]] = current_backoff + 1
-                        logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
-                        tried += 1
-                        continue
-                    break
-                except Exception as e:
-                    provider_name = entry.get("provider") or self.provider
-                    model_name = entry.get("model", self.model) or ''
-                    raw_key = str(entry.get("api_key") or "")
-                    key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                    if model_name:
-                        logging.getLogger("snbt_localizer.core").error(
-                            f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                        )
-                    else:
-                        logging.getLogger("snbt_localizer.core").error(
-                            f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                        )
-                    break
+                            logging.getLogger("snbt_localizer.core").error(
+                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                            )
+                        break
 
             if res is not None:
                 break
@@ -719,7 +896,7 @@ class UnifiedTranslator:
         return res
 
 class SNBTManager:
-    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None):
+    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None, custom_base_url: Optional[str] = None):
         self.cache = TranslationCache(target_lang_code=target_lang_code)
         self.target_lang_code = target_lang_code
         self.provider = provider
@@ -734,7 +911,7 @@ class SNBTManager:
             self.translator = translator
         else:
             keys = [api_key] if api_key and api_key != "SKIP" else []
-            self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool, batch_size=batch_size, min_batch_size=min_batch_size, max_concurrent_requests=max_concurrent_requests)
+            self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool, batch_size=batch_size, min_batch_size=min_batch_size, max_concurrent_requests=max_concurrent_requests, custom_base_url=custom_base_url)
 
     def close(self):
         self.cache.close()
@@ -895,6 +1072,8 @@ class SNBTManager:
                 if not chunk_to_send:
                     continue
                 
+                if progress_callback:
+                    progress_callback(i // chunk_size, total_chunks, min(i + chunk_size, len(to_trans)), len(to_trans))
                 try:
                     res = await self.translator.translate(chunk_to_send, logger, check_status, context=filepath.name)
                     new_map = dict(zip(chunk_to_send, res))
@@ -917,6 +1096,9 @@ class SNBTManager:
                 mapping.update(new_map)
                 self.cache.save_batch(new_map, modpack=self.modpack)
                 
+                if progress_callback:
+                    progress_callback((i + chunk_size) // chunk_size, total_chunks, min(i + chunk_size, len(to_trans)), len(to_trans))
+
                 for orig, trans in new_map.items():
                     if orig != trans:
                         provider_name = self.translator.provider

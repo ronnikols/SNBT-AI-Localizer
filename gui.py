@@ -4,6 +4,7 @@ import re
 import asyncio
 import time
 import logging
+import weakref
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QFileDialog, QLineEdit, 
@@ -56,20 +57,26 @@ def find_all_quest_dirs(instance_path: Path) -> list[Path]:
         quest_dirs.append(instance_path)
     return quest_dirs
 
-class LogSignaler(QObject):
-    log_signal = pyqtSignal(str)
+class QtLogSignaler(QObject):
+    log_signal = pyqtSignal(str, int)
 
-class QTextEditHandler(logging.Handler):
-    """Custom logging handler that emits log records to a QTextEdit via a signal."""
+class QtLoggingHandler(logging.Handler):
     def __init__(self, text_edit):
         super().__init__()
-        self.signaler = LogSignaler()
-        self.signaler.log_signal.connect(text_edit.append)
+        self.signaler = QtLogSignaler()
+        self.text_edit_ref = weakref.ref(text_edit)
+        self.signaler.log_signal.connect(self._append_to_text_edit)
         self.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
 
+    def _append_to_text_edit(self, msg, level):
+        text_edit = self.text_edit_ref()
+        if text_edit is not None:
+            text_edit.append(msg)
+
     def emit(self, record):
-        msg = self.format(record)
-        self.signaler.log_signal.emit(msg)
+        if record.levelno >= logging.INFO:
+            msg = self.format(record)
+            self.signaler.log_signal.emit(msg, record.levelno)
 
 STYLE_SHEET = """
 QMainWindow {
@@ -616,9 +623,42 @@ class ModelLoader(QThread):
                         models = [m["id"] for m in data.get("data", [])]
                     elif resp.status_code in (401, 403):
                         error_msg = f"Mistral API error {resp.status_code}: Invalid or missing API key"
+                elif "Anthropic" in self.provider and self.api_key:
+                    headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}
+                    resp = await client.get("https://api.anthropic.com/v1/models", headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"Anthropic API error {resp.status_code}: Invalid or missing API key"
+                elif "Cohere" in self.provider and self.api_key:
+                    headers = {"Authorization": f"Bearer {self.api_key}"}
+                    resp = await client.get("https://api.cohere.ai/v1/models", headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("models", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"Cohere API error {resp.status_code}: Invalid or missing API key"
         except Exception as e:
             error_msg = f"Connection error: {str(e)}"
         self.loaded.emit(models, error_msg, self.loader_id, self.provider)
+
+class KeyVerifierWorker(QThread):
+    verification_complete = pyqtSignal(dict)
+
+    def __init__(self, keys, provider, model, translator):
+        super().__init__()
+        self.keys = keys
+        self.provider = provider
+        self.model = model
+        self.translator = translator
+
+    def run(self):
+        results = {}
+        for key in self.keys:
+            status = asyncio.run(self.translator.ping_key(key, self.provider, self.model))
+            results[key] = status
+        self.verification_complete.emit(results)
 
 class Worker(QThread):
     log = pyqtSignal(str)
@@ -626,11 +666,12 @@ class Worker(QThread):
     progress_batch = pyqtSignal(int, int)
     chunk_progress = pyqtSignal(int, int, int, int)
     lines_translated = pyqtSignal(int, int)
+    progress_state = pyqtSignal(int, int, str, int, int, float)
 
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None):
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None, custom_base_url=None):
         super().__init__()
         self.files = files
-        self.keys = keys  # list of api keys
+        self.keys = keys
         self.provider = provider
         self.model = model
         self.t_titles = t_titles
@@ -645,8 +686,14 @@ class Worker(QThread):
         self.min_batch_size = min_batch_size
         self.max_concurrent_requests = max_concurrent_requests
         self.modpack = modpack
+        self.custom_base_url = custom_base_url
         self.is_aborted = False
         self.is_paused = False
+        self._total_strings = 0
+        self._completed_strings = 0
+        self._ema_speed = None
+        self._files_last_time = {}
+        self._files_last_strings = {}
 
     def run(self):
         try:
@@ -662,6 +709,28 @@ class Worker(QThread):
             await asyncio.sleep(0.1)
         if self.is_aborted:
             raise AbortException()
+
+    def handle_batch_progress(self, idx, total_files, filename, chunk_idx, total_chunks, strings_done=0):
+        duration = time.time() - self._files_last_time.get(idx, time.time())
+        strings_in_batch = strings_done - self._files_last_strings.get(idx, 0)
+
+        if duration > 0 and strings_in_batch > 0:
+            current_speed = duration / strings_in_batch
+            if self._ema_speed is None:
+                self._ema_speed = current_speed
+            else:
+                self._ema_speed = (0.2 * current_speed) + (0.8 * self._ema_speed)
+            self._ema_speed = max(self._ema_speed, 0.05)
+
+        self._completed_strings += strings_in_batch
+        remaining_strings = max(0, self._total_strings - self._completed_strings)
+        eta_seconds = remaining_strings * self._ema_speed if self._ema_speed is not None else 0
+
+        self.progress_state.emit(idx, total_files, filename, self._completed_strings, self._total_strings, eta_seconds)
+        self._files_last_time[idx] = time.time()
+        self._files_last_strings[idx] = strings_done
+
+        self.chunk_progress.emit(idx, total_files, chunk_idx, total_chunks)
 
     async def process(self):
         if not self.files:
@@ -682,18 +751,23 @@ class Worker(QThread):
             batch_size=self.batch_size,
             min_batch_size=self.min_batch_size,
             max_concurrent_requests=self.max_concurrent_requests,
-            modpack=self.modpack
+            modpack=self.modpack,
+            custom_base_url=self.custom_base_url
         )
 
         total_lines = 0
         for f in self.files:
             total_lines += m.count_translatable_strings(f, self.t_titles, self.t_subs, self.t_desc)
 
-        completed_lines = 0
-        self.lines_translated.emit(0, total_lines)
+        self._total_strings = total_lines
+        self._completed_strings = 0
+        self._ema_speed = None
+        self._files_last_time = {}
+        self._files_last_strings = {}
 
         total_files = len(self.files)
         completed_count = 0
+        completed_lines = 0
         self.progress_batch.emit(0, total_files)
 
         sem = asyncio.Semaphore(self.concurrency)
@@ -706,17 +780,26 @@ class Worker(QThread):
                 await self.check_status()
                 self.log.emit(f"Processing: {f.name}")
                 logging.getLogger("snbt_localizer.gui").info(f"Processing: {f.name}")
+                file_total_strings = m.count_translatable_strings(f, self.t_titles, self.t_subs, self.t_desc)
                 file_start = time.time()
+                self._files_last_time[idx] = time.time()
+                self._files_last_strings[idx] = 0
                 m.is_aborted = self.is_aborted
                 lines_processed = await m.process_file(
-                    f, self.t_titles, self.t_subs, self.t_desc, 
-                    lambda x: self.log.emit(str(x)), 
-                    self.check_status, 
+                    f, self.t_titles, self.t_subs, self.t_desc,
+                    lambda x: self.log.emit(str(x)),
+                    self.check_status,
                     self.policy,
-                    progress_callback=lambda chunk_idx, total_chunks: self.chunk_progress.emit(idx, total_files, chunk_idx, total_chunks)
+                    progress_callback=lambda chunk_idx, total_chunks, strings_done=0, file_total=0: self.handle_batch_progress(idx, total_files, f.name, chunk_idx, total_chunks, strings_done)
                 )
-                completed_lines += lines_processed
-                self.lines_translated.emit(completed_lines, total_lines)
+                accounted = self._files_last_strings.get(idx, 0)
+                unaccounted = file_total_strings - accounted
+                if unaccounted > 0:
+                    self._completed_strings += unaccounted
+                    self._files_last_strings[idx] = file_total_strings
+                remaining_strings = max(0, self._total_strings - self._completed_strings)
+                eta_seconds = remaining_strings * self._ema_speed if self._ema_speed is not None else 0
+                self.progress_state.emit(idx, total_files, f.name, self._completed_strings, self._total_strings, eta_seconds)
                 file_elapsed = time.time() - file_start
                 self.log.emit(f"Done: {f.name} (took {file_elapsed:.1f}s)")
                 logging.getLogger("snbt_localizer.gui").info(f"Done: {f.name} (took {file_elapsed:.1f}s)")
@@ -728,7 +811,6 @@ class Worker(QThread):
             tasks = [asyncio.create_task(process_one(idx, f)) for idx, f in enumerate(self.files)]
             await asyncio.gather(*tasks)
             self.progress_batch.emit(total_files, total_files)
-            self.lines_translated.emit(total_lines, total_lines)
 
             batch_elapsed = time.time() - batch_start
             mins = int(batch_elapsed // 60)
@@ -759,6 +841,8 @@ class App(QMainWindow):
         
         self._is_initializing = True
         self.last_valid_index = 0
+        self._key_validation_cache = {}
+        self._translation_finished = False
         self.running_loaders = []
         self.current_loader_id = 0
         self.settings = QSettings("MineAI", "SNBT-Localizer")
@@ -772,6 +856,7 @@ class App(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self._perform_debounced_save)
         self._pending_save_provider = None
+        self.custom_base_url = ""
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(STYLE_SHEET)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -798,6 +883,9 @@ class App(QMainWindow):
             "Sambanova",
             "OpenAI",
             "Mistral AI",
+            "Anthropic (Claude)",
+            "Cohere",
+            "Local LLM / Custom",
             "Mixed Providers"
         ])
         self.provider_box.currentTextChanged.connect(self.on_provider_changed)
@@ -842,9 +930,25 @@ class App(QMainWindow):
         self.key_pool_edit.setVisible(False)
         self.key_pool_edit.textChanged.connect(self.key_pool_changed)
 
+        self.btn_test_keys = QPushButton("Test Keys")
+        self.btn_test_keys.clicked.connect(self.verify_keys)
+        self.lbl_key_status = QLabel("Pool Status: Unchecked")
+
         key_layout.addWidget(self.key_label)
         key_layout.addWidget(self.btn_toggle_keys)
         key_layout.addWidget(self.key_pool_edit)
+        key_layout.addWidget(self.btn_test_keys)
+        key_layout.addWidget(self.lbl_key_status)
+
+        self.custom_url_label = QLabel("Custom API Base URL (for Local LLM):")
+        self.custom_base_url_edit = QLineEdit()
+        self.custom_base_url_edit.setPlaceholderText("e.g. http://localhost:8080/v1")
+        self.custom_base_url_edit.setVisible(False)
+        self.custom_url_label.setVisible(False)
+        self.custom_base_url_edit.textChanged.connect(lambda: self.save_timer.start(500))
+
+        key_layout.addWidget(self.custom_url_label)
+        key_layout.addWidget(self.custom_base_url_edit)
         workspace_layout.addLayout(key_layout)
 
         context_layout = QVBoxLayout()
@@ -1005,6 +1109,28 @@ class App(QMainWindow):
         self.translation_memory_tab.language_changed.connect(self.on_tm_language_changed)
         self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
 
+        self.setCentralWidget(self.tabs)
+        saved_geometry = self.settings.value("geometry")
+        if saved_geometry:
+            self.restoreGeometry(saved_geometry)
+        self.load_saved_settings()
+        self.populate_instances()
+        self.current_provider = "INIT_STATE"
+        self._is_initializing = False
+        self.on_provider_changed(self.provider_box.currentText())
+        self.log_cache_stats()
+
+        self.shortcut_copy = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        self.shortcut_copy.activated.connect(self.copy_logs)
+
+        gui_logger = logging.getLogger("snbt_localizer")
+        gui_logger.setLevel(logging.DEBUG)
+        gui_logger.handlers.clear()
+        gui_handler = QtLoggingHandler(self.out)
+        gui_handler.setLevel(logging.INFO)
+        gui_logger.addHandler(gui_handler)
+        gui_logger.propagate = False
+
     def on_lang_box_changed(self, lang_text):
         if self._is_initializing:
             return
@@ -1035,36 +1161,6 @@ class App(QMainWindow):
             self.translation_memory_tab.refresh_modpack_filter()
             self.translation_memory_tab._load_data()
 
-        self.setCentralWidget(self.tabs)
-        
-        saved_geometry = self.settings.value("geometry")
-        if saved_geometry:
-            self.restoreGeometry(saved_geometry)
-        
-        self.load_saved_settings()
-        self.populate_instances()
-
-        self.current_provider = "INIT_STATE"
-        self._is_initializing = False
-        self.on_provider_changed(self.provider_box.currentText())
-
-        self.log_cache_stats()
-
-        self.shortcut_copy = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
-        self.shortcut_copy.activated.connect(self.copy_logs)
-
-        gui_logger = logging.getLogger("snbt_localizer")
-        gui_logger.setLevel(logging.DEBUG)
-        gui_logger.handlers.clear()
-        gui_handler = QTextEditHandler(self.out)
-        gui_handler.setLevel(logging.DEBUG)
-        gui_logger.addHandler(gui_handler)
-        file_handler = logging.FileHandler("snbt_localizer.log", encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
-        gui_logger.addHandler(file_handler)
-        gui_logger.propagate = False
-
     def _load_env_cache(self):
         cache = {}
         try:
@@ -1081,12 +1177,12 @@ class App(QMainWindow):
     def load_saved_settings(self):
         self.provider_box.blockSignals(True)
         self.dir_box.blockSignals(True)
-        
+
         saved_provider = self.config.provider
         idx_p = self.provider_box.findText(saved_provider)
         if idx_p != -1:
             self.provider_box.setCurrentIndex(idx_p)
-            
+
         self.cb_titles.setChecked(self.settings.value("cb_titles", "true") == "true")
         self.cb_subs.setChecked(self.settings.value("cb_subs", "true") == "true")
         self.cb_desc.setChecked(self.settings.value("cb_desc", "true") == "true")
@@ -1108,11 +1204,15 @@ class App(QMainWindow):
             self.policy_box.setCurrentText(mapping.get(saved_policy, "Complement"))
         else:
             self.policy_box.setCurrentText(saved_policy)
-            
+
         provider = self.config.provider
         saved_keys = self.config.get_api_keys(provider)
         if saved_keys:
             self.key_pool_edit.setPlainText("\n".join(saved_keys))
+
+        self.custom_base_url_edit.setText(self.settings.value("custom_base_url", ""))
+        self.custom_base_url = self.custom_base_url_edit.text()
+
         self.concurrency_spin.setValue(self.config.concurrency)
         self.batch_spin.setValue(self.config.batch_size)
         self.min_batch_spin.setValue(self.config.min_batch_size)
@@ -1128,14 +1228,14 @@ class App(QMainWindow):
 
         if provider_to_save is None:
             self.config.provider = self.provider_box.currentText()
-        
+
         model_text = self.model_box.currentText()
         if model_text and model_text not in ["", "Loading live models...", "None (Free Engine)", "Defined per key in pool"]:
             self.config.model = model_text
             self.settings.setValue(f"model_{provider}", model_text)
         else:
             self.config.model = None
-            
+
         self.settings.setValue("cb_titles", "true" if self.cb_titles.isChecked() else "false")
         self.settings.setValue("cb_subs", "true" if self.cb_subs.isChecked() else "false")
         self.settings.setValue("cb_desc", "true" if self.cb_desc.isChecked() else "false")
@@ -1146,8 +1246,11 @@ class App(QMainWindow):
         policy_text = self.policy_box.currentText()
         self.config.policy = policy_text
         self.settings.setValue("policy", policy_text)
-        
-        if provider != "Google Translate (Free)":
+
+        self.custom_base_url = self.custom_base_url_edit.text()
+        self.settings.setValue("custom_base_url", self.custom_base_url)
+
+        if provider not in ("Google Translate (Free)", "Ollama (Local / Free)"):
             keys_text = self.key_pool_edit.toPlainText().strip()
             keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
             self.config.set_api_keys(provider, keys)
@@ -1243,7 +1346,7 @@ class App(QMainWindow):
                     self.last_valid_index = 0
 
                 self.settings.setValue("last_path", d)
-                self.out.append(f"Custom folder selected: {d}")
+                logging.getLogger("snbt_localizer.gui").info(f"Custom folder selected: {d}")
 
                 # Populate quest_dirs for custom path
                 path_obj = Path(d)
@@ -1257,7 +1360,7 @@ class App(QMainWindow):
         else:
             self.last_valid_index = index
             self.settings.setValue("last_path", data)
-            self.out.append(f"Selected modpack path: {data}")
+            logging.getLogger("snbt_localizer.gui").info(f"Selected modpack path: {data}")
             
         self.update_run_status()
 
@@ -1304,10 +1407,6 @@ class App(QMainWindow):
         tot = max(1, tot)
         if hasattr(self, 'files_progress') and cur > 0:
             self.files_progress[cur - 1] = 1.0
-        self.pb_batch.setMaximum(tot * 100)
-        overall = sum(self.files_progress.get(i, 0.0) for i in range(tot)) if hasattr(self, 'files_progress') else cur
-        self.pb_batch.setValue(int(overall * 100))
-        self.pb_batch.setFormat(f"Total Progress: {cur} / {tot} files")
 
     def update_chunk_progress(self, file_idx, total_files, chunk_idx, total_chunks):
         if hasattr(self, 'files_progress'):
@@ -1315,23 +1414,28 @@ class App(QMainWindow):
                 self.files_progress[file_idx] = chunk_idx / total_chunks
             else:
                 self.files_progress[file_idx] = 0.0
-            overall = sum(self.files_progress.get(i, 0.0) for i in range(total_files))
-            self.pb_batch.setMaximum(total_files * 100)
-            self.pb_batch.setValue(int(overall * 100))
-        else:
-            if total_chunks > 0:
-                overall = file_idx + chunk_idx / total_chunks
-            else:
-                overall = file_idx
-            self.pb_batch.setMaximum(total_files)
-            self.pb_batch.setValue(int(overall))
-        self.pb_batch.setFormat(f"Total Progress: {overall:.1f} / {total_files} files")
 
     def update_lines_progress(self, completed: int, total: int):
-        if total > 0:
-            self.pb_batch.setRange(0, total)
-            self.pb_batch.setValue(completed)
-            self.pb_batch.setFormat(f"Progress: {completed}/{total} lines")
+        pass
+
+    def update_progress_state(self, current_file_idx, total_files, current_file_name, completed_strings, total_strings, eta_seconds):
+        if getattr(self, '_translation_finished', False):
+            return
+        self.pb_batch.setRange(0, 100)
+        if total_strings > 0:
+            progress_percent = int((completed_strings / total_strings) * 100)
+            self.pb_batch.setValue(progress_percent)
+            self.pb_batch.setFormat(f"File {current_file_idx}/{total_files}: {current_file_name} | Strings {completed_strings}/{total_strings} | ETA: {self.format_eta(eta_seconds)}")
+        else:
+            self.pb_batch.setValue(0)
+            self.pb_batch.setFormat("Processing...")
+
+    def format_eta(self, eta_seconds):
+        if eta_seconds <= 0 or eta_seconds is None:
+            return "--:--"
+        minutes = int(eta_seconds // 60)
+        seconds = int(eta_seconds % 60)
+        return f"{minutes:02d}:{seconds:02d}"
 
     def _perform_debounced_save(self):
         provider = self._pending_save_provider
@@ -1341,14 +1445,14 @@ class App(QMainWindow):
     def copy_logs(self):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.out.toPlainText())
-        self.out.append("--- Log content copied to clipboard ---")
+        logging.getLogger("snbt_localizer.gui").info("--- Log content copied to clipboard ---")
 
     def log_cache_stats(self):
         try:
             size_mb, count = self.translation_memory_tab.cache.get_stats()
-            self.out.append(f"Cache stats: {size_mb:.2f} MB, {count} entries")
+            logging.getLogger("snbt_localizer.gui").info(f"Cache stats: {size_mb:.2f} MB, {count} entries")
         except Exception as e:
-            self.out.append(f"Cache stats error: {e}")
+            logging.getLogger("snbt_localizer.gui").error(f"Cache stats error: {e}")
 
 
     def toggle_key_pool(self, checked):
@@ -1358,6 +1462,37 @@ class App(QMainWindow):
         else:
             self.key_pool_edit.setVisible(False)
             self.btn_toggle_keys.setText("▼ API Keys Pool")
+
+    def verify_keys(self):
+        provider = self.provider_box.currentText()
+        model = self.model_box.currentText()
+        keys_text = self.key_pool_edit.toPlainText().strip()
+        keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
+
+        if provider in ("Google Translate (Free)", "Ollama (Local / Free)", "Local LLM / Custom"):
+            results = {k: "Active" for k in keys} if keys else {}
+            self.on_verification_complete(results)
+            return
+
+        if not keys:
+            self.lbl_key_status.setText("Pool Status: No keys to verify")
+            return
+
+        self.lbl_key_status.setText("Pool Status: Verifying keys...")
+        self.btn_test_keys.setEnabled(False)
+
+        custom_url = self.custom_base_url_edit.text() if provider in ("Local LLM / Custom", "Ollama (Local / Free)") else None
+        translator = UnifiedTranslator(keys, provider, model, custom_base_url=custom_url)
+        self.verifier = KeyVerifierWorker(keys, provider, model, translator)
+        self.verifier.verification_complete.connect(self.on_verification_complete)
+        self.verifier.start()
+
+    def on_verification_complete(self, results):
+        self.btn_test_keys.setEnabled(True)
+        active_count = sum(1 for status in results.values() if status == "Active")
+        total = len(results)
+        self._key_validation_cache.update(results)
+        self.lbl_key_status.setText(f"Pool Status: {active_count}/{total} active")
 
     def key_pool_changed(self):
         self.save_timer.start(500)
@@ -1388,11 +1523,26 @@ class App(QMainWindow):
             self.key_pool_edit.setEnabled(False)
             self.key_pool_edit.setPlaceholderText("No key required for free Google Translate")
             self.btn_toggle_keys.setEnabled(False)
+            self.custom_base_url_edit.setVisible(False)
+            self.custom_url_label.setVisible(False)
         elif "Ollama" in new_provider:
             self.key_pool_edit.clear()
             self.key_pool_edit.setEnabled(False)
             self.key_pool_edit.setPlaceholderText("No key required for local Ollama")
             self.btn_toggle_keys.setEnabled(False)
+            self.custom_base_url_edit.setVisible(True)
+            self.custom_url_label.setVisible(True)
+        elif new_provider == "Local LLM / Custom":
+            self.key_pool_edit.setEnabled(True)
+            self.key_pool_edit.setPlaceholderText("Enter up to 10 API keys, one per line")
+            self.btn_toggle_keys.setEnabled(True)
+            saved_keys = self.config.get_api_keys(new_provider)
+            if saved_keys:
+                self.key_pool_edit.setPlainText("\n".join(saved_keys))
+            else:
+                self.key_pool_edit.clear()
+            self.custom_base_url_edit.setVisible(True)
+            self.custom_url_label.setVisible(True)
         else:
             self.key_pool_edit.setEnabled(True)
             self.key_pool_edit.setPlaceholderText("Enter up to 10 API keys, one per line")
@@ -1403,6 +1553,8 @@ class App(QMainWindow):
             else:
                 k = load_key_from_env_or_file(new_provider, self.env_cache)
                 self.key_pool_edit.setPlainText(k if k else "")
+            self.custom_base_url_edit.setVisible(False)
+            self.custom_url_label.setVisible(False)
 
         self._is_updating_models = False
         self.key_pool_edit.blockSignals(False)
@@ -1431,6 +1583,11 @@ class App(QMainWindow):
         elif "Ollama" in provider:
             self.model_box.setEnabled(True)
             self._trigger_loader(provider, "")
+        elif provider == "Local LLM / Custom":
+            self.model_box.setEnabled(True)
+            self.model_box.clear()
+            self.model_box.setEditable(True)
+            self.completer.setModel(QStringListModel([]))
         else:
             self.model_box.setEnabled(True)
 
@@ -1440,10 +1597,10 @@ class App(QMainWindow):
                 self.model_box.clear()
                 self.model_box.addItem("Enter API Key to load models")
                 self.completer.setModel(QStringListModel(["Enter API Key to load models"]))
-                self.out.append("API Key is empty")
                 self.model_box.blockSignals(False)
                 self._is_updating_models = False
                 self.update_run_status()
+                logging.getLogger("snbt_localizer.gui").warning("API Key is empty")
                 return
 
             self._trigger_loader(provider, keys[0])
@@ -1511,9 +1668,13 @@ class App(QMainWindow):
                 fallbacks = ["gpt-4o-mini", "gpt-4o"]
             elif "Mistral" in provider:
                 fallbacks = ["mistral-large-latest", "open-mistral-nemo"]
+            elif "Anthropic" in provider:
+                fallbacks = ["claude-3-5-sonnet-20241022", "claude-3-haiku-20240307", "claude-3-sonnet-20240229"]
+            elif "Cohere" in provider:
+                fallbacks = ["command-r-plus", "command-r", "command"]
             else:
                 fallbacks = [
-                    "google/gemma-4-31b:free", 
+                    "google/gemma-4-31b:free",
                     "openai/gpt-oss-120b:free",
                     "poolside/laguna-m.1:free",
                     "nvidia/nemotron-3-super:free",
@@ -1525,7 +1686,7 @@ class App(QMainWindow):
             self.completer.setModel(QStringListModel(fallbacks))
 
         if error_msg:
-            self.out.append(f"Error: {error_msg}")
+            logging.getLogger("snbt_localizer.gui").error(f"Error: {error_msg}")
 
         if self.model_box.count() > 0:
             saved_model = self.settings.value(f"model_{provider}", "")
@@ -1563,6 +1724,7 @@ class App(QMainWindow):
         self.btn_pause.setEnabled(False)
 
     def start(self):
+        self._translation_finished = False
         if hasattr(self, 'w') and self.w.isRunning():
             return
 
@@ -1596,7 +1758,7 @@ class App(QMainWindow):
             saved_keys_by_provider = {}
             saved_models_by_provider = {}
             default_models_by_provider = {}
-            for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)"]:
+            for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI", "Anthropic (Claude)", "Cohere", "Google Translate (Free)", "Ollama (Local / Free)", "Local LLM / Custom"]:
                 saved_keys_by_provider[p] = self.config.get_api_keys(p)
                 saved_models_by_provider[p] = self.settings.value(f"model_{p}", "")
                 default_models_by_provider[p] = PROVIDER_DEFAULTS.get(p, "")
@@ -1605,13 +1767,19 @@ class App(QMainWindow):
             mixed_pool = resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider)
             
             if not mixed_pool:
-                self.out.append("Error: No API keys available for Mixed Providers. Add keys or configure other providers first.")
+                logging.getLogger("snbt_localizer.gui").error("Error: No API keys available for Mixed Providers. Add keys or configure other providers first.")
                 return
             
             unique_keys = [item["api_key"] for item in mixed_pool]
         
+        if unique_keys:
+            first_key = unique_keys[0]
+            if first_key in self._key_validation_cache and self._key_validation_cache[first_key] == "Invalid":
+                QMessageBox.warning(self, "Invalid API Key", "The first API key in your pool is known to be invalid. Please check your keys.")
+                return
+
         if "Google Translate" not in prov and "Ollama" not in prov and not unique_keys:
-            self.out.append("Error: Enter at least one API Key.")
+            logging.getLogger("snbt_localizer.gui").error("Error: Enter at least one API Key.")
             return
             
         self.btn_run.setEnabled(False)
@@ -1628,17 +1796,17 @@ class App(QMainWindow):
         self.policy_box.setEnabled(False)
         self.tabs.setTabEnabled(1, False)
         
-        model = self.config.model or ""
+        model = self.model_box.currentText() or ""
         t_titles = self.cb_titles.isChecked()
         t_subs = self.cb_subs.isChecked()
         t_desc = self.cb_desc.isChecked()
-        custom_context = self.config.custom_context
-        policy = self.config.policy
-        target_lang = self.config.target_lang
+        custom_context = self.context_in.text().strip()
+        policy = self.policy_box.currentText()
+        target_lang = self.lang_box.currentText()
 
         dir_path = self.dir_box.itemData(self.dir_box.currentIndex())
         if dir_path == "MANUAL":
-            self.out.append("Error: Please select a valid directory first.")
+            logging.getLogger("snbt_localizer.gui").error("Error: Please select a valid directory first.")
             return
 
         dir_path_obj = Path(dir_path)
@@ -1646,7 +1814,7 @@ class App(QMainWindow):
         if not quest_dirs:
             quest_dirs = find_all_quest_dirs(dir_path_obj)
             if not quest_dirs:
-                self.out.append(f"Error: No quest directories found in {dir_path}")
+                logging.getLogger("snbt_localizer.gui").error(f"Error: No quest directories found in {dir_path}")
                 return
 
         all_files = []
@@ -1659,11 +1827,12 @@ class App(QMainWindow):
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
         first_key = unique_keys[0] if unique_keys else ""
+        custom_url = self.custom_base_url_edit.text() if prov in ("Local LLM / Custom", "Ollama (Local / Free)") else None
         m = SNBTManager(
             first_key, prov, model, custom_context, target_lang_name, target_lang_code,
             concurrency_limit=concurrency, mixed_pool=mixed_pool, modpack=modpack_name,
             batch_size=self.batch_spin.value(), min_batch_size=self.min_batch_spin.value(),
-            max_concurrent_requests=self.max_requests_spin.value()
+            max_concurrent_requests=self.max_requests_spin.value(), custom_base_url=custom_url
         )
         
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
@@ -1684,26 +1853,32 @@ class App(QMainWindow):
                         break
             if source_file:
                 files.append(source_file)
-                self.out.append(f"Localization source file resolved: {source_file.name}")
+                logging.getLogger("snbt_localizer.gui").info(f"Localization source file resolved: {source_file.name}")
                 
         files.extend(chapter_files)
         
         self.pb_batch.setRange(0, len(files))
         self.pb_batch.setValue(0)
         self.files_progress = {}
-        self.out.append(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
+        logging.getLogger("snbt_localizer.gui").info(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
 
-        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.batch_spin.value(), self.min_batch_spin.value(), self.max_requests_spin.value(), modpack=modpack_name)
+        custom_url = self.custom_base_url_edit.text() if prov in ("Local LLM / Custom", "Ollama (Local / Free)") else None
+        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.batch_spin.value(), self.min_batch_spin.value(), self.max_requests_spin.value(), modpack=modpack_name, custom_base_url=custom_url)
         self.w.is_aborted = False
         self.w.is_paused = False
         self.w.log.connect(self.out.append)
         self.w.progress_batch.connect(self.update_batch_progress)
         self.w.chunk_progress.connect(self.update_chunk_progress)
         self.w.lines_translated.connect(self.update_lines_progress)
+        self.w.progress_state.connect(self.update_progress_state)
         self.w.done.connect(self.on_worker_done)
         self.w.start()
 
     def on_worker_done(self):
+        self._translation_finished = True
+        self.pb_batch.setRange(0, 100)
+        self.pb_batch.setValue(100)
+        self.pb_batch.setFormat("Translation Finished! 100% Completed")
         self.btn_run.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("Pause")
@@ -1736,6 +1911,23 @@ class App(QMainWindow):
             event.accept()
 
 def main():
+    import os
+    from logging.handlers import RotatingFileHandler
+    root_logger = logging.getLogger("snbt_localizer")
+    if not root_logger.handlers:
+        root_logger.setLevel(logging.DEBUG)
+        log_dir = os.path.expanduser("~/.snbt_localizer/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            os.path.join(log_dir, "app.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8"
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
+        root_logger.addHandler(file_handler)
+        root_logger.propagate = False
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
 
