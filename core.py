@@ -130,13 +130,41 @@ class TranslationCache:
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', target_lang_code)
         self.table_name = f"cache_{sanitized}"
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.lock = threading.Lock()
         with self.lock:
-            self.conn.execute(f"CREATE TABLE IF NOT EXISTS {self.table_name} (orig TEXT PRIMARY KEY, trans TEXT)")
+            cursor = self.conn.cursor()
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS {self.table_name} (orig TEXT PRIMARY KEY, trans TEXT)")
+            cursor.execute(f"PRAGMA table_info({self.table_name})")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "created_at" not in columns:
+                cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN created_at INTEGER")
+                cursor.execute(f"UPDATE {self.table_name} SET created_at = strftime('%s', 'now') WHERE created_at IS NULL")
+            if "modpack" not in columns:
+                cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN modpack TEXT")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_modpack ON {self.table_name}(modpack)")
             self.conn.commit()
+
+    def _sanitize_mapping(self, mapping):
+        clean = {}
+        for k, v in mapping.items():
+            str_key = str(k)
+            if isinstance(v, dict):
+                str_val = v.get("translation") or v.get("translated") or v.get("text")
+                if not str_val:
+                    str_val = next((str(val) for val in v.values() if isinstance(val, str)), str(v))
+                else:
+                    str_val = str(str_val)
+            else:
+                str_val = str(v)
+            clean[str_key] = str_val
+        return clean
 
     def get(self, text: str):
         with self.lock:
+            if not isinstance(text, str):
+                return None
             if not text:
                 return None
 
@@ -175,9 +203,19 @@ class TranslationCache:
 
             return None
 
-    def save_batch(self, mapping: Dict[str, str]):
+    def save_batch(self, mapping: Dict[str, str], modpack=None):
         with self.lock:
-            self.conn.executemany(f"INSERT OR REPLACE INTO {self.table_name} VALUES (?, ?)", mapping.items())
+            clean_mapping = self._sanitize_mapping(mapping)
+            if modpack is None:
+                self.conn.executemany(
+                    f"INSERT OR REPLACE INTO {self.table_name} (orig, trans, created_at) VALUES (?, ?, strftime('%s', 'now'))",
+                    clean_mapping.items()
+                )
+            else:
+                self.conn.executemany(
+                    f"INSERT OR REPLACE INTO {self.table_name} (orig, trans, modpack, created_at) VALUES (?, ?, ?, strftime('%s', 'now'))",
+                    [(k, v, modpack) for k, v in clean_mapping.items()]
+                )
             self.conn.commit()
 
     def get_stats(self):
@@ -211,6 +249,56 @@ class TranslationCache:
             self.conn.execute("VACUUM")
             self.conn.commit()
             self.conn.execute("VACUUM")
+            self.conn.commit()
+
+    def get_unique_modpacks(self):
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(f"SELECT DISTINCT modpack FROM {self.table_name} WHERE modpack IS NOT NULL ORDER BY modpack COLLATE NOCASE")
+            return [row[0] for row in cursor.fetchall() if row[0]]
+
+    def get_all_records(self, search_query=None, limit=500, offset=0, modpack_filter=None):
+        with self.lock:
+            cursor = self.conn.cursor()
+            query = f"SELECT orig, trans, modpack, datetime(created_at, 'unixepoch', 'localtime') FROM {self.table_name}"
+            params = []
+            conditions = []
+            if search_query:
+                conditions.append("(orig LIKE ? OR trans LIKE ?)")
+                params.extend([f"%{search_query}%", f"%{search_query}%"])
+            if modpack_filter and modpack_filter != "All Modpacks":
+                conditions.append("modpack = ?")
+                params.append(modpack_filter)
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            cursor.execute(query, params)
+            return cursor.fetchall()
+
+    def update_records(self, updates, modpack=None):
+        with self.lock:
+            clean_updates = self._sanitize_mapping(updates)
+            if modpack is None:
+                self.conn.executemany(
+                    f"INSERT OR REPLACE INTO {self.table_name} (orig, trans) VALUES (?, ?)",
+                    list(clean_updates.items())
+                )
+            else:
+                self.conn.executemany(
+                    f"INSERT OR REPLACE INTO {self.table_name} (orig, trans, modpack) VALUES (?, ?, ?)",
+                    [(k, v, modpack) for k, v in clean_updates.items()]
+                )
+            self.conn.commit()
+
+    def delete_records(self, originals):
+        with self.lock:
+            batch_size = 500
+            for i in range(0, len(originals), batch_size):
+                batch = originals[i:i + batch_size]
+                placeholders = ",".join(["?"] * len(batch))
+                query = f"DELETE FROM {self.table_name} WHERE orig IN ({placeholders})"
+                self.conn.execute(query, batch)
             self.conn.commit()
 
     def close(self):
@@ -325,7 +413,7 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
     return resolved
 
 class UnifiedTranslator:
-    def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None):
+    def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10):
         cleaned = []
         seen = set()
         for k in api_keys:
@@ -348,6 +436,10 @@ class UnifiedTranslator:
         self.key_backoff = {}
         self.mixed_pool = []
         self.pool_lock = asyncio.Lock()
+        self.batch_size = batch_size
+        self.min_batch_size = min_batch_size
+        self.max_concurrent_requests = max_concurrent_requests
+        self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         if not model:
             model = get_default_model(provider)
         if provider == "Mixed Providers":
@@ -430,140 +522,7 @@ class UnifiedTranslator:
         if "Google Translate" in self.provider:
             res = await self.free_google.translate(shielded_texts, self.target_lang_code)
         else:
-            if not self.mixed_pool:
-                raise ValueError("No providers configured in mixed pool")
-
-            user_content = f"Instructions: {self.prompt}\n\nJSON array to translate: {json.dumps(shielded_texts, ensure_ascii=False)}"
-            BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
-            max_attempts = len(BACKOFF_DELAYS) if not any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 1
-            res = None
-
-            for attempt in range(max_attempts):
-                if check_status:
-                    await check_status()
-
-                pool_size = len(self.mixed_pool)
-                tried = 0
-                while tried < pool_size:
-                    if check_status:
-                        await check_status()
-                    idx = self.key_index % pool_size
-                    self.key_index += 1
-                    entry = self.mixed_pool[idx]
-                    now = time.time()
-
-                    if entry["api_key"] in self.key_cooldown_until and now < self.key_cooldown_until[entry["api_key"]]:
-                        tried += 1
-                        continue
-
-                    url = f"{entry['base_url']}/chat/completions"
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {entry['api_key']}"
-                    }
-                    payload = {
-                        "model": entry["model"],
-                        "messages": [{"role": "user", "content": user_content}],
-                        "temperature": 0.1
-                    }
-
-                    try:
-                        async with httpx.AsyncClient(timeout=self.timeout) as client:
-                            resp = await client.post(url, headers=headers, json=payload)
-                            if resp.status_code == 429 or resp.status_code >= 500:
-                                current_backoff = self.key_backoff.get(entry["api_key"], 0)
-                                delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
-                                self.key_cooldown_until[entry["api_key"]] = now + delay
-                                self.key_backoff[entry["api_key"]] = current_backoff + 1
-                                logging.getLogger("snbt_localizer.core").warning(f"[{context}] Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Backoff: {delay:.1f}s (Attempt {attempt+1}/{max_attempts}).")
-                                tried += 1
-                                continue
-                            resp.raise_for_status()
-                            resp_data = resp.json()
-                            if 'choices' in resp_data and len(resp_data['choices']) > 0:
-                                content = resp_data['choices'][0]['message']['content'].strip()
-                            else:
-                                error_msg = resp_data.get("error", {}).get("message", "Unknown API error (empty choices)")
-                                raise ValueError(error_msg)
-                            content = re.sub(r'<' + 'think>.*?</' + 'think>', '', content, flags=re.DOTALL).strip()
-                            parsed_res = extract_json_array(content)
-                            if isinstance(parsed_res, list) and len(parsed_res) == len(texts):
-                                res = parsed_res
-                                self.key_backoff[entry["api_key"]] = 0
-                                break
-                            else:
-                                logging.getLogger("snbt_localizer.core").warning(f"API Format Error (Attempt {attempt+1}/{max_attempts}). Array mismatch.")
-                                break
-                    except httpx.TimeoutException:
-                        self.key_cooldown_until[entry["api_key"]] = now + 150.0
-                        logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{entry['api_key'][-4:]}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
-                        tried += 1
-                        continue
-                    except httpx.HTTPStatusError as e:
-                        status = e.response.status_code
-                        reason = getattr(e.response, 'reason_phrase', '') or ''
-                        provider_name = entry.get("provider") or self.provider
-                        model_name = entry.get("model", self.model) or ''
-                        raw_key = entry.get("api_key") or ""
-                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                        if model_name:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        else:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        if status in (401, 403):
-                            async with self.pool_lock:
-                                if entry in self.mixed_pool:
-                                    self.mixed_pool.remove(entry)
-                                self.key_index = 0
-                                if not self.mixed_pool:
-                                    raise AbortException("All API keys failed with 401/403.")
-                            continue
-                        elif status == 429:
-                            current_backoff = self.key_backoff.get(entry["api_key"], 0)
-                            delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
-                            self.key_cooldown_until[entry["api_key"]] = now + delay
-                            self.key_backoff[entry["api_key"]] = current_backoff + 1
-                            logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
-                            tried += 1
-                            continue
-                        break
-                    except Exception as e:
-                        provider_name = entry.get("provider") or self.provider
-                        model_name = entry.get("model", self.model) or ''
-                        raw_key = entry.get("api_key") or ""
-                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                        if model_name:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        else:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        break
-
-                if res is not None:
-                    break
-
-                if attempt < max_attempts - 1:
-                    now = time.time()
-                    min_cooldown = None
-                    for entry in self.mixed_pool:
-                        key = entry["api_key"]
-                        if key in self.key_cooldown_until:
-                            remaining = self.key_cooldown_until[key] - now
-                            if remaining > 0 and (min_cooldown is None or remaining < min_cooldown):
-                                min_cooldown = remaining
-                    wait = max(min_cooldown or 2.0, 2.0)
-                    logging.getLogger("snbt_localizer.core").warning(f"All keys exhausted or in cooldown. Sleeping for {int(wait)}s...")
-                    await asyncio.sleep(wait)
-
-            if res is None:
-                raise ValueError("Failed to translate chunk as a valid JSON array of correct length.")
+            res = await self._translate_with_binary_split(shielded_texts, logger, check_status, context)
 
         restored_res = []
         for trans, placeholders in zip(res, restoration_maps):
@@ -572,22 +531,230 @@ class UnifiedTranslator:
             restored_res.append(trans)
         return restored_res
 
+    async def _translate_with_binary_split(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
+        indexed_batch = list(enumerate(texts))
+        results = await self._translate_indexed(indexed_batch, logger, check_status, context, depth=0)
+        sorted_results = sorted(results.items(), key=lambda x: x[0])
+        return [trans for _, trans in sorted_results]
+
+    async def _translate_indexed(self, batch: list, logger=print, check_status=None, context: str = "", depth: int = 0) -> dict:
+        if not batch:
+            return {}
+
+        try:
+            async with self.request_semaphore:
+                batch_texts = [text for _, text in batch]
+                translations = await self._do_raw_translation(batch_texts, logger, check_status, context)
+
+            if len(translations) != len(batch_texts):
+                raise ValueError("Array length mismatch")
+            return {idx: trans for (idx, _), trans in zip(batch, translations)}
+
+        except (ValueError, json.JSONDecodeError) as e:
+            if len(batch) <= self.min_batch_size:
+                logger(f"[BinarySplit] Depth {depth}: Failed to translate single item: {str(e)[:100]}")
+                return {idx: str(text) for idx, text in batch}
+
+            mid = len(batch) // 2
+            logger(f"[BinarySplit] Splitting batch of size {len(batch)} into {mid} + {len(batch) - mid} due to: {str(e)[:100]}")
+            left_batch = batch[:mid]
+            right_batch = batch[mid:]
+
+            left_task = self._translate_indexed(left_batch, logger, check_status, context, depth + 1)
+            right_task = self._translate_indexed(right_batch, logger, check_status, context, depth + 1)
+            left_results, right_results = await asyncio.gather(left_task, right_task)
+            return {**left_results, **right_results}
+
+        except Exception:
+            raise
+
+    async def _do_raw_translation(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
+        if not self.mixed_pool:
+            raise ValueError("No providers configured in mixed pool")
+
+        user_content = f"Instructions: {self.prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+        max_attempts = len(BACKOFF_DELAYS) if not any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 1
+        res = None
+
+        for attempt in range(max_attempts):
+            if check_status:
+                await check_status()
+
+            pool_size = len(self.mixed_pool)
+            tried = 0
+            while tried < pool_size:
+                if check_status:
+                    await check_status()
+                idx = self.key_index % pool_size
+                self.key_index += 1
+                entry = self.mixed_pool[idx]
+                now = time.time()
+
+                if entry["api_key"] in self.key_cooldown_until and now < self.key_cooldown_until[entry["api_key"]]:
+                    tried += 1
+                    continue
+
+                url = f"{entry['base_url']}/chat/completions"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {entry['api_key']}"
+                }
+                payload = {
+                    "model": entry["model"],
+                    "messages": [{"role": "user", "content": user_content}],
+                    "temperature": 0.1
+                }
+
+                try:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
+                        resp = await client.post(url, headers=headers, json=payload)
+                        if resp.status_code == 429 or resp.status_code >= 500:
+                            current_backoff = self.key_backoff.get(entry["api_key"], 0)
+                            delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
+                            self.key_cooldown_until[entry["api_key"]] = now + delay
+                            self.key_backoff[entry["api_key"]] = current_backoff + 1
+                            logging.getLogger("snbt_localizer.core").warning(f"[{context}] Rate limit or server error ({resp.status_code}) on key ending ...{entry['api_key'][-4:]}. Backoff: {delay:.1f}s (Attempt {attempt+1}/{max_attempts}).")
+                            tried += 1
+                            continue
+                        resp.raise_for_status()
+                        resp_data = resp.json()
+                        if 'choices' in resp_data and len(resp_data['choices']) > 0:
+                            content = resp_data['choices'][0]['message']['content']
+                            if not isinstance(content, str):
+                                content = str(content)
+                            content = content.strip()
+                        else:
+                            error_msg = resp_data.get("error", {}).get("message", "Unknown API error (empty choices)")
+                            raise ValueError(error_msg)
+                        content = re.sub(r'<' + 'think>.*?</' + 'think>', '', content, flags=re.DOTALL).strip()
+                        parsed_res = extract_json_array(content)
+                        if isinstance(parsed_res, list) and len(parsed_res) == len(texts):
+                            res = []
+                            for item in parsed_res:
+                                if isinstance(item, dict):
+                                    val = item.get("translation") or item.get("translated") or item.get("text")
+                                    if not val:
+                                        val = next((str(v) for v in item.values() if isinstance(v, str)), str(item))
+                                    res.append(str(val))
+                                else:
+                                    res.append(str(item))
+                            self.key_backoff[entry["api_key"]] = 0
+                            break
+                        else:
+                            logging.getLogger("snbt_localizer.core").warning(f"API Format Error (Attempt {attempt+1}/{max_attempts}). Array mismatch.")
+                            break
+                except httpx.TimeoutException:
+                    api_key = str(entry["api_key"])
+                    self.key_cooldown_until[entry["api_key"]] = now + 150.0
+                    key_suffix = api_key[-4:] if len(api_key) > 4 else api_key
+                    logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
+                    tried += 1
+                    continue
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    reason = getattr(e.response, 'reason_phrase', '') or ''
+                    provider_name = entry.get("provider") or self.provider
+                    model_name = entry.get("model", self.model) or ''
+                    raw_key = str(entry.get("api_key") or "")
+                    key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                    if model_name:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    else:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    if status in (401, 403):
+                        async with self.pool_lock:
+                            if entry in self.mixed_pool:
+                                self.mixed_pool.remove(entry)
+                            self.key_index = 0
+                            if not self.mixed_pool:
+                                raise AbortException("All API keys failed with 401/403.")
+                        continue
+                    elif status == 429:
+                        current_backoff = self.key_backoff.get(entry["api_key"], 0)
+                        delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
+                        self.key_cooldown_until[entry["api_key"]] = now + delay
+                        self.key_backoff[entry["api_key"]] = current_backoff + 1
+                        logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
+                        tried += 1
+                        continue
+                    break
+                except Exception as e:
+                    provider_name = entry.get("provider") or self.provider
+                    model_name = entry.get("model", self.model) or ''
+                    raw_key = str(entry.get("api_key") or "")
+                    key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                    if model_name:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    else:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    break
+
+            if res is not None:
+                break
+
+            if attempt < max_attempts - 1:
+                now = time.time()
+                min_cooldown = None
+                for entry in self.mixed_pool:
+                    key = entry["api_key"]
+                    if key in self.key_cooldown_until:
+                        remaining = self.key_cooldown_until[key] - now
+                        if remaining > 0 and (min_cooldown is None or remaining < min_cooldown):
+                            min_cooldown = remaining
+                wait = max(min_cooldown or 2.0, 2.0)
+                logging.getLogger("snbt_localizer.core").warning(f"All keys exhausted or in cooldown. Sleeping for {int(wait)}s...")
+                await asyncio.sleep(wait)
+
+        if res is None:
+            raise ValueError("Failed to translate chunk as a valid JSON array of correct length.")
+        return res
+
 class SNBTManager:
-    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None):
+    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None):
         self.cache = TranslationCache(target_lang_code=target_lang_code)
         self.target_lang_code = target_lang_code
         self.provider = provider
         self.skip_mode = (api_key == "SKIP")
         self.concurrency_limit = max(1, min(concurrency_limit, 10))
         self.is_aborted = False
+        self.batch_size = batch_size
+        self.min_batch_size = min_batch_size
+        self.max_concurrent_requests = max_concurrent_requests
+        self.modpack = modpack
         if translator is not None:
             self.translator = translator
         else:
             keys = [api_key] if api_key and api_key != "SKIP" else []
-            self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool)
+            self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool, batch_size=batch_size, min_batch_size=min_batch_size, max_concurrent_requests=max_concurrent_requests)
 
     def close(self):
         self.cache.close()
+
+    def count_translatable_strings(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool) -> int:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return self._count_translatable_in_content(content, t_titles, t_subs, t_desc)
+
+    def _count_translatable_in_content(self, content: str, t_titles: bool, t_subs: bool, t_desc: bool) -> int:
+        count = 0
+        if t_titles:
+            count += len(re.findall(r'title:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content))
+        if t_subs:
+            count += len(re.findall(r'subtitle:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content))
+        if t_desc:
+            count += len(re.findall(r'description:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content))
+            for arr in re.findall(r'description:\s*\[\s*([\s\S]*?)\s*\]', content):
+                count += len(re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', arr))
+        return count
 
     def is_valid(self, text: str) -> bool:
         return len(text) > 1 and not ID_PATTERN.match(text) and not UUID_PATTERN.match(text) and not text.startswith('{')
@@ -604,11 +771,11 @@ class SNBTManager:
                     return p
         return start_path
 
-    async def process_file(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool, logger=print, check_status=None, policy="Complement (Дополнить)", progress_callback=None):
+    async def process_file(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool, logger=print, check_status=None, policy="Complement (Дополнить)", progress_callback=None) -> int:
         if self.skip_mode:
             logger(f"[SKIP MODE] Skipping file: {filepath.name}")
             logging.getLogger("snbt_localizer.core").info(f"[SKIP MODE] Skipping file: {filepath.name}")
-            return
+            return 0
 
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
         is_loc_file = bool(lang_pattern.match(filepath.name))
@@ -685,16 +852,16 @@ class SNBTManager:
 
         if t_titles:
             for m in re.findall(r'title:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                if should_translate(m): target_texts.add(m)
+                if isinstance(m, str) and should_translate(m): target_texts.add(m)
         if t_subs:
             for m in re.findall(r'subtitle:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                if should_translate(m): target_texts.add(m)
+                if isinstance(m, str) and should_translate(m): target_texts.add(m)
         if t_desc:
             for m in re.findall(r'description:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                if should_translate(m): target_texts.add(m)
+                if isinstance(m, str) and should_translate(m): target_texts.add(m)
             for arr in re.findall(r'description:\s*\[\s*([\s\S]*?)\s*\]', content):
                 for m in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', arr):
-                    if should_translate(m): target_texts.add(m)
+                    if isinstance(m, str) and should_translate(m): target_texts.add(m)
 
         texts = list(target_texts)
         if not texts:
@@ -705,7 +872,7 @@ class SNBTManager:
                 for orig in sorted(mapping.keys(), key=len, reverse=True):
                     final_content = final_content.replace(f'"{orig}"', f'"{mapping[orig]}"')
                 target_path.write_text(final_content, 'utf-8')
-            return
+            return 0
 
         if is_overwrite:
             to_trans = texts
@@ -716,7 +883,7 @@ class SNBTManager:
                 if c: mapping[t] = c
 
         try:
-            chunk_size = 5 if "Ollama" in self.provider else 15
+            chunk_size = 5 if "Ollama" in self.provider else self.batch_size
             total_chunks = (len(to_trans) + chunk_size - 1) // chunk_size if to_trans else 0
             for i in range(0, len(to_trans), chunk_size):
                 if progress_callback:
@@ -748,7 +915,7 @@ class SNBTManager:
                             new_map[item] = item
                             
                 mapping.update(new_map)
-                self.cache.save_batch(new_map)
+                self.cache.save_batch(new_map, modpack=self.modpack)
                 
                 for orig, trans in new_map.items():
                     if orig != trans:
@@ -757,7 +924,9 @@ class SNBTManager:
                         if self.translator.mixed_pool:
                             provider_name = "Mixed"
                             model_name = "Multiple"
-                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig[:40]}...\" -> \"{trans[:40]}...\"")
+                        orig_str = str(orig)[:40]
+                        trans_str = str(trans)[:40]
+                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig_str}...\" -> \"{trans_str}...\"")
                 
                 if "Ollama" not in self.provider and "Google Translate" not in self.provider:
                     next_chunk = to_trans[i+chunk_size:i+chunk_size*2]
@@ -786,6 +955,7 @@ class SNBTManager:
             except Exception:
                 tmp_path.unlink(missing_ok=True)
                 raise
+
         else:
             if not bak_path.exists() or bak_path.stat().st_size == 0:
                 async with aiofiles.open(bak_path, 'w', encoding='utf-8') as f:
@@ -804,3 +974,5 @@ class SNBTManager:
             except Exception:
                 tmp_path.unlink(missing_ok=True)
                 raise
+
+        return len(texts)

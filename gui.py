@@ -9,8 +9,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QFileDialog, QLineEdit, 
                              QTextEdit, QLabel, QComboBox, QListView, QCheckBox, 
                              QCompleter, QStyleFactory, QProgressBar, QMessageBox,
-                             QSpinBox)
-from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer
+                             QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
+                             QTabWidget, QHeaderView)
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut
 import httpx
 from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS
@@ -336,6 +337,183 @@ def detect_instances() -> tuple[dict, dict]:
                     pass
     return detected, quest_dirs_mapping
 
+class TranslationMemoryTab(QWidget):
+    def __init__(self, cache, parent=None):
+        super().__init__(parent)
+        self.cache = cache
+        self.pending_updates = {}
+        self.pending_deletions = set()
+        self.offset = 0
+        self.limit = 500
+        self.search_timer = QTimer()
+        self.search_timer.setInterval(300)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self._perform_search)
+        self.setup_ui()
+        self._load_data()
+        self.refresh_modpack_filter()
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        search_layout = QHBoxLayout()
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search by original or translation...")
+        self.search_input.textChanged.connect(self._on_search_changed)
+        search_layout.addWidget(self.search_input)
+
+        self.modpack_filter = QComboBox()
+        self.modpack_filter.addItem("All Modpacks")
+        self.modpack_filter.currentTextChanged.connect(self._on_filter_changed)
+        search_layout.addWidget(self.modpack_filter)
+
+        layout.addLayout(search_layout)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Original", "Translation", "Modpack", "Added"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.table.itemChanged.connect(self._on_item_changed)
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(False)
+
+        layout.addWidget(self.table)
+
+        button_layout = QHBoxLayout()
+        self.load_more_btn = QPushButton("Load More")
+        self.load_more_btn.clicked.connect(self._on_load_more)
+        button_layout.addWidget(self.load_more_btn)
+
+        self.delete_selected_btn = QPushButton("Delete Selected")
+        self.delete_selected_btn.clicked.connect(self._on_delete_selected)
+        button_layout.addWidget(self.delete_selected_btn)
+
+        self.save_changes_btn = QPushButton("Save Changes")
+        self.save_changes_btn.clicked.connect(self._on_save_changes)
+        button_layout.addWidget(self.save_changes_btn)
+
+        self.clear_cache_btn = QPushButton("Clear Cache")
+        self.clear_cache_btn.clicked.connect(self._on_clear_cache)
+        button_layout.addWidget(self.clear_cache_btn)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def _on_search_changed(self):
+        self.search_timer.start()
+
+    def _on_filter_changed(self):
+        self.offset = 0
+        self._load_data()
+
+    def _perform_search(self):
+        self.offset = 0
+        self._load_data()
+
+    def _load_data(self):
+        self.load_more_btn.setEnabled(False)
+        search_term = self.search_input.text()
+        modpack = self.modpack_filter.currentText()
+        modpack_filter = modpack if modpack != "All Modpacks" else None
+        records = self.cache.get_all_records(search_term, self.limit, self.offset, modpack_filter)
+        self._populate_table(records, append=(self.offset > 0))
+        self.load_more_btn.setEnabled(len(records) == self.limit)
+
+    def _populate_table(self, records, append=False):
+        self.table.blockSignals(True)
+        if not append:
+            self.table.setRowCount(0)
+            self.pending_updates.clear()
+            self.pending_deletions.clear()
+
+        for orig, trans, modpack, created_at in records:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            orig_item = QTableWidgetItem(orig)
+            orig_item.setFlags(orig_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 0, orig_item)
+
+            trans_item = QTableWidgetItem(trans)
+            self.table.setItem(row, 1, trans_item)
+
+            modpack_item = QTableWidgetItem(modpack if modpack else "Global")
+            modpack_item.setFlags(modpack_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 2, modpack_item)
+
+            created_item = QTableWidgetItem(created_at if created_at else "")
+            created_item.setFlags(created_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table.setItem(row, 3, created_item)
+        self.table.blockSignals(False)
+
+    def _on_item_changed(self, item):
+        if item.column() == 1:
+            row = item.row()
+            orig_item = self.table.item(row, 0)
+            if orig_item:
+                orig_text = orig_item.text()
+                self.pending_updates[orig_text] = item.text()
+
+    def _on_delete_selected(self):
+        selected_items = self.table.selectedItems()
+        selected_rows = sorted(list(set(item.row() for item in selected_items)), reverse=True)
+        for row in selected_rows:
+            orig_item = self.table.item(row, 0)
+            if orig_item:
+                orig_text = orig_item.text()
+                self.pending_deletions.add(orig_text)
+                if orig_text in self.pending_updates:
+                    del self.pending_updates[orig_text]
+            self.table.removeRow(row)
+
+    def _on_save_changes(self):
+        if self.pending_updates:
+            self.cache.update_records(self.pending_updates)
+            self.pending_updates.clear()
+        if self.pending_deletions:
+            self.cache.delete_records(list(self.pending_deletions))
+            self.pending_deletions.clear()
+        self._load_data()
+
+    def _on_load_more(self):
+        self.offset += self.limit
+        self._load_data()
+
+    def _confirm_clear_cache(self):
+        reply = QMessageBox.question(
+            self,
+            "Clear Cache",
+            "Are you sure you want to clear the translation cache?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _on_clear_cache(self):
+        if self._confirm_clear_cache():
+            try:
+                self.cache.clear()
+                self.offset = 0
+                self.pending_updates.clear()
+                self.pending_deletions.clear()
+                self._load_data()
+                self.refresh_modpack_filter()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Cache clear error: {e}")
+
+    def refresh_modpack_filter(self):
+        self.modpack_filter.blockSignals(True)
+        self.modpack_filter.clear()
+        self.modpack_filter.addItem("All Modpacks")
+        modpacks = self.cache.get_unique_modpacks()
+        self.modpack_filter.addItems(modpacks)
+        self.modpack_filter.blockSignals(False)
+
 class ModelLoader(QThread):
     loaded = pyqtSignal(list, str, int, str)
     def __init__(self, provider, api_key=None, loader_id=0):
@@ -423,8 +601,9 @@ class Worker(QThread):
     done = pyqtSignal()
     progress_batch = pyqtSignal(int, int)
     chunk_progress = pyqtSignal(int, int, int, int)
-    
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None):
+    lines_translated = pyqtSignal(int, int)
+
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None):
         super().__init__()
         self.files = files
         self.keys = keys  # list of api keys
@@ -438,6 +617,10 @@ class Worker(QThread):
         self.target_lang = target_lang
         self.concurrency = concurrency
         self.mixed_pool = mixed_pool
+        self.batch_size = batch_size
+        self.min_batch_size = min_batch_size
+        self.max_concurrent_requests = max_concurrent_requests
+        self.modpack = modpack
         self.is_aborted = False
         self.is_paused = False
 
@@ -459,61 +642,79 @@ class Worker(QThread):
     async def process(self):
         if not self.files:
             self.log.emit("No files to process.")
-            logging.getLogger("snbt_localizer.gui").warning("No files to process.")
             return
-            
+
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
-        m = SNBTManager(first_key, self.provider, self.model, self.custom_context, target_lang_name, target_lang_code, concurrency_limit=self.concurrency, mixed_pool=self.mixed_pool)
+        m = SNBTManager(
+            first_key,
+            self.provider,
+            self.model,
+            self.custom_context,
+            target_lang_name,
+            target_lang_code,
+            concurrency_limit=self.concurrency,
+            mixed_pool=self.mixed_pool,
+            batch_size=self.batch_size,
+            min_batch_size=self.min_batch_size,
+            max_concurrent_requests=self.max_concurrent_requests,
+            modpack=self.modpack
+        )
+
+        total_lines = 0
+        for f in self.files:
+            total_lines += m.count_translatable_strings(f, self.t_titles, self.t_subs, self.t_desc)
+
+        completed_lines = 0
+        self.lines_translated.emit(0, total_lines)
 
         total_files = len(self.files)
-        self.log.emit(f"Files to process: {total_files}")
-        logging.getLogger("snbt_localizer.gui").info(f"Files to process: {total_files}")
-        
-        batch_start = time.time()
-        sem = asyncio.Semaphore(self.concurrency)
         completed_count = 0
+        self.progress_batch.emit(0, total_files)
+
+        sem = asyncio.Semaphore(self.concurrency)
         lock = asyncio.Lock()
-        
+        batch_start = time.time()
+
         async def process_one(idx, f):
-            nonlocal completed_count
+            nonlocal completed_lines, completed_count
             async with sem:
                 await self.check_status()
                 self.log.emit(f"Processing: {f.name}")
                 logging.getLogger("snbt_localizer.gui").info(f"Processing: {f.name}")
                 file_start = time.time()
                 m.is_aborted = self.is_aborted
-                await m.process_file(
+                lines_processed = await m.process_file(
                     f, self.t_titles, self.t_subs, self.t_desc, 
                     lambda x: self.log.emit(str(x)), 
                     self.check_status, 
                     self.policy,
                     progress_callback=lambda chunk_idx, total_chunks: self.chunk_progress.emit(idx, total_files, chunk_idx, total_chunks)
                 )
+                completed_lines += lines_processed
+                self.lines_translated.emit(completed_lines, total_lines)
                 file_elapsed = time.time() - file_start
                 self.log.emit(f"Done: {f.name} (took {file_elapsed:.1f}s)")
                 logging.getLogger("snbt_localizer.gui").info(f"Done: {f.name} (took {file_elapsed:.1f}s)")
                 async with lock:
                     completed_count += 1
                     self.progress_batch.emit(completed_count, total_files)
-        
+
         try:
             tasks = [asyncio.create_task(process_one(idx, f)) for idx, f in enumerate(self.files)]
             await asyncio.gather(*tasks)
             self.progress_batch.emit(total_files, total_files)
-            
+            self.lines_translated.emit(total_lines, total_lines)
+
             batch_elapsed = time.time() - batch_start
             mins = int(batch_elapsed // 60)
             secs = int(batch_elapsed % 60)
             if mins > 0:
                 self.log.emit(f"Batch completed in {mins}m {secs}s.")
-                logging.getLogger("snbt_localizer.gui").info(f"Batch completed in {mins}m {secs}s.")
             else:
                 self.log.emit(f"Batch completed in {secs}s.")
-                logging.getLogger("snbt_localizer.gui").info(f"Batch completed in {secs}s.")
         except AbortException:
             self.log.emit("Translation process was aborted by user.")
-            logging.getLogger("snbt_localizer.gui").warning("Translation process was aborted by user.")
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -547,10 +748,15 @@ class App(QMainWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self._perform_debounced_save)
         self._pending_save_provider = None
-        layout = QVBoxLayout()
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
-        
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(STYLE_SHEET)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        workspace_tab = QWidget()
+        workspace_layout = QVBoxLayout()
+        workspace_layout.setSpacing(12)
+        workspace_layout.setContentsMargins(16, 16, 16, 16)
+
         selectors_layout = QHBoxLayout()
         selectors_layout.setSpacing(12)
 
@@ -559,10 +765,10 @@ class App(QMainWindow):
         self.provider_box = QComboBox()
         self.provider_box.setView(QListView())
         self.provider_box.addItems([
-            "Google Translate (Free)", 
-            "Google Gemini (Free API)", 
-            "Ollama (Local / Free)", 
-            "Groq Cloud (Fast)", 
+            "Google Translate (Free)",
+            "Google Gemini (Free API)",
+            "Ollama (Local / Free)",
+            "Groq Cloud (Fast)",
             "OpenRouter (Cloud AI)",
             "NVIDIA NIM",
             "Sambanova",
@@ -589,33 +795,33 @@ class App(QMainWindow):
         self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.completer.popup().setStyleSheet(STYLE_SHEET)
         self.model_box.setCompleter(self.completer)
-        
+
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.model_box)
         selectors_layout.addLayout(model_layout)
 
-        layout.addLayout(selectors_layout)
+        workspace_layout.addLayout(selectors_layout)
 
         key_layout = QVBoxLayout()
         self.key_label = QLabel("API Access Keys (one per line, max 10)")
-        
+
         self.btn_toggle_keys = QPushButton("▼ API Keys Pool")
         self.btn_toggle_keys.setCheckable(True)
         self.btn_toggle_keys.setObjectName("btn_show_key")
         self.btn_toggle_keys.setMinimumWidth(160)
         self.btn_toggle_keys.setStyleSheet("padding: 6px;")
         self.btn_toggle_keys.clicked.connect(self.toggle_key_pool)
-        
+
         self.key_pool_edit = QTextEdit()
         self.key_pool_edit.setPlaceholderText("Enter up to 10 API keys, one per line")
         self.key_pool_edit.setMaximumHeight(120)
         self.key_pool_edit.setVisible(False)
         self.key_pool_edit.textChanged.connect(self.key_pool_changed)
-        
+
         key_layout.addWidget(self.key_label)
         key_layout.addWidget(self.btn_toggle_keys)
         key_layout.addWidget(self.key_pool_edit)
-        layout.addLayout(key_layout)
+        workspace_layout.addLayout(key_layout)
 
         context_layout = QVBoxLayout()
         context_label = QLabel("Custom Translation Context / Modpack Description")
@@ -623,7 +829,7 @@ class App(QMainWindow):
         self.context_in.setText(self.settings.value("custom_context", ""))
         context_layout.addWidget(context_label)
         context_layout.addWidget(self.context_in)
-        layout.addLayout(context_layout)
+        workspace_layout.addLayout(context_layout)
 
         lang_layout = QVBoxLayout()
         lang_label = QLabel("Target Language (Format: Name (code))")
@@ -644,31 +850,67 @@ class App(QMainWindow):
         self.lang_box.setCurrentText(self.settings.value("target_lang", "Russian (ru_ru)"))
         lang_layout.addWidget(lang_label)
         lang_layout.addWidget(self.lang_box)
-        layout.addLayout(lang_layout)
+        workspace_layout.addLayout(lang_layout)
+
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(12)
 
         concurrency_layout = QVBoxLayout()
-        concurrency_label = QLabel("Потоки:")
+        concurrency_label = QLabel("Threads:")
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setRange(1, 10)
         self.concurrency_spin.setValue(int(self.settings.value("concurrency_limit", 2)))
         self.concurrency_spin.valueChanged.connect(lambda: self.save_timer.start(500))
         concurrency_layout.addWidget(concurrency_label)
         concurrency_layout.addWidget(self.concurrency_spin)
-        layout.addLayout(concurrency_layout)
+        settings_row.addLayout(concurrency_layout)
+
+        batch_layout = QVBoxLayout()
+        batch_label = QLabel("Batch Size:")
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 500)
+        self.batch_spin.setValue(int(self.settings.value("batch_size", 50)))
+        self.batch_spin.valueChanged.connect(lambda: self.save_timer.start(500))
+        batch_layout.addWidget(batch_label)
+        batch_layout.addWidget(self.batch_spin)
+        settings_row.addLayout(batch_layout)
+
+        min_batch_layout = QVBoxLayout()
+        min_batch_label = QLabel("Min Batch Size:")
+        self.min_batch_spin = QSpinBox()
+        self.min_batch_spin.setRange(1, 50)
+        self.min_batch_spin.setValue(int(self.settings.value("min_batch_size", 1)))
+        self.min_batch_spin.valueChanged.connect(lambda: self.save_timer.start(500))
+        min_batch_layout.addWidget(min_batch_label)
+        min_batch_layout.addWidget(self.min_batch_spin)
+        settings_row.addLayout(min_batch_layout)
+
+        max_requests_layout = QVBoxLayout()
+        max_requests_label = QLabel("Max API Requests:")
+        self.max_requests_spin = QSpinBox()
+        self.max_requests_spin.setRange(1, 100)
+        self.max_requests_spin.setValue(int(self.settings.value("max_concurrent_requests", 10)))
+        self.max_requests_spin.valueChanged.connect(lambda: self.save_timer.start(500))
+        max_requests_layout.addWidget(max_requests_label)
+        max_requests_layout.addWidget(self.max_requests_spin)
+        settings_row.addLayout(max_requests_layout)
+
+        settings_row.addStretch()
+        workspace_layout.addLayout(settings_row)
 
         policy_layout = QVBoxLayout()
         policy_label = QLabel("Existing Localized Files Policy")
         self.policy_box = QComboBox()
         self.policy_box.setView(QListView())
         self.policy_box.addItems([
-            "Complement (Дополнить)", 
-            "Full Overwrite (Перезаписать)", 
-            "Skip / Nothing (Пропустить)"
+            "Complement",
+            "Full Overwrite",
+            "Skip / Nothing"
         ])
-        self.policy_box.setCurrentText(self.settings.value("policy", "Complement (Дополнить)"))
+        self.policy_box.setCurrentText(self.settings.value("policy", "Complement"))
         policy_layout.addWidget(policy_label)
         policy_layout.addWidget(self.policy_box)
-        layout.addLayout(policy_layout)
+        workspace_layout.addLayout(policy_layout)
 
         filters_layout = QHBoxLayout()
         filters_layout.setSpacing(20)
@@ -681,61 +923,66 @@ class App(QMainWindow):
         filters_layout.addWidget(self.cb_titles)
         filters_layout.addWidget(self.cb_subs)
         filters_layout.addWidget(self.cb_desc)
-        layout.addLayout(filters_layout)
+        workspace_layout.addLayout(filters_layout)
         
         dir_layout = QVBoxLayout()
         dir_label = QLabel("Target Modpack / Directory")
         self.dir_box = QComboBox()
         self.dir_box.setView(QListView())
         self.dir_box.currentIndexChanged.connect(self.dir_box_changed)
-        
+
         self.lbl_file_count = QLabel("")
         self.lbl_file_count.setStyleSheet("color: #4a8df8; font-weight: normal; margin-top: 5px; margin-bottom: 5px; font-size: 11px;")
-        
+
         dir_layout.addWidget(dir_label)
         dir_layout.addWidget(self.dir_box)
         dir_layout.addWidget(self.lbl_file_count)
-        layout.addLayout(dir_layout)
+        workspace_layout.addLayout(dir_layout)
 
         self.pb_batch = QProgressBar()
         self.pb_batch.setFormat("Total Progress: %v / %m files")
         self.pb_batch.setValue(0)
-        layout.addWidget(self.pb_batch)
-        
+        workspace_layout.addWidget(self.pb_batch)
+
         self.out = QTextEdit(readOnly=True)
-        layout.addWidget(self.out)
+        workspace_layout.addWidget(self.out)
         
         control_layout = QHBoxLayout()
         self.btn_run = QPushButton("Start Batch Translation")
         self.btn_run.setObjectName("btn_run")
         self.btn_run.clicked.connect(self.start)
-        
+
         self.btn_pause = QPushButton("Pause")
         self.btn_pause.setObjectName("btn_pause")
         self.btn_pause.clicked.connect(self.pause)
         self.btn_pause.setEnabled(False)
-        
+
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setObjectName("btn_stop")
         self.btn_stop.clicked.connect(self.stop)
         self.btn_stop.setEnabled(False)
-        
+
         self.btn_clear = QPushButton("Clear Log")
         self.btn_clear.clicked.connect(self.out.clear)
-        
-        self.btn_clear_cache = QPushButton("Clear Cache")
-        self.btn_clear_cache.clicked.connect(self.clear_cache)
-        
+
         control_layout.addWidget(self.btn_run)
         control_layout.addWidget(self.btn_pause)
         control_layout.addWidget(self.btn_stop)
         control_layout.addWidget(self.btn_clear)
-        control_layout.addWidget(self.btn_clear_cache)
-        layout.addLayout(control_layout)
-        
-        w = QWidget()
-        w.setLayout(layout)
-        self.setCentralWidget(w)
+        workspace_layout.addLayout(control_layout)
+
+        workspace_tab.setLayout(workspace_layout)
+        self.tabs.addTab(workspace_tab, "Workspace")
+
+        self.translation_memory_tab = TranslationMemoryTab(TranslationCache())
+        self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
+
+    def _on_tab_changed(self, index):
+        if index == 1:
+            self.translation_memory_tab.refresh_modpack_filter()
+            self.translation_memory_tab._load_data()
+
+        self.setCentralWidget(self.tabs)
         
         saved_geometry = self.settings.value("geometry")
         if saved_geometry:
@@ -790,20 +1037,34 @@ class App(QMainWindow):
         self.cb_titles.setChecked(self.settings.value("cb_titles", "true") == "true")
         self.cb_subs.setChecked(self.settings.value("cb_subs", "true") == "true")
         self.cb_desc.setChecked(self.settings.value("cb_desc", "true") == "true")
-        
+
         saved_model = self.config.model or ""
         if saved_model in ["", "Loading live models...", "None (Free Engine)"]:
             self.config.model = None
             self.saved_model = ""
         else:
             self.saved_model = saved_model
+
+        saved_policy = self.settings.value("policy", "Complement")
+        if saved_policy in ["Complement (Дополнить)", "Full Overwrite (Перезаписать)", "Skip / Nothing (Пропустить)"]:
+            mapping = {
+                "Complement (Дополнить)": "Complement",
+                "Full Overwrite (Перезаписать)": "Full Overwrite",
+                "Skip / Nothing (Пропустить)": "Skip / Nothing"
+            }
+            self.policy_box.setCurrentText(mapping.get(saved_policy, "Complement"))
+        else:
+            self.policy_box.setCurrentText(saved_policy)
             
         provider = self.config.provider
         saved_keys = self.config.get_api_keys(provider)
         if saved_keys:
             self.key_pool_edit.setPlainText("\n".join(saved_keys))
         self.concurrency_spin.setValue(self.config.concurrency)
-            
+        self.batch_spin.setValue(self.config.batch_size)
+        self.min_batch_spin.setValue(self.config.min_batch_size)
+        self.max_requests_spin.setValue(self.config.max_concurrent_requests)
+
         self.provider_box.blockSignals(False)
         self.dir_box.blockSignals(False)
 
@@ -825,16 +1086,22 @@ class App(QMainWindow):
         self.settings.setValue("cb_titles", "true" if self.cb_titles.isChecked() else "false")
         self.settings.setValue("cb_subs", "true" if self.cb_subs.isChecked() else "false")
         self.settings.setValue("cb_desc", "true" if self.cb_desc.isChecked() else "false")
-        
+
         self.config.custom_context = self.context_in.text().strip()
         self.config.target_lang = self.lang_box.currentText()
-        self.config.policy = self.policy_box.currentText()
+
+        policy_text = self.policy_box.currentText()
+        self.config.policy = policy_text
+        self.settings.setValue("policy", policy_text)
         
         if provider != "Google Translate (Free)":
             keys_text = self.key_pool_edit.toPlainText().strip()
             keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
             self.config.set_api_keys(provider, keys)
         self.config.concurrency = self.concurrency_spin.value()
+        self.config.batch_size = self.batch_spin.value()
+        self.config.min_batch_size = self.min_batch_spin.value()
+        self.config.max_concurrent_requests = self.max_requests_spin.value()
         self.config.save_to_settings()
 
     def populate_instances(self):
@@ -1007,6 +1274,12 @@ class App(QMainWindow):
             self.pb_batch.setValue(int(overall))
         self.pb_batch.setFormat(f"Total Progress: {overall:.1f} / {total_files} files")
 
+    def update_lines_progress(self, completed: int, total: int):
+        if total > 0:
+            self.pb_batch.setRange(0, total)
+            self.pb_batch.setValue(completed)
+            self.pb_batch.setFormat(f"Progress: {completed}/{total} lines")
+
     def _perform_debounced_save(self):
         provider = self._pending_save_provider
         self._pending_save_provider = None
@@ -1019,23 +1292,11 @@ class App(QMainWindow):
 
     def log_cache_stats(self):
         try:
-            cache = TranslationCache()
-            size_mb, count = cache.get_stats()
+            size_mb, count = self.translation_memory_tab.cache.get_stats()
             self.out.append(f"Cache stats: {size_mb:.2f} MB, {count} entries")
         except Exception as e:
             self.out.append(f"Cache stats error: {e}")
 
-    def clear_cache(self):
-        reply = QMessageBox.question(self, "Clear Cache", "Are you sure you want to clear the translation cache?", 
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                cache = TranslationCache()
-                cache.clear()
-                self.out.append("Cache cleared successfully")
-                self.log_cache_stats()
-            except Exception as e:
-                self.out.append(f"Cache clear error: {e}")
 
     def toggle_key_pool(self, checked):
         if checked:
@@ -1251,7 +1512,7 @@ class App(QMainWindow):
     def start(self):
         if hasattr(self, 'w') and self.w.isRunning():
             return
-        
+
         self.save_timer.start(500)
         prov = self.config.provider
         policy = self.config.policy
@@ -1303,7 +1564,7 @@ class App(QMainWindow):
         self.btn_run.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
-        
+
         self.provider_box.setEnabled(False)
         self.model_box.setEnabled(False)
         self.key_pool_edit.setEnabled(False)
@@ -1312,6 +1573,7 @@ class App(QMainWindow):
         self.context_in.setEnabled(False)
         self.lang_box.setEnabled(False)
         self.policy_box.setEnabled(False)
+        self.tabs.setTabEnabled(1, False)
         
         model = self.config.model or ""
         t_titles = self.cb_titles.isChecked()
@@ -1339,10 +1601,17 @@ class App(QMainWindow):
             files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
             all_files.extend(files)
 
+        modpack_name = dir_path_obj.name if dir_path != "MANUAL" else "Global"
+
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
         first_key = unique_keys[0] if unique_keys else ""
-        m = SNBTManager(first_key, prov, model, custom_context, target_lang_name, target_lang_code, concurrency_limit=concurrency, mixed_pool=mixed_pool)
+        m = SNBTManager(
+            first_key, prov, model, custom_context, target_lang_name, target_lang_code,
+            concurrency_limit=concurrency, mixed_pool=mixed_pool, modpack=modpack_name,
+            batch_size=self.batch_spin.value(), min_batch_size=self.min_batch_spin.value(),
+            max_concurrent_requests=self.max_requests_spin.value()
+        )
         
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
         loc_files = [p for p in all_files if lang_pattern.match(p.name)]
@@ -1371,12 +1640,13 @@ class App(QMainWindow):
         self.files_progress = {}
         self.out.append(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
 
-        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool)
+        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.batch_spin.value(), self.min_batch_spin.value(), self.max_requests_spin.value(), modpack=modpack_name)
         self.w.is_aborted = False
         self.w.is_paused = False
         self.w.log.connect(self.out.append)
         self.w.progress_batch.connect(self.update_batch_progress)
         self.w.chunk_progress.connect(self.update_chunk_progress)
+        self.w.lines_translated.connect(self.update_lines_progress)
         self.w.done.connect(self.on_worker_done)
         self.w.start()
 
@@ -1385,7 +1655,7 @@ class App(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("Pause")
         self.btn_stop.setEnabled(False)
-        
+
         self.provider_box.setEnabled(True)
         self.model_box.setEnabled(True)
         self.key_pool_edit.setEnabled(True)
@@ -1394,6 +1664,9 @@ class App(QMainWindow):
         self.context_in.setEnabled(True)
         self.lang_box.setEnabled(True)
         self.policy_box.setEnabled(True)
+        self.tabs.setTabEnabled(1, True)
+        self.translation_memory_tab.refresh_modpack_filter()
+        self.translation_memory_tab._load_data()
         if getattr(self, '_close_pending', False):
             self.close()
 

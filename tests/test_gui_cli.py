@@ -1,10 +1,14 @@
 import sys
 import pytest
+import tempfile
+import sqlite3
+import os
 from pathlib import Path
 from unittest.mock import patch, AsyncMock
 from PyQt6.QtCore import Qt, QSettings
-from gui import App
-from core import resolve_mixed_pool, UnifiedTranslator
+from PyQt6.QtWidgets import QMessageBox
+from gui import App, TranslationMemoryTab
+from core import resolve_mixed_pool, UnifiedTranslator, TranslationCache
 from config import ConfigManager, PROVIDER_DEFAULTS
 
 def test_resolve_mixed_pool_empty_fallback():
@@ -50,6 +54,7 @@ def test_resolve_mixed_pool_autodetect():
     assert pool[1]["model"] == "nemotron-saved"
 
 def test_gui_provider_key_isolation(qtbot):
+    from gui import App
     app = App()
     qtbot.addWidget(app)
     app.settings.clear()
@@ -187,7 +192,7 @@ def test_provider_specific_model_saving():
             "target_lang": "ru_ru",
             "concurrency_limit": 3,
             "custom_context": "",
-            "policy": "Complement (Дополнить)"
+            "policy": "Complement"
         }.get(key, default)
 
         config = ConfigManager()
@@ -466,3 +471,335 @@ def test_fuzzy_cache_edge_cases():
         cache.close()
     finally:
         os.unlink(db_path)
+
+@pytest.mark.asyncio
+async def test_binary_split_on_parse_error():
+    from core import UnifiedTranslator
+    from unittest.mock import AsyncMock, patch
+
+    translator = UnifiedTranslator(
+        ["test_key"],
+        "Groq Cloud (Fast)",
+        "test-model",
+        batch_size=10,
+        min_batch_size=1,
+        max_concurrent_requests=10
+    )
+
+    with patch.object(translator, '_do_raw_translation', new_callable=AsyncMock) as mock_translate:
+        mock_translate.side_effect = [
+            ValueError("Invalid JSON"),
+            ["trans1"],
+            ["trans2", "trans3"]
+        ]
+
+        texts = ["text1", "text2", "text3"]
+        results = await translator.translate(texts)
+        assert results == ["trans1", "trans2", "trans3"]
+        assert mock_translate.call_count == 3
+
+@pytest.mark.asyncio
+async def test_binary_split_preserves_order():
+    from core import UnifiedTranslator
+    from unittest.mock import AsyncMock, patch
+
+    translator = UnifiedTranslator(
+        ["test_key"],
+        "Groq Cloud (Fast)",
+        "test-model",
+        batch_size=2,
+        min_batch_size=1,
+        max_concurrent_requests=10
+    )
+
+    with patch.object(translator, '_do_raw_translation', new_callable=AsyncMock) as mock_translate:
+        mock_translate.side_effect = [
+            ValueError("Error"),
+            ["trans0"],
+            ["trans1"]
+        ]
+
+        texts = ["text0", "text1"]
+        results = await translator.translate(texts)
+        assert results == ["trans0", "trans1"]
+
+@pytest.mark.asyncio
+async def test_single_item_fallback():
+    from core import UnifiedTranslator
+    from unittest.mock import AsyncMock, patch
+
+    translator = UnifiedTranslator(
+        ["test_key"],
+        "Groq Cloud (Fast)",
+        "test-model",
+        batch_size=1,
+        min_batch_size=1,
+        max_concurrent_requests=10
+    )
+
+    with patch.object(translator, '_do_raw_translation', new_callable=AsyncMock) as mock_translate:
+        mock_translate.side_effect = ValueError("Fatal error")
+
+        texts = ["untranslatable"]
+        results = await translator.translate(texts)
+        assert results == ["untranslatable"]
+
+def test_translation_memory_tab_clear_cache(qtbot):
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        from gui import TranslationMemoryTab
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"key1": "val1", "key2": "val2"})
+        tab = TranslationMemoryTab(cache)
+        qtbot.addWidget(tab)
+        assert tab.table.rowCount() == 2
+
+        tab._confirm_clear_cache = lambda: True
+        tab._on_clear_cache()
+        assert tab.table.rowCount() == 0
+        assert len(cache.get_all_records()) == 0
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_tab_disabled_during_work(qtbot):
+    from gui import App, ModelLoader
+    from unittest.mock import patch
+
+    def fake_start(self):
+        qtbot.addWidget(self)
+        self.tabs.setTabEnabled(1, False)
+
+    def fake_run(self):
+        pass
+
+    with patch('gui.App.start', fake_start), patch('gui.ModelLoader.run', fake_run):
+        app = App()
+        qtbot.addWidget(app)
+
+        assert app.tabs.isTabEnabled(1) == True
+
+        with qtbot.capture_exceptions():
+            app.btn_run.click()
+            qtbot.wait(100)
+
+        assert app.tabs.isTabEnabled(1) == False
+
+def test_cache_migration_logic():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE cache_ru_ru (orig TEXT PRIMARY KEY, trans TEXT)")
+        conn.execute("INSERT INTO cache_ru_ru VALUES ('hello', 'привет')")
+        conn.commit()
+        conn.close()
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        records = cache.get_all_records()
+        assert len(records) == 1
+        assert records[0][0] == 'hello'
+        assert records[0][1] == 'привет'
+        assert records[0][2] is None
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_cache_advanced_operations():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        updates = {f"orig_{i}": f"trans_{i}" for i in range(505)}
+        cache.update_records(updates)
+        records = cache.get_all_records(limit=10)
+        assert len(records) == 10
+        searched = cache.get_all_records(search_query="orig_100")
+        assert len(searched) == 1
+        assert searched[0][0] == "orig_100"
+        cache.delete_records(list(updates.keys()))
+        assert len(cache.get_all_records()) == 0
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_translation_memory_tab_gui(qtbot):
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        from gui import TranslationMemoryTab
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"test_key": "test_val"})
+        tab = TranslationMemoryTab(cache)
+        qtbot.addWidget(tab)
+        assert tab.table.rowCount() == 1
+        assert tab.table.item(0, 0).text() == "test_key"
+        assert tab.table.item(0, 1).text() == "test_val"
+        tab.table.item(0, 1).setText("new_val")
+        tab._on_item_changed(tab.table.item(0, 1))
+        assert tab.pending_updates["test_key"] == "new_val"
+        tab.table.selectRow(0)
+        tab._on_delete_selected()
+        assert tab.table.rowCount() == 0
+        assert "test_key" in tab.pending_deletions
+        assert "test_key" not in tab.pending_updates
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_app_has_tabs(qtbot):
+    from gui import App
+    app = App()
+    qtbot.addWidget(app)
+    assert hasattr(app, 'tabs')
+    assert app.tabs.count() == 2
+    assert app.tabs.tabText(0) == "Workspace"
+    assert app.tabs.tabText(1) == "Translation Memory"
+
+def test_translation_memory_tab_search_debounce(qtbot):
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        tab = TranslationMemoryTab(cache)
+        qtbot.addWidget(tab)
+
+        tab.search_timer.timeout.disconnect()
+        with patch.object(tab, '_perform_search') as mock_search:
+            tab.search_timer.timeout.connect(tab._perform_search)
+            tab.search_input.setText("word")
+            tab._on_search_changed()
+            qtbot.wait(100)
+            mock_search.assert_not_called()
+
+            tab.search_timer.timeout.emit()
+            mock_search.assert_called_once()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_translation_memory_tab_pagination(qtbot):
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        updates = {f"key_{i}": f"val_{i}" for i in range(505)}
+        cache.save_batch(updates)
+
+        tab = TranslationMemoryTab(cache)
+        qtbot.addWidget(tab)
+
+        assert tab.table.rowCount() == 500
+        assert tab.load_more_btn.isEnabled()
+
+        tab.load_more_btn.click()
+        qtbot.wait(100)
+
+        assert tab.table.rowCount() == 505
+        assert not tab.load_more_btn.isEnabled()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_translation_memory_tab_save_changes(qtbot):
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"apple": "яблоко", "banana": "банан"})
+
+        tab = TranslationMemoryTab(cache)
+        qtbot.addWidget(tab)
+
+        tab.table.item(0, 1).setText("new_apple")
+        tab._on_item_changed(tab.table.item(0, 1))
+
+        tab.table.selectRow(1)
+        tab._on_delete_selected()
+
+        tab.save_changes_btn.click()
+        qtbot.wait(100)
+
+        records = cache.get_all_records()
+        assert len(records) == 1
+        assert records[0][0] == "apple"
+        assert records[0][1] == "new_apple"
+        assert len(tab.pending_updates) == 0
+        assert len(tab.pending_deletions) == 0
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_modpack_column_migration():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cursor = cache.conn.cursor()
+        cursor.execute("PRAGMA table_info(cache_ru_ru)")
+        columns = [col[1] for col in cursor.fetchall()]
+        assert "modpack" in columns
+        cursor.execute("PRAGMA index_list(cache_ru_ru)")
+        indexes = [idx[1] for idx in cursor.fetchall()]
+        assert any("modpack" in idx for idx in indexes)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_save_batch_with_modpack():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"test": "тест"}, modpack="FTB Skies")
+        cursor = cache.conn.cursor()
+        cursor.execute("SELECT modpack FROM cache_ru_ru WHERE orig = 'test'")
+        result = cursor.fetchone()
+        assert result[0] == "FTB Skies"
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_save_batch_without_modpack():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"test": "тест"})
+        cursor = cache.conn.cursor()
+        cursor.execute("SELECT modpack FROM cache_ru_ru WHERE orig = 'test'")
+        result = cursor.fetchone()
+        assert result[0] is None
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_filter_by_modpack():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"test1": "тест1"}, modpack="FTB Skies")
+        cache.save_batch({"test2": "тест2"}, modpack="Create Above")
+        cache.save_batch({"test3": "тест3"})
+        records = cache.get_all_records(modpack_filter="FTB Skies")
+        assert len(records) == 1
+        assert records[0][0] == "test1"
+        assert records[0][2] == "FTB Skies"
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+def test_get_unique_modpacks():
+    with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
+        db_path = f.name
+    try:
+        cache = TranslationCache(db_path=db_path, target_lang_code="ru_ru")
+        cache.save_batch({"test1": "тест1"}, modpack="FTB Skies")
+        cache.save_batch({"test2": "тест2"}, modpack="Create Above")
+        cache.save_batch({"test3": "тест3"})
+        modpacks = cache.get_unique_modpacks()
+        assert set(modpacks) == {"FTB Skies", "Create Above"}
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
