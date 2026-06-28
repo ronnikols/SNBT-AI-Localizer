@@ -2,20 +2,34 @@
 
 ## Synopsis
 ```
-python main.py [options]
+snbt-tr [options]
 ```
 
 ## Options
-| Flag | Argument | Description |
-|------|----------|-------------|
-| `-p`, `--provider` | ALIAS | Provider: `google`, `gemini`, `groq`, `openrouter`, `nvidia`, `nim` |
-| `-m`, `--model` | NAME | Model name (default: provider default) |
-| `-k`, `--key` | KEY | API key (fallback: env var, QSettings) |
-| `-l`, `--lang` | CODE | Target language (default: `ru`) |
-| `-d`, `--dir` | PATH | Quests directory (default: `.`, supports `~`) |
-| `-c`, `--context` | TEXT | Custom translation context |
-| `--list-models` | | List models for provider and exit |
-| `-h`, `--help` | | Show help |
+
+### Global Flags
+| Short | Long | Description | Default |
+|-------|------|-------------|---------|
+| `-h` | `--help` | Show this help message and exit | N/A |
+| | `--gui` | Launch Graphical User Interface (PyQt6) with dual-tab interface | False |
+| | `--debug` | Enable debug logging to console | False |
+| | `--mix` | Enable Mixed Provider mode (auto-balancing across configured providers) | False |
+| | `--clear-cache` | Clear translation cache and exit (alias: `--clear`) | N/A |
+| | `--fastdir` | Scan launcher paths for Minecraft instances and exit (alias: `--fd`) | N/A |
+
+### Translation Configuration
+| Short | Long | Description | Default |
+|-------|------|-------------|---------|
+| `-p` | `--provider` | Provider alias: `google`, `gemini`, `groq`, `openrouter`, `nvidia`, `nim`, `sambanova`, `openai`, `mistral`, `ollama` | N/A |
+| `-m` | `--model` | Model name (default: provider default) | N/A |
+| `-k` | `--key` | API key(s), comma-separated (fallback: env var, QSettings) | N/A |
+| `-l` | `--lang` | Target language code (default: `ru`) | `ru` |
+| `-d` | `--dir` | Path to quests directory (default: current directory) | `.` |
+| `-c` | `--context` | Custom translation context | "" |
+| | `--policy` | Policy for existing localized files: `complement`, `overwrite`, `skip` | `complement` |
+| | `--concurrency` | Number of parallel translation threads (1-10) | 3 |
+| | `--batch-size` | Number of texts per API request (1-500) | 50 |
+| | `--min-batch` | Minimum batch size for fallback (1-50) | 1 |
 
 ## Provider Aliases
 | Alias | Full Name |
@@ -25,7 +39,11 @@ python main.py [options]
 | `ollama` | Ollama (Local / Free) |
 | `groq` | Groq Cloud (Fast) |
 | `openrouter` | OpenRouter (Cloud AI) |
-| `nvidia`, `nim` | NVIDIA NIM |
+| `nvidia` | NVIDIA NIM |
+| `nim` | NVIDIA NIM (alias) |
+| `sambanova` | Sambanova |
+| `openai` | OpenAI |
+| `mistral` | Mistral AI |
 
 ## Language Codes
 | Code | Language |
@@ -49,28 +67,43 @@ python main.py [options]
 | `OPENROUTER_API_KEY` | OpenRouter |
 | `NVIDIA_API_KEY` | NVIDIA NIM (preferred) |
 | `NVIDIA_NIM_API_KEY` | NVIDIA NIM (fallback) |
+| `SAMBANOVA_API_KEY` | Sambanova |
+| `OPENAI_API_KEY` | OpenAI |
+| `MISTRAL_API_KEY` | Mistral AI |
 
 ## Examples
 
-### List models
+### List Models
 ```bash
-python main.py --provider nim --list-models
+snbt-tr --list-models -p groq
+snbt-tr --list-models --provider nvidia
 ```
 
-### Non-interactive (CI/CD)
+### Non-Interactive Translation (CI/CD)
 ```bash
-python main.py -d ~/modpack -p groq -m llama-3.3-70b-versatile -k $GROQ_KEY -l ru
+snbt-tr -d ~/modpack -p groq -m llama-3.3-70b-versatile -k $GROQ_KEY -l ru
+snbt-tr --dir /opt/minecraft/quests --provider openrouter --model google/gemma-4-31b:free --key $OPENROUTER_KEY
 ```
 
-### Interactive (TTY)
+### Mixed Provider Mode
 ```bash
-python main.py -d ~/modpack
-# Prompts for provider, key, model, language
+snbt-tr --mix -d ~/modpack -k "gsk_...,nvapi-...,sk-or-..."
 ```
 
-### With custom context
+### Interactive Mode (TTY)
 ```bash
-python main.py -d ./quests -p gemini -c "Medieval fantasy modpack with magic and dragons" -l en
+snbt-tr -d ~/modpack
+```
+
+### With Custom Context
+```bash
+snbt-tr -d ./quests -p gemini -c "Medieval fantasy modpack with magic and dragons" -l en
+```
+
+### Utility Commands
+```bash
+snbt-tr --clear-cache
+snbt-tr --fastdir
 ```
 
 ## Exit Codes

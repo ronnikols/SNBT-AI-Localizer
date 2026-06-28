@@ -1,89 +1,134 @@
-# SNBT AI Localizer
+# SNBT AI Localizer — Technical Overview
 
 SNBT AI Localizer is an advanced asynchronous translator for Minecraft FTB Quests files (`.snbt`). It supports multiple local and cloud translation engines with a focus on reliability, fault tolerance, and Minecraft-specific formatting preservation.
 
+## Repository Structure
+
+| File | Purpose |
+|------|---------|
+| `main.py` | CLI entry point with argument parsing, setup wizards, and batch translation orchestration |
+| `gui.py` | PyQt6 GUI implementation with dual-tab interface (Workspace and Translation Memory) |
+| `core.py` | Core translation logic: TranslationCache (SQLite), UnifiedTranslator, SNBTManager, and formatting protection |
+| `config.py` | Configuration management: ConfigManager for settings, API keys, and provider defaults |
+| `tests/` | Test suite with 43 tests covering GUI, CLI, caching, and translation logic |
+
 ## Packaging and Distribution
 
-| Platform       | Package Name          | Install Command                          |
-|----------------|------------------------|------------------------------------------|
-| Arch Linux AUR | `snbt-tr`             | `yay -S snbt-tr`                         |
-| Flatpak        | `org.mineai.snbt-tr`  | `flatpak install org.mineai.snbt-tr`    |
-| pipx           | `snbt-tr`             | `pipx install snbt-tr`                   |
-| PyPI           | `snbt-tr`             | `pip install snbt-tr`                    |
-| Windows EXE    | Standalone            | Download from releases                   |
+| Platform | Package Name | Install Command |
+|----------|--------------|-----------------|
+| Arch Linux AUR | `snbt-tr` | `yay -S snbt-tr` |
+| Flatpak | `org.mineai.snbt-tr` | `flatpak install org.mineai.snbt-tr` |
+| pipx | `snbt-tr` | `pipx install snbt-tr` |
+| PyPI | `snbt-tr` | `pip install snbt-tr` |
 
-## CLI Reference
+## Architecture
 
-The primary entry point is the `snbt-tr` command.
+### Dual-Tab GUI (PyQt6)
+- **Workspace Tab**:
+  - Provider/model selection with live auto-suggest via QCompleter
+  - Multi-key pool management (up to 10 keys) with QTextEdit
+  - Custom context input for translation
+  - Batch processing controls (Start/Pause/Stop)
+  - Real-time progress tracking with QProgressBar
+  - Live logging output to QTextEdit
+- **Translation Memory Tab**:
+  - SQLite cache visualization via QTableWidget
+  - Search with 300ms debounce using QTimer
+  - Language and modpack filtering via QComboBox
+  - Paginated table view (500 entries/page)
+  - Inline editing and bulk operations
+  - Bidirectional language synchronization with Workspace tab
 
-### Global Flags
+### Core Components
 
-| Short | Long            | Description                                                                                     | Default       |
-|-------|-----------------|-------------------------------------------------------------------------------------------------|---------------|
-| `-h`  | `--help`        | Show this help message and exit                                                                | N/A           |
-|       | `--gui`         | Launch Graphical User Interface (GUI)                                                          | False         |
-|       | `--debug`       | Enable debug logging to console                                                                | False         |
-|       | `--mix`         | Enable Mixed Provider mode using QSettings key pool                                           | False         |
+#### TranslationCache (SQLite + WAL)
+- **Thread-Safe Design**: Uses `threading.Lock` for all operations
+- **WAL Mode**: Enables concurrent reads/writes (`PRAGMA journal_mode=WAL`)
+- **Schema**:
+  - Per-language tables (`cache_{lang_code}`)
+  - Columns: `orig` (PRIMARY KEY), `trans`, `modpack`, `created_at`
+  - Indexes: `idx_cache_{lang_code}_modpack` for fast filtering
+- **Sanitization**:
+  - Automatic cleanup of nested dictionaries in SNBT via `_sanitize_mapping`
+  - Protection against malformed JSON in API responses
+- **Pluralization Guard**:
+  - Fuzzy matching (90% similarity threshold) via difflib.SequenceMatcher
+  - Number-aware comparison (preserves numeric IDs)
+  - Tail pattern preservation (punctuation, formatting codes)
 
-### Translation Configuration
+#### UnifiedTranslator
+- **Multi-Provider Support**: 9 providers with auto-detection via `detect_provider`
+- **Key Pool Management**:
+  - Round-Robin rotation with `key_index`
+  - Exponential backoff for rate-limited keys (0.2s to 64s) stored in `key_backoff`
+  - Permanent removal of invalid keys (401/403) from `mixed_pool`
+- **Binary Split Fallback**:
+  - Recursive chunk splitting on parse errors via `_translate_indexed`
+  - Single-item fallback as last resort
+- **Mixed Provider Mode**:
+  - Auto-detection from key prefixes (`gsk_`, `nvapi-`, etc.) via `resolve_mixed_pool`
+  - Per-key model specification (format: `key\model`)
+  - Cross-provider load balancing
 
-| Short | Long         | Description                                                                                     | Default       |
-|-------|--------------|-------------------------------------------------------------------------------------------------|---------------|
-| `-p`  | `--provider` | Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova, openai, mistral)       | N/A           |
-| `-m`  | `--model`    | Model name (default: provider default)                                                          | N/A           |
-| `-k`  | `--key`      | API key(s), comma-separated (env/QSettings fallback)                                          | N/A           |
-| `-l`  | `--lang`     | Language code (default: ru)                                                                     | ru            |
-| `-d`  | `--dir`      | Path to quests directory (default: current directory)                                          | .             |
-| `-c`  | `--context`  | Custom translation context                                                                    | ""            |
-|       | `--policy`   | Existing files policy: complement, overwrite, skip (default: complement)                        | complement    |
-|       | `--concurrency` | Number of parallel translation threads (1-10, default: 3)                                   | 3             |
-
-### Utility Commands
-
-| Short | Long            | Description                                                                                     |
-|-------|-----------------|-------------------------------------------------------------------------------------------------|
-|       | `--list-models` | List available models for provider and exit                                                    |
-|       | `--fastdir`     | Scan launcher paths for instances and exit (alias: `--fd`)                                     |
-|       | `--clear-cache` | Clear translation cache and exit (alias: `--clear`)                                            |
-
-## Core Architecture
-
-### Asynchronous Engine
-- Built on `asyncio` with `httpx.AsyncClient` for non-blocking I/O
-- Configurable concurrency (1-10 threads) with adaptive chunking:
-  - 5 items per chunk for Ollama (local)
-  - 15 items per chunk for cloud providers
-- Automatic 3-second delay between chunks for non-Ollama providers to prevent rate limiting
-
-### Round-Robin Multi-Key Pool
-- Cyclic key rotation with automatic load balancing
-- Invalid keys (HTTP 401/403) are permanently removed from the pool during operation
-- Rate-limited keys (HTTP 429) enter a dynamic exponential backoff starting at 0.2s and doubling on each consecutive failure
-- Mixed Provider Mode: Auto-detects provider from key prefix and uses saved defaults
-
-### SQLite Cache with Pluralization Guard
-- Thread-safe SQLite database (`cache.sqlite`) with per-language tables
-- Exact-match lookup with O(1) primary key search
-- Batch persistence via `executemany` for atomic updates
-- Pluralization Guard: Prevents duplicate API calls for similar phrases by normalizing variations
-
-### Minecraft Tag Protection
-- Hardcoded regex shielding for:
-  - Namespace tags (`#c:ender_pearl_dusts`, `#forge:ingots`)
-  - UUIDs (`[0-9a-f]{8}-[0-9a-f]{4}-...`)
-  - Entity IDs (`minecraft:diamond_sword`)
-- Temporary placeholder substitution (`__TAG_N__`) during translation, restored post-processing
+#### SNBTManager
+- **File Processing**:
+  - Automatic detection of localization files (`{lang}.snbt`)
+  - Backup creation (`.bak` files) for in-place translation
+  - Policy support: Complement, Overwrite, Skip
+- **Modpack Isolation**:
+  - Optional `modpack` parameter for cache segmentation
+  - Preserves modpack context in translations
+- **Formatting Protection**:
+  - Regex patterns for tags (`#namespace:path`), UUIDs, entity IDs
+  - Placeholder substitution during translation
+  - Exact restoration post-translation
 
 ## Supported Providers
 
-| Provider               | Default Model                     | Free Tier |
-|------------------------|-----------------------------------|-----------|
-| Groq Cloud (Fast)     | llama-3.3-70b-versatile          | Yes       |
-| NVIDIA NIM            | nvidia/nemotron-4-340b-instruct   | Yes       |
-| OpenRouter (Cloud AI) | google/gemma-4-31b:free          | Yes       |
-| Google Gemini (Free API) | models/gemini-3.1-flash-lite   | Yes       |
-| Sambanova             | DeepSeek-V3.1                     | No        |
-| OpenAI                | gpt-4o-mini                       | No        |
-| Mistral AI            | mistral-large-latest             | No        |
-| Ollama (Local / Free) | qwen2.5:7b                       | Yes       |
-| Google Translate (Free)| N/A                              | Yes       |
+| Provider | Default Model | Free Tier | Base URL |
+|----------|----------------|-----------|----------|
+| Groq Cloud (Fast) | llama-3.3-70b-versatile | Yes | `https://api.groq.com/openai/v1` |
+| NVIDIA NIM | nvidia/nemotron-4-340b-instruct | Yes | `https://integrate.api.nvidia.com/v1` |
+| OpenRouter (Cloud AI) | google/gemma-4-31b:free | Yes | `https://openrouter.ai/api/v1` |
+| Google Gemini (Free API) | models/gemini-3.1-flash-lite | Yes | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| Sambanova | DeepSeek-V3.1 | No | `https://api.sambanova.ai/v1` |
+| OpenAI | gpt-4o-mini | No | `https://api.openai.com/v1` |
+| Mistral AI | mistral-large-latest | No | `https://api.mistral.ai/v1` |
+| Ollama (Local / Free) | qwen2.5:7b | Yes | `http://localhost:11434/v1` |
+| Google Translate (Free) | N/A | Yes | `https://translate.googleapis.com` |
+
+## CLI Reference
+
+### Global Flags
+| Short | Long | Description |
+|-------|------|-------------|
+| `--gui` | Launch PyQt6 GUI with dual-tab interface |
+| `--mix` | Enable Mixed Provider mode |
+| `--clear-cache` | Clear translation cache |
+| `--fastdir` | Scan for Minecraft instances |
+
+### Translation Flags
+| Short | Long | Description |
+|-------|------|-------------|
+| `-p` | `--provider` | Provider alias (9 supported) |
+| `-m` | `--model` | Model name (auto-falls back to provider default) |
+| `-k` | `--key` | API key(s) (comma-separated) |
+| `-l` | `--lang` | Target language (default: `ru`) |
+| `-d` | `--dir` | Quests directory path |
+| `-c` | `--context` | Custom translation context |
+| | `--policy` | Existing files policy: `complement`, `overwrite`, `skip` |
+| | `--concurrency` | Parallel threads (1-10) |
+| | `--batch-size` | Items per API request (1-500) |
+
+## Performance Characteristics
+- **Concurrency**: 1-10 parallel threads (configurable)
+- **Chunking**:
+  - Ollama: 5 items/chunk (local inference)
+  - Cloud: Configurable (default: 50)
+- **Rate Limiting**:
+  - Automatic 3s delay between chunks (non-Ollama)
+  - Exponential backoff for 429 errors (0.2s to 64s)
+- **Caching**:
+  - SQLite WAL mode for concurrent access
+  - Real-time persistence between chunks
+  - Per-language and per-modpack isolation
