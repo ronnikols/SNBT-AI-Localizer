@@ -1,4 +1,6 @@
-# SNBT AI Localizer
+<p align="center">
+  <img src="logo.png" alt="SNBT AI Localizer Logo" width="200" height="200">
+</p> # SNBT AI Localizer
 
 English | [Русский](README_RU.md)
 
