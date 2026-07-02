@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict
 from logging.handlers import RotatingFileHandler
-from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider, is_valid_custom_instance, PROVIDER_DEFAULTS
+from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager
 from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
 try:
     from PyQt6.QtCore import QSettings
@@ -16,7 +16,6 @@ except ImportError:
 SERVICE_MODEL_KEYWORDS = {"orpheus", "tts", "whisper", "embed", "moderation", "safety", "guard", "reward"}
 
 def find_all_quest_dirs(instance_path: Path) -> list[Path]:
-    """Find all quests directories within an instance path."""
     quest_dirs = []
     MAX_DEPTH = 3
 
@@ -913,10 +912,56 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 base = get_base_url(provider)
                 mixed_pool.append({"provider": provider, "api_key": key, "model": model or "", "base_url": base})
 
+    if provider == "Mixed Providers" and not mixed_pool:
+        logging.getLogger("snbt_localizer.cli").error("No valid providers in mixed pool. Configure API keys first.")
+        return 1
     translator = UnifiedTranslator(api_keys, provider, model or "", config.custom_context, lang_name, lang_code, mixed_pool=mixed_pool)
 
     if isinstance(quest_dirs, Path):
         quest_dirs = [quest_dirs]
+
+    json_lang_dirs = set()
+    for qd in quest_dirs:
+        for lang_dir in qd.rglob("lang"):
+            if lang_dir.is_dir() and (lang_dir / "en_us.json").exists():
+                json_lang_dirs.add(lang_dir.parent)
+
+    if json_lang_dirs:
+        base_dir = next(iter(json_lang_dirs))
+        logging.getLogger("snbt_localizer.cli").info("JSON translation mode detected. Processing lang files...")
+        translator = UnifiedTranslator(
+            api_keys,
+            provider,
+            model or "",
+            config.custom_context,
+            lang_name,
+            lang_code,
+            mixed_pool=mixed_pool,
+            batch_size=config.batch_size,
+            min_batch_size=config.min_batch_size,
+            max_concurrent_requests=config.max_concurrent_requests
+        )
+        cache = TranslationCache(target_lang_code=lang_code)
+        manager = JSONManager(
+            base_dir,
+            lang_code,
+            translator,
+            cache,
+            modpack=base_dir.name,
+            policy=resolve_policy(config.policy)
+        )
+        try:
+            translated_count = asyncio.run(manager.process(
+                logger=logging.getLogger("snbt_localizer.cli").info
+            ))
+            logging.getLogger("snbt_localizer.cli").info(
+                f"JSON translation completed. Translated {translated_count} strings. "
+                "In Minecraft, run '/ftbquests reload' or restart the game to apply changes."
+            )
+            return 0
+        except Exception as e:
+            logging.getLogger("snbt_localizer.cli").error(f"JSON translation failed: {e}")
+            return 1
 
     all_files = []
     for qd in quest_dirs:

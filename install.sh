@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# SNBT-AI-Localizer Automated Installer
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DESKTOP_DIR="$HOME/.local/share/applications"
@@ -10,7 +9,11 @@ mkdir -p "$ICON_DIR"
 
 echo "Installing SNBT AI Localizer..."
 
-# 1. Создаем красивую системную SVG-иконку (книга квестов с символом перевода)
+if ! command -v python &> /dev/null; then
+    echo "Error: Python is not installed. Please install Python first."
+    exit 1
+fi
+
 cat << 'SVG' > "$ICON_DIR/snbt-ai-localizer.svg"
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
   <rect width="64" height="64" rx="14" fill="#111216"/>
@@ -23,7 +26,6 @@ cat << 'SVG' > "$ICON_DIR/snbt-ai-localizer.svg"
 </svg>
 SVG
 
-# 2. Проверяем и создаем виртуальное окружение
 [ -d "$APP_DIR/.venv" ] || {
     echo "Creating Python Virtual Environment..."
     python -m venv "$APP_DIR/.venv"
@@ -31,16 +33,15 @@ SVG
 
 echo "Installing and upgrading dependencies..."
 "$APP_DIR/.venv/bin/pip" install --upgrade pip
-"$APP_DIR/.venv/bin/pip" install PyQt6 httpx
+"$APP_DIR/.venv/bin/pip" install PyQt6 httpx aiofiles
 
-# 3. Динамически генерируем системный .desktop файл ярлыка
 cat << DE_EOF > "$DESKTOP_DIR/snbt-ai-localizer.desktop"
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=SNBT AI Localizer
 Comment=Translate Minecraft FTB Quests (*.snbt) using AI Providers
-Exec=$APP_DIR/.venv/bin/python $APP_DIR/gui.py
+Exec=$APP_DIR/.venv/bin/python $APP_DIR/main.py
 Icon=snbt-ai-localizer
 Terminal=false
 Categories=Utility;Development;Game;

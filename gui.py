@@ -11,19 +11,17 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QLabel, QComboBox, QListView, QCheckBox, 
                              QCompleter, QStyleFactory, QProgressBar, QMessageBox,
                              QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
-                             QTabWidget, QHeaderView)
+                             QTabWidget, QHeaderView, QFrame)
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut
 import httpx
-from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS
+from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager
 from config import ConfigManager
 
 def find_all_quest_dirs(instance_path: Path) -> list[Path]:
-    """Find all quests directories within an instance path."""
     quest_dirs = []
     MAX_DEPTH = 3
 
-    # Standard locations
     standard_paths = [
         instance_path / "config" / "ftbquests" / "quests",
         instance_path / "minecraft" / "config" / "ftbquests" / "quests",
@@ -32,7 +30,6 @@ def find_all_quest_dirs(instance_path: Path) -> list[Path]:
         if cp.exists() and cp.is_dir():
             quest_dirs.append(cp)
 
-    # Recursive scan for other locations
     def scan(base: Path, depth: int = 0):
         if depth > MAX_DEPTH:
             return
@@ -70,8 +67,11 @@ class QtLoggingHandler(logging.Handler):
 
     def _append_to_text_edit(self, msg, level):
         text_edit = self.text_edit_ref()
-        if text_edit is not None:
-            text_edit.append(msg)
+        if text_edit is not None and not text_edit.signalsBlocked():
+            try:
+                text_edit.append(msg)
+            except RuntimeError:
+                pass
 
     def emit(self, record):
         if record.levelno >= logging.INFO:
@@ -343,6 +343,55 @@ def detect_instances() -> tuple[dict, dict]:
                 except Exception:
                     pass
     return detected, quest_dirs_mapping
+
+class CreditsTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        main_layout = QVBoxLayout(self)
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        card = QFrame()
+        card.setFixedWidth(450)
+        card.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(30, 30, 30, 30)
+        card_layout.setSpacing(15)
+        card_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel("SNBT AI Localizer")
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #f2f4f8; border: none;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(title)
+
+        description = QLabel("Advanced asynchronous translator for Minecraft FTB Quests and KubeJS files.")
+        description.setStyleSheet("font-size: 13px; color: #9ba1b0; border: none;")
+        description.setWordWrap(True)
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_layout.addWidget(description)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("background-color: #2d2d30; max-height: 1px; border: none;")
+        card_layout.addWidget(line)
+
+        links_layout = QHBoxLayout()
+        links_layout.setSpacing(30)
+
+        github_label = QLabel('<a href="https://github.com/ronnikols/SNBT-AI-Localizer" style="color: #4a8df8; text-decoration: none; font-weight: bold;">GitHub</a>')
+        github_label.setOpenExternalLinks(True)
+        github_label.setStyleSheet("border: none; font-size: 14px;")
+        github_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        links_layout.addWidget(github_label)
+
+        telegram_label = QLabel('<a href="https://t.me/ronnikols" style="color: #4a8df8; text-decoration: none; font-weight: bold;">Telegram</a>')
+        telegram_label.setOpenExternalLinks(True)
+        telegram_label.setStyleSheet("border: none; font-size: 14px;")
+        telegram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        links_layout.addWidget(telegram_label)
+
+        card_layout.addLayout(links_layout)
+        main_layout.addWidget(card)
 
 class TranslationMemoryTab(QWidget):
     language_changed = pyqtSignal(str)
@@ -668,7 +717,7 @@ class Worker(QThread):
     lines_translated = pyqtSignal(int, int)
     progress_state = pyqtSignal(int, int, str, int, int, float)
 
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None, custom_base_url=None):
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None, custom_base_url=None, translator=None, cache=None):
         super().__init__()
         self.files = files
         self.keys = keys
@@ -687,6 +736,8 @@ class Worker(QThread):
         self.max_concurrent_requests = max_concurrent_requests
         self.modpack = modpack
         self.custom_base_url = custom_base_url
+        self.translator = translator
+        self.cache = cache
         self.is_aborted = False
         self.is_paused = False
         self._total_strings = 0
@@ -697,11 +748,52 @@ class Worker(QThread):
 
     def run(self):
         try:
-            asyncio.run(self.process())
+            from pathlib import Path
+            from core import JSONManager, parse_target_lang
+
+            snbt_files = [f for f in self.files if str(f).endswith('.snbt')]
+            json_files = [f for f in self.files if str(f).endswith('en_us.json')]
+
+            self.is_snbt_mode = bool(snbt_files)
+            self.is_json_mode = bool(json_files)
+
+            if snbt_files:
+                self.log.emit("Starting Quest translation (SNBT)...")
+                original_files = self.files
+                self.files = snbt_files
+                asyncio.run(self.process())
+                self.files = original_files
+
+            if json_files:
+                self.log.emit("Starting Language translation (JSON)...")
+                _, target_lang_code = parse_target_lang(self.target_lang)
+                processed_dirs = set()
+                for json_file in json_files:
+                    json_path = Path(json_file)
+                    lang_dir = json_path.parent
+                    base_dir = lang_dir.parent
+                    if base_dir in processed_dirs:
+                        continue
+                    processed_dirs.add(base_dir)
+                    manager = JSONManager(
+                        base_dir,
+                        target_lang_code,
+                        self.translator,
+                        self.cache,
+                        self.modpack,
+                        self.policy
+                    )
+                    asyncio.run(manager.process(
+                        logger=self.log.emit,
+                        check_status=self.check_status,
+                        progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot)
+                    ))
         except Exception as e:
             self.log.emit(f"Unexpected error: {e}")
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
         finally:
+            if self.cache:
+                self.cache.close()
             self.done.emit()
 
     async def check_status(self):
@@ -748,6 +840,7 @@ class Worker(QThread):
             target_lang_code,
             concurrency_limit=self.concurrency,
             mixed_pool=self.mixed_pool,
+            translator=self.translator,
             batch_size=self.batch_size,
             min_batch_size=self.min_batch_size,
             max_concurrent_requests=self.max_concurrent_requests,
@@ -831,6 +924,57 @@ class Worker(QThread):
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             m.close()
+
+class JSONWorker(QThread):
+    log = pyqtSignal(str)
+    done = pyqtSignal()
+    progress_batch = pyqtSignal(int, int)
+
+    def __init__(self, base_dir, target_lang_code, translator, cache, modpack, policy, concurrency, batch_size, min_batch_size, max_concurrent_requests):
+        super().__init__()
+        self.base_dir = base_dir
+        self.target_lang_code = target_lang_code
+        self.translator = translator
+        self.cache = cache
+        self.modpack = modpack
+        self.policy = policy
+        self.concurrency = concurrency
+        self.batch_size = batch_size
+        self.min_batch_size = min_batch_size
+        self.max_concurrent_requests = max_concurrent_requests
+        self.is_aborted = False
+        self.is_paused = False
+
+    async def check_status(self):
+        while self.is_paused:
+            await asyncio.sleep(0.1)
+        if self.is_aborted:
+            raise AbortException()
+
+    def run(self):
+        try:
+            asyncio.run(self.process())
+        except Exception as e:
+            self.log.emit(f"Unexpected error: {e}")
+            logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
+        finally:
+            self.done.emit()
+
+    async def process(self):
+        from core import JSONManager
+        manager = JSONManager(
+            self.base_dir,
+            self.target_lang_code,
+            self.translator,
+            self.cache,
+            self.modpack,
+            self.policy
+        )
+        await manager.process(
+            logger=self.log.emit,
+            check_status=self.check_status,
+            progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot)
+        )
 
 class App(QMainWindow):
     def __init__(self):
@@ -1032,9 +1176,9 @@ class App(QMainWindow):
         self.policy_box = QComboBox()
         self.policy_box.setView(QListView())
         self.policy_box.addItems([
-            "Complement",
-            "Full Overwrite",
-            "Skip / Nothing"
+            "complement",
+            "overwrite",
+            "skip"
         ])
         self.policy_box.setCurrentText(self.settings.value("policy", "Complement"))
         policy_layout.addWidget(policy_label)
@@ -1108,6 +1252,9 @@ class App(QMainWindow):
         self.translation_memory_tab = TranslationMemoryTab(TranslationCache(target_lang_code=lang_code))
         self.translation_memory_tab.language_changed.connect(self.on_tm_language_changed)
         self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
+
+        self.credits_tab = CreditsTab()
+        self.tabs.addTab(self.credits_tab, "Credits")
 
         self.setCentralWidget(self.tabs)
         saved_geometry = self.settings.value("geometry")
@@ -1194,16 +1341,11 @@ class App(QMainWindow):
         else:
             self.saved_model = saved_model
 
-        saved_policy = self.settings.value("policy", "Complement")
-        if saved_policy in ["Complement (Дополнить)", "Full Overwrite (Перезаписать)", "Skip / Nothing (Пропустить)"]:
-            mapping = {
-                "Complement (Дополнить)": "Complement",
-                "Full Overwrite (Перезаписать)": "Full Overwrite",
-                "Skip / Nothing (Пропустить)": "Skip / Nothing"
-            }
-            self.policy_box.setCurrentText(mapping.get(saved_policy, "Complement"))
-        else:
+        saved_policy = self.settings.value("policy", "complement")
+        if saved_policy in ["complement", "overwrite", "skip"]:
             self.policy_box.setCurrentText(saved_policy)
+        else:
+            self.policy_box.setCurrentText("complement")
 
         provider = self.config.provider
         saved_keys = self.config.get_api_keys(provider)
@@ -1376,24 +1518,31 @@ class App(QMainWindow):
         has_files = False
         if path_str and path_str != "MANUAL" and os.path.exists(path_str):
             path = Path(path_str)
-            quest_dirs = self.instance_quest_dirs.get(path)
-            if not quest_dirs:
-                quest_dirs = find_all_quest_dirs(path)
+            _, modpack_name = self._resolve_instance_root(path)
 
-            all_files = []
-            if quest_dirs:
-                for qd in quest_dirs:
-                    files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
-                    all_files.extend(files)
+            snbt_files = [p for p in path.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+            json_files = [p for p in path.rglob("**/lang/en_us.json") if not any(x in p.parts for x in EXCLUDED_DIRS)]
 
-            count = len(all_files)
-            if count > 0:
-                self.lbl_file_count.setText(f"✓ Detected: {count} quest files (.snbt)")
+            snbt_count = len(snbt_files)
+            json_count = len(json_files)
+
+            if snbt_count > 0 and json_count > 0:
+                self.lbl_file_count.setText(f"Modpack: {modpack_name} | Detected: {snbt_count} quest files (.snbt) & {json_count} JSON lang files")
                 has_files = True
-                self.pb_batch.setRange(0, count)
+                self.pb_batch.setRange(0, snbt_count + json_count)
+                self.pb_batch.setValue(0)
+            elif snbt_count > 0:
+                self.lbl_file_count.setText(f"Modpack: {modpack_name} | Detected: {snbt_count} quest files (.snbt)")
+                has_files = True
+                self.pb_batch.setRange(0, snbt_count)
+                self.pb_batch.setValue(0)
+            elif json_count > 0:
+                self.lbl_file_count.setText(f"Modpack: {modpack_name} | JSON Translation Mode Active")
+                has_files = True
+                self.pb_batch.setRange(0, json_count)
                 self.pb_batch.setValue(0)
             else:
-                self.lbl_file_count.setText("⚠ Warning: No quest files (.snbt) found in this directory")
+                self.lbl_file_count.setText(f"Modpack: {modpack_name} | ⚠ Warning: No quest files (.snbt) or JSON lang files found")
                 self.pb_batch.setRange(0, 100)
                 self.pb_batch.setValue(0)
         else:
@@ -1446,6 +1595,18 @@ class App(QMainWindow):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.out.toPlainText())
         logging.getLogger("snbt_localizer.gui").info("--- Log content copied to clipboard ---")
+
+    def _resolve_instance_root(self, path: Path) -> tuple[Path, str]:
+        curr = path.resolve()
+        while curr != curr.parent:
+            if (curr / "minecraft").is_dir() or (curr / "instance.cfg").is_file():
+                return curr, curr.name
+            if (curr / "config").is_dir() or (curr / "mods").is_dir() or (curr / "kubejs").is_dir():
+                return curr, curr.name
+            if curr.name == "minecraft":
+                return curr.parent, curr.parent.name
+            curr = curr.parent
+        return path, path.name
 
     def log_cache_stats(self):
         try:
@@ -1810,19 +1971,22 @@ class App(QMainWindow):
             return
 
         dir_path_obj = Path(dir_path)
-        quest_dirs = self.instance_quest_dirs.get(dir_path_obj)
+        _, modpack_name = self._resolve_instance_root(dir_path_obj)
+        quest_dirs = [dir_path_obj]
         if not quest_dirs:
             quest_dirs = find_all_quest_dirs(dir_path_obj)
             if not quest_dirs:
                 logging.getLogger("snbt_localizer.gui").error(f"Error: No quest directories found in {dir_path}")
                 return
 
+
         all_files = []
         for qd in quest_dirs:
-            files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
-            all_files.extend(files)
+            snbt_files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+            json_files = [p for p in qd.rglob("**/lang/en_us.json") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+            all_files.extend(snbt_files)
+            all_files.extend(json_files)
 
-        modpack_name = dir_path_obj.name if dir_path != "MANUAL" else "Global"
 
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
@@ -1863,7 +2027,21 @@ class App(QMainWindow):
         logging.getLogger("snbt_localizer.gui").info(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
 
         custom_url = self.custom_base_url_edit.text() if prov in ("Local LLM / Custom", "Ollama (Local / Free)") else None
-        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.batch_spin.value(), self.min_batch_spin.value(), self.max_requests_spin.value(), modpack=modpack_name, custom_base_url=custom_url)
+        translator = UnifiedTranslator(
+            unique_keys,
+            prov,
+            model or "",
+            self.context_in.text().strip(),
+            target_lang_name,
+            target_lang_code,
+            mixed_pool=mixed_pool,
+            batch_size=self.batch_spin.value(),
+            min_batch_size=self.min_batch_spin.value(),
+            max_concurrent_requests=self.max_requests_spin.value(),
+            custom_base_url=custom_url
+        )
+        cache = TranslationCache(target_lang_code=target_lang_code)
+        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.batch_spin.value(), self.min_batch_spin.value(), self.max_requests_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache)
         self.w.is_aborted = False
         self.w.is_paused = False
         self.w.log.connect(self.out.append)
@@ -1895,6 +2073,10 @@ class App(QMainWindow):
         self.tabs.setTabEnabled(1, True)
         self.translation_memory_tab.refresh_modpack_filter()
         self.translation_memory_tab._load_data()
+        if getattr(self.w, 'is_snbt_mode', False) and getattr(self.w, 'is_json_mode', False):
+            self.out.append("Quest and JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
+        elif getattr(self.w, 'is_json_mode', False):
+            self.out.append("JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
         if getattr(self, '_close_pending', False):
             self.close()
 

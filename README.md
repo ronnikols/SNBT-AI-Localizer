@@ -93,5 +93,9 @@ snbt-tr --fastdir
 | Ollama (Local / Free) | qwen2.5:7b | Yes | Self-hosted, no API key |
 | Google Translate (Free) | N/A | Yes | Traditional MT, no API key |
 
+## Feedback & Community
+For feedback, suggestions, and bug reports, please contact us via:
+- **Telegram**: [https://t.me/ronnikols](https://t.me/ronnikols)
+
 ## License
 MIT License - see [LICENSE](LICENSE) for details.

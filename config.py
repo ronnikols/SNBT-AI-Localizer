@@ -111,7 +111,7 @@ class ConfigManager:
         self.model: Optional[str] = None
         self.custom_context: str = ""
         self.policy: str = "Complement (Дополнить)"
-        self.api_keys_pool: Dict[str, List[str]] = {}
+        self.api_keys_pool: Dict[str, List[str]] = {prov: [] for prov in PROVIDER_ALIASES.values()}
         self.custom_instances_paths: List[str] = []
         self.batch_size: int = 50
         self.min_batch_size: int = 1
@@ -159,7 +159,7 @@ class ConfigManager:
                         seen.add(k)
                         unique.append(k)
                 self.api_keys_pool[prov] = unique[:10]
-            else:
+            if prov not in self.api_keys_pool:
                 self.api_keys_pool[prov] = []
 
     def save_to_settings(self):
@@ -186,7 +186,6 @@ class ConfigManager:
         s.sync()
 
     def parse_cli_args(self, args: Optional[List[str]] = None):
-        """Parse command-line arguments and override current config values."""
         parser = argparse.ArgumentParser(prog='snbt-tr', add_help=False)
         parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
         parser.add_argument("-p", "--provider", help="Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova)")
@@ -220,6 +219,7 @@ class ConfigManager:
                 self.provider = PROVIDER_ALIASES[alias]
             else:
                 logging.getLogger("snbt_localizer.cli").error(f"Unknown provider alias: {parsed.provider}")
+                self.provider = "Google Translate (Free)"
                 sys.exit(1)
 
         if parsed.mix:
@@ -278,12 +278,10 @@ class ConfigManager:
         return parsed
 
     def get_api_keys(self, provider: Optional[str] = None) -> List[str]:
-        """Return the list of API keys for the given provider (or current provider)."""
         prov = provider or self.provider
         return self.api_keys_pool.get(prov, [])
 
     def set_api_keys(self, provider: str, keys: List[str]):
-        """Store a list of API keys for a provider (max 10)."""
         seen = set()
         unique = []
         for k in keys:
@@ -334,7 +332,6 @@ class ConfigManager:
         return result
 
     def resolve_language(self, lang_input: str) -> tuple:
-        """Return (lang_name, lang_code) for a given input string."""
         lang_input = lang_input.lower()
         if lang_input in LANG_ALIASES:
             return LANG_ALIASES[lang_input]

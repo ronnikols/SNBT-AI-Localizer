@@ -653,9 +653,10 @@ def test_app_has_tabs(qtbot):
     app = App()
     qtbot.addWidget(app)
     assert hasattr(app, 'tabs')
-    assert app.tabs.count() == 2
+    assert app.tabs.count() == 3
     assert app.tabs.tabText(0) == "Workspace"
     assert app.tabs.tabText(1) == "Translation Memory"
+    assert app.tabs.tabText(2) == "Credits"
 
 def test_translation_memory_tab_search_debounce(qtbot):
     with tempfile.NamedTemporaryFile(suffix='.sqlite', delete=False) as f:
