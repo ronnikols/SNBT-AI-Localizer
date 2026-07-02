@@ -18,6 +18,463 @@ import httpx
 from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager
 from config import ConfigManager
 
+LOCALES = {
+    "en": {
+        "window_title": "SNBT AI Localizer",
+        "workspace_tab": "Workspace",
+        "translation_memory_tab": "Translation Memory",
+        "settings_tab": "Settings",
+        "credits_tab": "Credits",
+        "api_provider": "API Provider",
+        "ai_model": "AI Model (Live Auto-suggest)",
+        "api_keys_label": "API Access Keys (one per line, max 10)",
+        "show_keys": "▼ API Keys Pool",
+        "hide_keys": "▲ Hide Keys",
+        "test_keys": "Test Keys",
+        "pool_status_unchecked": "Pool Status: Unchecked",
+        "pool_status_verifying": "Pool Status: Verifying keys...",
+        "pool_status_active": "Pool Status: {} active",
+        "custom_url_label": "Custom API Base URL (for Local LLM):",
+        "custom_url_placeholder": "e.g. http://localhost:8080/v1",
+        "context_label": "Custom Translation Context / Modpack Description",
+        "context_placeholder": "e.g. Medieval RPG modpack with magic, technology, and dragons",
+        "target_lang_label": "Target Language (Format: Name (code))",
+        "policy_label": "Existing Localized Files Policy",
+        "policy_complement": "complement",
+        "policy_overwrite": "overwrite",
+        "policy_skip": "skip",
+        "translate_titles": "Translate Titles",
+        "translate_subs": "Translate Subtitles",
+        "translate_desc": "Translate Descriptions",
+        "target_dir_label": "Target Modpack / Directory",
+        "start_translation": "Start Batch Translation",
+        "pause": "Pause",
+        "resume": "Resume",
+        "stop": "Stop",
+        "clear_log": "Clear Log",
+        "settings_threads": "Threads:",
+        "settings_batch_size": "Batch Size:",
+        "settings_min_batch_size": "Min Batch Size:",
+        "settings_max_requests": "Max API Requests:",
+        "settings_ui_language": "UI Language",
+        "settings_resource_pack_mode": "Resource Pack Mode (Coming soon)",
+        "settings_resource_pack_desc": "Saves KubeJS/JSON translations into a clean standalone Resource Pack under 'resourcepacks/' instead of overwriting original files.",
+        "tm_search_placeholder": "Search by original or translation...",
+        "tm_all_modpacks": "All Modpacks",
+        "tm_original": "Original",
+        "tm_translation": "Translation",
+        "tm_modpack": "Modpack",
+        "tm_added": "Added",
+        "tm_load_more": "Load More",
+        "tm_delete_selected": "Delete Selected",
+        "tm_save_changes": "Save Changes",
+        "tm_clear_cache": "Clear Cache",
+        "tm_clear_cache_confirm": "Are you sure you want to clear the translation cache?",
+        "lang_english": "English",
+        "lang_russian": "Русский",
+        "lang_ru_ru": "Russian (ru_ru)",
+        "lang_es_es": "Spanish (es_es)",
+        "lang_zh_cn": "Chinese Simplified (zh_cn)",
+        "lang_zh_tw": "Chinese Traditional (zh_tw)",
+        "lang_de_de": "German (de_de)",
+        "lang_fr_fr": "French (fr_fr)",
+        "lang_pt_br": "Portuguese (pt_br)",
+        "lang_ja_jp": "Japanese (ja_jp)",
+        "lang_ko_kr": "Korean (ko_kr)"
+    },
+    "ru": {
+        "window_title": "SNBT AI Локализатор",
+        "workspace_tab": "Рабочая область",
+        "translation_memory_tab": "Память переводов",
+        "settings_tab": "Настройки",
+        "credits_tab": "Благодарности",
+        "api_provider": "Провайдер API",
+        "ai_model": "AI Модель (живая автоподстановка)",
+        "api_keys_label": "Ключи API (по одному на строку, максимум 10)",
+        "show_keys": "▼ Пул ключей API",
+        "hide_keys": "▲ Скрыть ключи",
+        "test_keys": "Проверить ключи",
+        "pool_status_unchecked": "Статус пула: Не проверено",
+        "pool_status_verifying": "Статус пула: Проверка ключей...",
+        "pool_status_active": "Статус пула: {} активных",
+        "custom_url_label": "Пользовательский базовый URL API (для локальной LLM):",
+        "custom_url_placeholder": "например http://localhost:8080/v1",
+        "context_label": "Пользовательский контекст перевода / Описание модпака",
+        "context_placeholder": "например Средневековый RPG модпак с магией, технологиями и драконами",
+        "target_lang_label": "Целевой язык (Формат: Название (код))",
+        "policy_label": "Политика для существующих локализованных файлов",
+        "policy_complement": "дополнить",
+        "policy_overwrite": "перезаписать",
+        "policy_skip": "пропустить",
+        "translate_titles": "Переводить заголовки",
+        "translate_subs": "Переводить субтитры",
+        "translate_desc": "Переводить описания",
+        "target_dir_label": "Целевой модпак / Директория",
+        "start_translation": "Начать пакетный перевод",
+        "pause": "Пауза",
+        "resume": "Продолжить",
+        "stop": "Стоп",
+        "clear_log": "Очистить лог",
+        "settings_threads": "Потоки:",
+        "settings_batch_size": "Размер пакета:",
+        "settings_min_batch_size": "Минимальный размер пакета:",
+        "settings_max_requests": "Максимум API запросов:",
+        "settings_ui_language": "Язык интерфейса",
+        "settings_resource_pack_mode": "Режим ресурспака (В разработке)",
+        "settings_resource_pack_desc": "Сохраняет переводы KubeJS в отдельный ресурспак в 'resourcepacks/', не перезаписывая оригинальные файлы сборки.",
+        "tm_search_placeholder": "Поиск по оригиналу или переводу...",
+        "tm_all_modpacks": "Все модпаки",
+        "tm_original": "Оригинал",
+        "tm_translation": "Перевод",
+        "tm_modpack": "Модпак",
+        "tm_added": "Добавлено",
+        "tm_load_more": "Загрузить ещё",
+        "tm_delete_selected": "Удалить выбранные",
+        "tm_save_changes": "Сохранить изменения",
+        "tm_clear_cache": "Очистить кэш",
+        "tm_clear_cache_confirm": "Вы уверены, что хотите очистить кэш переводов?",
+        "lang_english": "English",
+        "lang_russian": "Русский",
+        "lang_ru_ru": "Русский (ru_ru)",
+        "lang_es_es": "Испанский (es_es)",
+        "lang_zh_cn": "Китайский упрощённый (zh_cn)",
+        "lang_zh_tw": "Китайский традиционный (zh_tw)",
+        "lang_de_de": "Немецкий (de_de)",
+        "lang_fr_fr": "Французский (fr_fr)",
+        "lang_pt_br": "Португальский (pt_br)",
+        "lang_ja_jp": "Японский (ja_jp)",
+        "lang_ko_kr": "Корейский (ko_kr)"
+    },
+    "es": {
+        "window_title": "Localizador de IA SNBT",
+        "workspace_tab": "Área de trabajo",
+        "translation_memory_tab": "Memoria de traducción",
+        "settings_tab": "Configuración",
+        "credits_tab": "Créditos",
+        "api_provider": "Proveedor de API",
+        "ai_model": "Modelo de IA (Sugerencia en vivo)",
+        "api_keys_label": "Claves de API (una por línea, máximo 10)",
+        "show_keys": "▼ Grupo de claves API",
+        "hide_keys": "▲ Ocultar claves",
+        "test_keys": "Probar claves",
+        "pool_status_unchecked": "Estado del grupo: Sin verificar",
+        "pool_status_verifying": "Estado del grupo: Verificando claves...",
+        "pool_status_active": "Estado del grupo: {} activas",
+        "custom_url_label": "URL base de API personalizada (para LLM local):",
+        "custom_url_placeholder": "ej. http://localhost:8080/v1",
+        "context_label": "Contexto de traducción personalizado / Descripción del modpack",
+        "context_placeholder": "ej. Modpack RPG medieval con magia, tecnología y dragones",
+        "target_lang_label": "Idioma de destino (Formato: Nombre (código))",
+        "policy_label": "Política para archivos localizados existentes",
+        "policy_complement": "complementar",
+        "policy_overwrite": "sobrescribir",
+        "policy_skip": "omitir",
+        "translate_titles": "Traducir títulos",
+        "translate_subs": "Traducir subtítulos",
+        "translate_desc": "Traducir descripciones",
+        "target_dir_label": "Modpack / Directorio de destino",
+        "start_translation": "Iniciar traducción por lotes",
+        "pause": "Pausa",
+        "resume": "Reanudar",
+        "stop": "Detener",
+        "clear_log": "Limpiar registro",
+        "settings_threads": "Hilos:",
+        "settings_batch_size": "Tamaño del lote:",
+        "settings_min_batch_size": "Tamaño mínimo del lote:",
+        "settings_max_requests": "Máximo de solicitudes API:",
+        "settings_ui_language": "Idioma de la interfaz",
+        "settings_resource_pack_mode": "Modo paquete de recursos (Próximamente)",
+        "settings_resource_pack_desc": "Guarda las traducciones de KubeJS en un paquete de recursos independiente en lugar de modificar los archivos directamente.",
+        "tm_search_placeholder": "Buscar por original o traducción...",
+        "tm_all_modpacks": "Todos los modpacks",
+        "tm_original": "Original",
+        "tm_translation": "Traducción",
+        "tm_modpack": "Modpack",
+        "tm_added": "Añadido",
+        "tm_load_more": "Cargar más",
+        "tm_delete_selected": "Eliminar seleccionados",
+        "tm_save_changes": "Guardar cambios",
+        "tm_clear_cache": "Limpiar caché",
+        "tm_clear_cache_confirm": "¿Estás seguro de que quieres limpiar la caché de traducción?",
+        "lang_english": "English",
+        "lang_russian": "Русский",
+        "lang_ru_ru": "Ruso (ru_ru)",
+        "lang_es_es": "Español (es_es)",
+        "lang_zh_cn": "Chino simplificado (zh_cn)",
+        "lang_zh_tw": "Chino tradicional (zh_tw)",
+        "lang_de_de": "Alemán (de_de)",
+        "lang_fr_fr": "Francés (fr_fr)",
+        "lang_pt_br": "Portugués (pt_br)",
+        "lang_ja_jp": "Japonés (ja_jp)",
+        "lang_ko_kr": "Coreano (ko_kr)"
+    },
+    "de": {
+        "window_title": "SNBT KI-Lokalisierer",
+        "workspace_tab": "Arbeitsbereich",
+        "translation_memory_tab": "Übersetzungsspeicher",
+        "settings_tab": "Einstellungen",
+        "credits_tab": "Danksagungen",
+        "api_provider": "API-Anbieter",
+        "ai_model": "KI-Modell (Live-Vorschlag)",
+        "api_keys_label": "API-Zugriffsschlüssel (einer pro Zeile, max. 10)",
+        "show_keys": "▼ API-Schlüssel-Pool",
+        "hide_keys": "▲ Schlüssel ausblenden",
+        "test_keys": "Schlüssel testen",
+        "pool_status_unchecked": "Pool-Status: Nicht geprüft",
+        "pool_status_verifying": "Pool-Status: Schlüssel werden überprüft...",
+        "pool_status_active": "Pool-Status: {} aktiv",
+        "custom_url_label": "Benutzerdefinierte API-Basis-URL (für lokale LLM):",
+        "custom_url_placeholder": "z.B. http://localhost:8080/v1",
+        "context_label": "Benutzerdefinierter Übersetzungskontext / Modpack-Beschreibung",
+        "context_placeholder": "z.B. Mittelalterliches RPG-Modpack mit Magie, Technologie und Drachen",
+        "target_lang_label": "Zielsprache (Format: Name (Code))",
+        "policy_label": "Richtlinie für bestehende lokalisierte Dateien",
+        "policy_complement": "ergänzen",
+        "policy_overwrite": "überschreiben",
+        "policy_skip": "überspringen",
+        "translate_titles": "Titel übersetzen",
+        "translate_subs": "Untertitel übersetzen",
+        "translate_desc": "Beschreibungen übersetzen",
+        "target_dir_label": "Ziel-Modpack / Verzeichnis",
+        "start_translation": "Stapelübersetzung starten",
+        "pause": "Pause",
+        "resume": "Fortsetzen",
+        "stop": "Stoppen",
+        "clear_log": "Protokoll löschen",
+        "settings_threads": "Threads:",
+        "settings_batch_size": "Stapelgröße:",
+        "settings_min_batch_size": "Minimale Stapelgröße:",
+        "settings_max_requests": "Max. API-Anfragen:",
+        "settings_ui_language": "UI-Sprache",
+        "settings_resource_pack_mode": "Ressourcenpaket-Modus (Demnächst)",
+        "settings_resource_pack_desc": "Speichert KubeJS/JSON-Übersetzungen in einem sauberen eigenständigen Ressourcenpaket unter 'resourcepacks/' statt die Originaldateien zu überschreiben.",
+        "tm_search_placeholder": "Suche nach Original oder Übersetzung...",
+        "tm_all_modpacks": "Alle Modpacks",
+        "tm_original": "Original",
+        "tm_translation": "Übersetzung",
+        "tm_modpack": "Modpack",
+        "tm_added": "Hinzugefügt",
+        "tm_load_more": "Mehr laden",
+        "tm_delete_selected": "Ausgewählte löschen",
+        "tm_save_changes": "Änderungen speichern",
+        "tm_clear_cache": "Cache leeren",
+        "tm_clear_cache_confirm": "Sind Sie sicher, dass Sie den Übersetzungscache leeren möchten?",
+        "lang_english": "English",
+        "lang_russian": "Russisch",
+        "lang_ru_ru": "Russisch (ru_ru)",
+        "lang_es_es": "Spanisch (es_es)",
+        "lang_zh_cn": "Chinesisch (vereinfacht) (zh_cn)",
+        "lang_zh_tw": "Chinesisch (traditionell) (zh_tw)",
+        "lang_de_de": "Deutsch (de_de)",
+        "lang_fr_fr": "Französisch (fr_fr)",
+        "lang_pt_br": "Portugiesisch (BR) (pt_br)",
+        "lang_ja_jp": "Japanisch (ja_jp)",
+        "lang_ko_kr": "Koreanisch (ko_kr)"
+    },
+    "fr": {
+        "window_title": "Localisateur IA SNBT",
+        "workspace_tab": "Espace de travail",
+        "translation_memory_tab": "Mémoire de traduction",
+        "settings_tab": "Paramètres",
+        "credits_tab": "Crédits",
+        "api_provider": "Fournisseur d'API",
+        "ai_model": "Modèle IA (Suggestion en direct)",
+        "api_keys_label": "Clés d'accès API (une par ligne, max 10)",
+        "show_keys": "▼ Pool de clés API",
+        "hide_keys": "▲ Masquer les clés",
+        "test_keys": "Tester les clés",
+        "pool_status_unchecked": "Statut du pool : Non vérifié",
+        "pool_status_verifying": "Statut du pool : Vérification des clés...",
+        "pool_status_active": "Statut du pool : {} actif(s)",
+        "custom_url_label": "URL de base API personnalisée (pour LLM locale) :",
+        "custom_url_placeholder": "ex. http://localhost:8080/v1",
+        "context_label": "Contexte de traduction personnalisé / Description du modpack",
+        "context_placeholder": "ex. Modpack RPG médiéval avec magie, technologie et dragons",
+        "target_lang_label": "Langue cible (Format : Nom (code))",
+        "policy_label": "Politique pour les fichiers déjà localisés",
+        "policy_complement": "compléter",
+        "policy_overwrite": "écraser",
+        "policy_skip": "ignorer",
+        "translate_titles": "Traduire les titres",
+        "translate_subs": "Traduire les sous-titres",
+        "translate_desc": "Traduire les descriptions",
+        "target_dir_label": "Modpack / Répertoire cible",
+        "start_translation": "Démarrer la traduction par lots",
+        "pause": "Pause",
+        "resume": "Reprendre",
+        "stop": "Arrêter",
+        "clear_log": "Effacer le journal",
+        "settings_threads": "Threads :",
+        "settings_batch_size": "Taille du lot :",
+        "settings_min_batch_size": "Taille minimale du lot :",
+        "settings_max_requests": "Requêtes API max :",
+        "settings_ui_language": "Langue de l'interface",
+        "settings_resource_pack_mode": "Mode pack de ressources (Bientôt)",
+        "settings_resource_pack_desc": "Enregistre les traductions KubeJS/JSON dans un pack de ressources autonome propre sous 'resourcepacks/' au lieu d'écraser les fichiers originaux.",
+        "tm_search_placeholder": "Rechercher par original ou traduction...",
+        "tm_all_modpacks": "Tous les modpacks",
+        "tm_original": "Original",
+        "tm_translation": "Traduction",
+        "tm_modpack": "Modpack",
+        "tm_added": "Ajouté",
+        "tm_load_more": "Charger plus",
+        "tm_delete_selected": "Supprimer la sélection",
+        "tm_save_changes": "Enregistrer les modifications",
+        "tm_clear_cache": "Effacer le cache",
+        "tm_clear_cache_confirm": "Êtes-vous sûr de vouloir effacer le cache de traduction ?",
+        "lang_english": "English",
+        "lang_russian": "Russe",
+        "lang_ru_ru": "Russe (ru_ru)",
+        "lang_es_es": "Espagnol (es_es)",
+        "lang_zh_cn": "Chinois simplifié (zh_cn)",
+        "lang_zh_tw": "Chinois traditionnel (zh_tw)",
+        "lang_de_de": "Allemand (de_de)",
+        "lang_fr_fr": "Français (fr_fr)",
+        "lang_pt_br": "Portugais (BR) (pt_br)",
+        "lang_ja_jp": "Japonais (ja_jp)",
+        "lang_ko_kr": "Coréen (ko_kr)"
+    },
+    "pt_br": {
+        "window_title": "Localizador de IA SNBT",
+        "workspace_tab": "Área de trabalho",
+        "translation_memory_tab": "Memória de tradução",
+        "settings_tab": "Configurações",
+        "credits_tab": "Créditos",
+        "api_provider": "Provedor de API",
+        "ai_model": "Modelo de IA (Sugestão ao vivo)",
+        "api_keys_label": "Chaves de acesso à API (uma por linha, máximo 10)",
+        "show_keys": "▼ Pool de chaves de API",
+        "hide_keys": "▲ Ocultar chaves",
+        "test_keys": "Testar chaves",
+        "pool_status_unchecked": "Status do pool: Não verificado",
+        "pool_status_verifying": "Status do pool: Verificando chaves...",
+        "pool_status_active": "Status do pool: {} ativo(s)",
+        "custom_url_label": "URL base da API personalizada (para LLM local):",
+        "custom_url_placeholder": "ex. http://localhost:8080/v1",
+        "context_label": "Contexto de tradução personalizado / Descrição do modpack",
+        "context_placeholder": "ex. Modpack RPG medieval com magia, tecnologia e dragões",
+        "target_lang_label": "Idioma de destino (Formato: Nome (código))",
+        "policy_label": "Política para arquivos já localizados",
+        "policy_complement": "complementar",
+        "policy_overwrite": "sobrescrever",
+        "policy_skip": "pular",
+        "translate_titles": "Traduzir títulos",
+        "translate_subs": "Traduzir legendas",
+        "translate_desc": "Traduzir descrições",
+        "target_dir_label": "Modpack / Diretório de destino",
+        "start_translation": "Iniciar tradução em lote",
+        "pause": "Pausar",
+        "resume": "Retomar",
+        "stop": "Parar",
+        "clear_log": "Limpar registro",
+        "settings_threads": "Threads:",
+        "settings_batch_size": "Tamanho do lote:",
+        "settings_min_batch_size": "Tamanho mínimo do lote:",
+        "settings_max_requests": "Máximo de solicitações de API:",
+        "settings_ui_language": "Idioma da interface",
+        "settings_resource_pack_mode": "Modo pacote de recursos (Em breve)",
+        "settings_resource_pack_desc": "Salva traduções KubeJS/JSON em um pacote de recursos autônomo limpo em 'resourcepacks/' em vez de sobrescrever os arquivos originais.",
+        "tm_search_placeholder": "Pesquisar por original ou tradução...",
+        "tm_all_modpacks": "Todos os modpacks",
+        "tm_original": "Original",
+        "tm_translation": "Tradução",
+        "tm_modpack": "Modpack",
+        "tm_added": "Adicionado",
+        "tm_load_more": "Carregar mais",
+        "tm_delete_selected": "Excluir selecionados",
+        "tm_save_changes": "Salvar alterações",
+        "tm_clear_cache": "Limpar cache",
+        "tm_clear_cache_confirm": "Tem certeza de que deseja limpar o cache de tradução?",
+        "lang_english": "English",
+        "lang_russian": "Russo",
+        "lang_ru_ru": "Russo (ru_ru)",
+        "lang_es_es": "Espanhol (es_es)",
+        "lang_zh_cn": "Chinês simplificado (zh_cn)",
+        "lang_zh_tw": "Chinês tradicional (zh_tw)",
+        "lang_de_de": "Alemão (de_de)",
+        "lang_fr_fr": "Francês (fr_fr)",
+        "lang_pt_br": "Português (BR) (pt_br)",
+        "lang_ja_jp": "Japonês (ja_jp)",
+        "lang_ko_kr": "Coreano (ko_kr)"
+    },
+    "zh_cn": {
+        "window_title": "SNBT AI 本地化工具",
+        "workspace_tab": "工作区",
+        "translation_memory_tab": "翻译内存",
+        "settings_tab": "设置",
+        "credits_tab": "鸣谢",
+        "api_provider": "API 提供商",
+        "ai_model": "AI 模型（实时建议）",
+        "api_keys_label": "API 访问密钥（每行一个，最多10个）",
+        "show_keys": "▼ API 密钥池",
+        "hide_keys": "▲ 隐藏密钥",
+        "test_keys": "测试密钥",
+        "pool_status_unchecked": "池状态：未检查",
+        "pool_status_verifying": "池状态：正在验证密钥...",
+        "pool_status_active": "池状态：{} 个活跃",
+        "custom_url_label": "自定义 API 基础 URL（用于本地 LLM）：",
+        "custom_url_placeholder": "例如 http://localhost:8080/v1",
+        "context_label": "自定义翻译上下文 / 模组包描述",
+        "context_placeholder": "例如 中世纪 RPG 模组包，包含魔法、科技和龙",
+        "target_lang_label": "目标语言（格式：名称（代码））",
+        "policy_label": "现有本地化文件策略",
+        "policy_complement": "补充",
+        "policy_overwrite": "覆盖",
+        "policy_skip": "跳过",
+        "translate_titles": "翻译标题",
+        "translate_subs": "翻译字幕",
+        "translate_desc": "翻译描述",
+        "target_dir_label": "目标模组包 / 目录",
+        "start_translation": "开始批量翻译",
+        "pause": "暂停",
+        "resume": "继续",
+        "stop": "停止",
+        "clear_log": "清除日志",
+        "settings_threads": "线程：",
+        "settings_batch_size": "批次大小：",
+        "settings_min_batch_size": "最小批次大小：",
+        "settings_max_requests": "最大 API 请求数：",
+        "settings_ui_language": "界面语言",
+        "settings_resource_pack_mode": "资源包模式（即将推出）",
+        "settings_resource_pack_desc": "将 KubeJS/JSON 翻译保存到 'resourcepacks/' 下的干净独立资源包中，而不是覆盖原始文件。",
+        "tm_search_placeholder": "按原文或翻译搜索...",
+        "tm_all_modpacks": "所有模组包",
+        "tm_original": "原文",
+        "tm_translation": "翻译",
+        "tm_modpack": "模组包",
+        "tm_added": "已添加",
+        "tm_load_more": "加载更多",
+        "tm_delete_selected": "删除选中项",
+        "tm_save_changes": "保存更改",
+        "tm_clear_cache": "清除缓存",
+        "tm_clear_cache_confirm": "您确定要清除翻译缓存吗？",
+        "lang_english": "English",
+        "lang_russian": "俄语",
+        "lang_ru_ru": "俄语 (ru_ru)",
+        "lang_es_es": "西班牙语 (es_es)",
+        "lang_zh_cn": "简体中文 (zh_cn)",
+        "lang_zh_tw": "繁体中文 (zh_tw)",
+        "lang_de_de": "德语 (de_de)",
+        "lang_fr_fr": "法语 (fr_fr)",
+        "lang_pt_br": "巴西葡萄牙语 (pt_br)",
+        "lang_ja_jp": "日语 (ja_jp)",
+        "lang_ko_kr": "韩语 (ko_kr)"
+    }
+}
+
+def get_locale():
+    settings = QSettings("MineAI", "SNBT-Localizer")
+    lang = settings.value("ui_language", "English")
+    lang_map = {
+        "English": "en", "Русский": "ru", "Español": "es",
+        "Deutsch": "de", "Français": "fr", "Português (BR)": "pt_br",
+        "简体中文": "zh_cn"
+    }
+    code = lang_map.get(lang, "en")
+    base = LOCALES.get("en", {}).copy()
+    base.update(LOCALES.get(code, {}))
+    return base
+
 def find_all_quest_dirs(instance_path: Path) -> list[Path]:
     quest_dirs = []
     MAX_DEPTH = 3
@@ -392,6 +849,142 @@ class CreditsTab(QWidget):
 
         card_layout.addLayout(links_layout)
         main_layout.addWidget(card)
+
+class SettingsTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.settings = QSettings("MineAI", "SNBT-Localizer")
+        self.setup_ui()
+        self._load_settings()
+
+    def _load_settings(self):
+        self.context_in.setText(self.settings.value("custom_context", ""))
+        self.concurrency_spin.setValue(int(self.settings.value("concurrency_limit", 2)))
+        self.batch_spin.setValue(int(self.settings.value("batch_size", 50)))
+        self.min_batch_spin.setValue(int(self.settings.value("min_batch_size", 1)))
+        self.max_requests_spin.setValue(int(self.settings.value("max_concurrent_requests", 10)))
+        self.cb_titles.setChecked(self.settings.value("cb_titles", "true") == "true")
+        self.cb_subs.setChecked(self.settings.value("cb_subs", "true") == "true")
+        self.cb_desc.setChecked(self.settings.value("cb_desc", "true") == "true")
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        context_frame = QFrame()
+        context_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+        context_layout = QVBoxLayout(context_frame)
+        context_layout.setContentsMargins(12, 12, 12, 12)
+        context_layout.setSpacing(8)
+
+        self.context_label = QLabel("Custom Translation Context / Modpack Description")
+        self.context_in = QLineEdit()
+        self.context_in.setPlaceholderText("e.g. Medieval RPG modpack with magic, technology, and dragons")
+        context_layout.addWidget(self.context_label)
+        context_layout.addWidget(self.context_in)
+        layout.addWidget(context_frame)
+
+        settings_frame = QFrame()
+        settings_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+        settings_layout = QVBoxLayout(settings_frame)
+        settings_layout.setContentsMargins(12, 12, 12, 12)
+        settings_layout.setSpacing(12)
+
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(12)
+
+        concurrency_layout = QVBoxLayout()
+        self.concurrency_label = QLabel("Threads:")
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 10)
+        concurrency_layout.addWidget(self.concurrency_label)
+        concurrency_layout.addWidget(self.concurrency_spin)
+        settings_row.addLayout(concurrency_layout)
+
+        batch_layout = QVBoxLayout()
+        self.batch_label = QLabel("Batch Size:")
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 500)
+        batch_layout.addWidget(self.batch_label)
+        batch_layout.addWidget(self.batch_spin)
+        settings_row.addLayout(batch_layout)
+
+        min_batch_layout = QVBoxLayout()
+        self.min_batch_label = QLabel("Min Batch Size:")
+        self.min_batch_spin = QSpinBox()
+        self.min_batch_spin.setRange(1, 50)
+        min_batch_layout.addWidget(self.min_batch_label)
+        min_batch_layout.addWidget(self.min_batch_spin)
+        settings_row.addLayout(min_batch_layout)
+
+        max_requests_layout = QVBoxLayout()
+        self.max_requests_label = QLabel("Max API Requests:")
+        self.max_requests_spin = QSpinBox()
+        self.max_requests_spin.setRange(1, 100)
+        max_requests_layout.addWidget(self.max_requests_label)
+        max_requests_layout.addWidget(self.max_requests_spin)
+        settings_row.addLayout(max_requests_layout)
+
+        settings_row.addStretch()
+        settings_layout.addLayout(settings_row)
+        layout.addWidget(settings_frame)
+
+        filters_frame = QFrame()
+        filters_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+        filters_layout = QVBoxLayout(filters_frame)
+        filters_layout.setContentsMargins(12, 12, 12, 12)
+        filters_layout.setSpacing(8)
+
+        filters_row = QHBoxLayout()
+        filters_row.setSpacing(20)
+        self.cb_titles = QCheckBox("Translate Titles")
+        self.cb_titles.setChecked(True)
+        self.cb_subs = QCheckBox("Translate Subtitles")
+        self.cb_subs.setChecked(True)
+        self.cb_desc = QCheckBox("Translate Descriptions")
+        self.cb_desc.setChecked(True)
+        filters_row.addWidget(self.cb_titles)
+        filters_row.addWidget(self.cb_subs)
+        filters_row.addWidget(self.cb_desc)
+        filters_row.addStretch()
+        filters_layout.addLayout(filters_row)
+        layout.addWidget(filters_frame)
+
+        ui_settings_frame = QFrame()
+        ui_settings_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+        ui_settings_layout = QVBoxLayout(ui_settings_frame)
+        ui_settings_layout.setContentsMargins(12, 12, 12, 12)
+        ui_settings_layout.setSpacing(8)
+
+        lang_layout = QHBoxLayout()
+        self.ui_lang_label = QLabel("UI Language")
+        self.ui_lang_combo = QComboBox()
+        self.ui_lang_combo.addItems(["English", "Русский", "Español", "Deutsch", "Français", "Português (BR)", "简体中文"])
+        saved_lang = self.settings.value("ui_language", "English")
+        idx = self.ui_lang_combo.findText(saved_lang)
+        if idx >= 0:
+            self.ui_lang_combo.setCurrentIndex(idx)
+        lang_layout.addWidget(self.ui_lang_label)
+        lang_layout.addWidget(self.ui_lang_combo)
+        lang_layout.addStretch()
+        ui_settings_layout.addLayout(lang_layout)
+
+        line_ui = QFrame()
+        line_ui.setFrameShape(QFrame.Shape.HLine)
+        line_ui.setStyleSheet("background-color: #2d2d30; max-height: 1px; border: none;")
+        ui_settings_layout.addWidget(line_ui)
+
+        self.cb_resource_pack = QCheckBox("Resource Pack Mode (Coming soon)")
+        self.cb_resource_pack.setEnabled(False)
+        ui_settings_layout.addWidget(self.cb_resource_pack)
+
+        self.resource_pack_desc = QLabel("Saves KubeJS/JSON translations into a clean standalone Resource Pack under 'resourcepacks/' instead of overwriting original files.")
+        self.resource_pack_desc.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 20px;")
+        ui_settings_layout.addWidget(self.resource_pack_desc)
+
+        layout.addWidget(ui_settings_frame)
+        layout.addStretch()
 
 class TranslationMemoryTab(QWidget):
     language_changed = pyqtSignal(str)
@@ -1074,14 +1667,21 @@ class App(QMainWindow):
         self.key_pool_edit.setVisible(False)
         self.key_pool_edit.textChanged.connect(self.key_pool_changed)
 
+        test_keys_layout = QHBoxLayout()
+        test_keys_layout.addStretch()
         self.btn_test_keys = QPushButton("Test Keys")
+        self.btn_test_keys.setFixedWidth(200)
+        self.btn_test_keys.setFixedHeight(32)
         self.btn_test_keys.clicked.connect(self.verify_keys)
+        test_keys_layout.addWidget(self.btn_test_keys)
+        test_keys_layout.addStretch()
+
         self.lbl_key_status = QLabel("Pool Status: Unchecked")
 
         key_layout.addWidget(self.key_label)
         key_layout.addWidget(self.btn_toggle_keys)
         key_layout.addWidget(self.key_pool_edit)
-        key_layout.addWidget(self.btn_test_keys)
+        key_layout.addLayout(test_keys_layout)
         key_layout.addWidget(self.lbl_key_status)
 
         self.custom_url_label = QLabel("Custom API Base URL (for Local LLM):")
@@ -1095,16 +1695,8 @@ class App(QMainWindow):
         key_layout.addWidget(self.custom_base_url_edit)
         workspace_layout.addLayout(key_layout)
 
-        context_layout = QVBoxLayout()
-        context_label = QLabel("Custom Translation Context / Modpack Description")
-        self.context_in = QLineEdit(placeholderText="e.g. Medieval RPG modpack with magic, technology, and dragons")
-        self.context_in.setText(self.settings.value("custom_context", ""))
-        context_layout.addWidget(context_label)
-        context_layout.addWidget(self.context_in)
-        workspace_layout.addLayout(context_layout)
-
         lang_layout = QVBoxLayout()
-        lang_label = QLabel("Target Language (Format: Name (code))")
+        self.target_lang_label = QLabel("Target Language (Format: Name (code))")
         self.lang_box = QComboBox()
         self.lang_box.setView(QListView())
         self.lang_box.setEditable(True)
@@ -1121,58 +1713,12 @@ class App(QMainWindow):
         ])
         self.lang_box.setCurrentText(self.settings.value("target_lang", "Russian (ru_ru)"))
         self.lang_box.currentTextChanged.connect(self.on_lang_box_changed)
-        lang_layout.addWidget(lang_label)
+        lang_layout.addWidget(self.target_lang_label)
         lang_layout.addWidget(self.lang_box)
         workspace_layout.addLayout(lang_layout)
 
-        settings_row = QHBoxLayout()
-        settings_row.setSpacing(12)
-
-        concurrency_layout = QVBoxLayout()
-        concurrency_label = QLabel("Threads:")
-        self.concurrency_spin = QSpinBox()
-        self.concurrency_spin.setRange(1, 10)
-        self.concurrency_spin.setValue(int(self.settings.value("concurrency_limit", 2)))
-        self.concurrency_spin.valueChanged.connect(lambda: self.save_timer.start(500))
-        concurrency_layout.addWidget(concurrency_label)
-        concurrency_layout.addWidget(self.concurrency_spin)
-        settings_row.addLayout(concurrency_layout)
-
-        batch_layout = QVBoxLayout()
-        batch_label = QLabel("Batch Size:")
-        self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(1, 500)
-        self.batch_spin.setValue(int(self.settings.value("batch_size", 50)))
-        self.batch_spin.valueChanged.connect(lambda: self.save_timer.start(500))
-        batch_layout.addWidget(batch_label)
-        batch_layout.addWidget(self.batch_spin)
-        settings_row.addLayout(batch_layout)
-
-        min_batch_layout = QVBoxLayout()
-        min_batch_label = QLabel("Min Batch Size:")
-        self.min_batch_spin = QSpinBox()
-        self.min_batch_spin.setRange(1, 50)
-        self.min_batch_spin.setValue(int(self.settings.value("min_batch_size", 1)))
-        self.min_batch_spin.valueChanged.connect(lambda: self.save_timer.start(500))
-        min_batch_layout.addWidget(min_batch_label)
-        min_batch_layout.addWidget(self.min_batch_spin)
-        settings_row.addLayout(min_batch_layout)
-
-        max_requests_layout = QVBoxLayout()
-        max_requests_label = QLabel("Max API Requests:")
-        self.max_requests_spin = QSpinBox()
-        self.max_requests_spin.setRange(1, 100)
-        self.max_requests_spin.setValue(int(self.settings.value("max_concurrent_requests", 10)))
-        self.max_requests_spin.valueChanged.connect(lambda: self.save_timer.start(500))
-        max_requests_layout.addWidget(max_requests_label)
-        max_requests_layout.addWidget(self.max_requests_spin)
-        settings_row.addLayout(max_requests_layout)
-
-        settings_row.addStretch()
-        workspace_layout.addLayout(settings_row)
-
         policy_layout = QVBoxLayout()
-        policy_label = QLabel("Existing Localized Files Policy")
+        self.policy_label = QLabel("Existing Localized Files Policy")
         self.policy_box = QComboBox()
         self.policy_box.setView(QListView())
         self.policy_box.addItems([
@@ -1181,25 +1727,12 @@ class App(QMainWindow):
             "skip"
         ])
         self.policy_box.setCurrentText(self.settings.value("policy", "Complement"))
-        policy_layout.addWidget(policy_label)
+        policy_layout.addWidget(self.policy_label)
         policy_layout.addWidget(self.policy_box)
         workspace_layout.addLayout(policy_layout)
 
-        filters_layout = QHBoxLayout()
-        filters_layout.setSpacing(20)
-        self.cb_titles = QCheckBox("Translate Titles")
-        self.cb_titles.setChecked(True)
-        self.cb_subs = QCheckBox("Translate Subtitles")
-        self.cb_subs.setChecked(True)
-        self.cb_desc = QCheckBox("Translate Descriptions")
-        self.cb_desc.setChecked(True)
-        filters_layout.addWidget(self.cb_titles)
-        filters_layout.addWidget(self.cb_subs)
-        filters_layout.addWidget(self.cb_desc)
-        workspace_layout.addLayout(filters_layout)
-
         dir_layout = QVBoxLayout()
-        dir_label = QLabel("Target Modpack / Directory")
+        self.dir_label = QLabel("Target Modpack / Directory")
         self.dir_box = QComboBox()
         self.dir_box.setView(QListView())
         self.dir_box.currentIndexChanged.connect(self.dir_box_changed)
@@ -1207,7 +1740,7 @@ class App(QMainWindow):
         self.lbl_file_count = QLabel("")
         self.lbl_file_count.setStyleSheet("color: #4a8df8; font-weight: normal; margin-top: 5px; margin-bottom: 5px; font-size: 11px;")
 
-        dir_layout.addWidget(dir_label)
+        dir_layout.addWidget(self.dir_label)
         dir_layout.addWidget(self.dir_box)
         dir_layout.addWidget(self.lbl_file_count)
         workspace_layout.addLayout(dir_layout)
@@ -1252,6 +1785,10 @@ class App(QMainWindow):
         self.translation_memory_tab = TranslationMemoryTab(TranslationCache(target_lang_code=lang_code))
         self.translation_memory_tab.language_changed.connect(self.on_tm_language_changed)
         self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
+
+        self.settings_tab = SettingsTab()
+        self.settings_tab.ui_lang_combo.currentIndexChanged.connect(self.on_ui_language_changed)
+        self.tabs.addTab(self.settings_tab, "Settings")
 
         self.credits_tab = CreditsTab()
         self.tabs.addTab(self.credits_tab, "Credits")
@@ -1330,10 +1867,6 @@ class App(QMainWindow):
         if idx_p != -1:
             self.provider_box.setCurrentIndex(idx_p)
 
-        self.cb_titles.setChecked(self.settings.value("cb_titles", "true") == "true")
-        self.cb_subs.setChecked(self.settings.value("cb_subs", "true") == "true")
-        self.cb_desc.setChecked(self.settings.value("cb_desc", "true") == "true")
-
         saved_model = self.config.model or ""
         if saved_model in ["", "Loading live models...", "None (Free Engine)"]:
             self.config.model = None
@@ -1355,10 +1888,10 @@ class App(QMainWindow):
         self.custom_base_url_edit.setText(self.settings.value("custom_base_url", ""))
         self.custom_base_url = self.custom_base_url_edit.text()
 
-        self.concurrency_spin.setValue(self.config.concurrency)
-        self.batch_spin.setValue(self.config.batch_size)
-        self.min_batch_spin.setValue(self.config.min_batch_size)
-        self.max_requests_spin.setValue(self.config.max_concurrent_requests)
+        self.settings_tab.concurrency_spin.setValue(self.config.concurrency)
+        self.settings_tab.batch_spin.setValue(self.config.batch_size)
+        self.settings_tab.min_batch_spin.setValue(self.config.min_batch_size)
+        self.settings_tab.max_requests_spin.setValue(self.config.max_concurrent_requests)
 
         self.provider_box.blockSignals(False)
         self.dir_box.blockSignals(False)
@@ -1378,11 +1911,11 @@ class App(QMainWindow):
         else:
             self.config.model = None
 
-        self.settings.setValue("cb_titles", "true" if self.cb_titles.isChecked() else "false")
-        self.settings.setValue("cb_subs", "true" if self.cb_subs.isChecked() else "false")
-        self.settings.setValue("cb_desc", "true" if self.cb_desc.isChecked() else "false")
+        self.settings.setValue("cb_titles", "true" if self.settings_tab.cb_titles.isChecked() else "false")
+        self.settings.setValue("cb_subs", "true" if self.settings_tab.cb_subs.isChecked() else "false")
+        self.settings.setValue("cb_desc", "true" if self.settings_tab.cb_desc.isChecked() else "false")
 
-        self.config.custom_context = self.context_in.text().strip()
+        self.config.custom_context = self.settings_tab.context_in.text().strip()
         self.config.target_lang = self.lang_box.currentText()
 
         policy_text = self.policy_box.currentText()
@@ -1396,10 +1929,10 @@ class App(QMainWindow):
             keys_text = self.key_pool_edit.toPlainText().strip()
             keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
             self.config.set_api_keys(provider, keys)
-        self.config.concurrency = self.concurrency_spin.value()
-        self.config.batch_size = self.batch_spin.value()
-        self.config.min_batch_size = self.min_batch_spin.value()
-        self.config.max_concurrent_requests = self.max_requests_spin.value()
+        self.config.concurrency = self.settings_tab.concurrency_spin.value()
+        self.config.batch_size = self.settings_tab.batch_spin.value()
+        self.config.min_batch_size = self.settings_tab.min_batch_spin.value()
+        self.config.max_concurrent_requests = self.settings_tab.max_requests_spin.value()
         self.config.save_to_settings()
 
     def populate_instances(self):
@@ -1614,6 +2147,91 @@ class App(QMainWindow):
             logging.getLogger("snbt_localizer.gui").info(f"Cache stats: {size_mb:.2f} MB, {count} entries")
         except Exception as e:
             logging.getLogger("snbt_localizer.gui").error(f"Cache stats error: {e}")
+
+    def on_ui_language_changed(self, index):
+        lang = self.settings_tab.ui_lang_combo.currentText()
+        self.settings.setValue("ui_language", lang)
+        self.retranslate_ui()
+
+    def retranslate_ui(self):
+        locale = get_locale()
+        self.setWindowTitle(locale["window_title"])
+
+        self.tabs.setTabText(0, locale["workspace_tab"])
+        self.tabs.setTabText(1, locale["translation_memory_tab"])
+        self.tabs.setTabText(2, locale["settings_tab"])
+        self.tabs.setTabText(3, locale["credits_tab"])
+
+        self.provider_box.blockSignals(True)
+        self.model_box.blockSignals(True)
+        self.lang_box.blockSignals(True)
+        self.policy_box.blockSignals(True)
+        self.key_label.setText(locale["api_keys_label"])
+        self.btn_toggle_keys.setText(locale["hide_keys"] if self.key_pool_edit.isVisible() else locale["show_keys"])
+        self.btn_test_keys.setText(locale["test_keys"])
+        self.lbl_key_status.setText(locale["pool_status_unchecked"])
+        self.custom_url_label.setText(locale["custom_url_label"])
+        self.custom_base_url_edit.setPlaceholderText(locale["custom_url_placeholder"])
+        self.lang_box.clear()
+        self.lang_box.addItems([
+            locale["lang_ru_ru"],
+            locale["lang_es_es"],
+            locale["lang_zh_cn"],
+            locale["lang_zh_tw"],
+            locale["lang_de_de"],
+            locale["lang_fr_fr"],
+            locale["lang_pt_br"],
+            locale["lang_ja_jp"],
+            locale["lang_ko_kr"]
+        ])
+        self.policy_label.setText(locale["policy_label"])
+        self.policy_box.clear()
+        self.policy_box.addItems([
+            locale["policy_complement"],
+            locale["policy_overwrite"],
+            locale["policy_skip"]
+        ])
+        self.target_lang_label.setText(locale["target_lang_label"])
+        self.dir_label.setText(locale["target_dir_label"])
+        self.dir_box.setItemText(self.dir_box.count() - 1, locale["target_dir_label"])
+        self.btn_run.setText(locale["start_translation"])
+        self.btn_pause.setText(locale["pause"])
+        self.btn_stop.setText(locale["stop"])
+        self.btn_clear.setText(locale["clear_log"])
+        self.pb_batch.setFormat(locale["pool_status_unchecked"])
+
+        self.provider_box.blockSignals(False)
+        self.model_box.blockSignals(False)
+        self.lang_box.blockSignals(False)
+        self.policy_box.blockSignals(False)
+
+        self.settings_tab.context_label.setText(locale["context_label"])
+        self.settings_tab.context_in.setPlaceholderText(locale["context_placeholder"])
+        self.settings_tab.concurrency_label.setText(locale["settings_threads"])
+        self.settings_tab.batch_label.setText(locale["settings_batch_size"])
+        self.settings_tab.min_batch_label.setText(locale["settings_min_batch_size"])
+        self.settings_tab.max_requests_label.setText(locale["settings_max_requests"])
+        self.settings_tab.cb_titles.setText(locale["translate_titles"])
+        self.settings_tab.cb_subs.setText(locale["translate_subs"])
+        self.settings_tab.cb_desc.setText(locale["translate_desc"])
+        self.settings_tab.ui_lang_label.setText(locale["settings_ui_language"])
+        self.settings_tab.cb_resource_pack.setText(locale["settings_resource_pack_mode"])
+        self.settings_tab.resource_pack_desc.setText(locale.get("settings_resource_pack_desc", ""))
+
+        self.translation_memory_tab.search_input.setPlaceholderText(locale["tm_search_placeholder"])
+        self.translation_memory_tab.modpack_filter.setItemText(0, locale["tm_all_modpacks"])
+        self.translation_memory_tab.table.setHorizontalHeaderLabels([
+            locale["tm_original"],
+            locale["tm_translation"],
+            locale["tm_modpack"],
+            locale["tm_added"]
+        ])
+        self.translation_memory_tab.load_more_btn.setText(locale["tm_load_more"])
+        self.translation_memory_tab.delete_selected_btn.setText(locale["tm_delete_selected"])
+        self.translation_memory_tab.save_changes_btn.setText(locale["tm_save_changes"])
+        self.translation_memory_tab.clear_cache_btn.setText(locale["tm_clear_cache"])
+
+        self.credits_tab.setWindowTitle(locale["window_title"])
 
 
     def toggle_key_pool(self, checked):
@@ -1958,10 +2576,10 @@ class App(QMainWindow):
         self.tabs.setTabEnabled(1, False)
         
         model = self.model_box.currentText() or ""
-        t_titles = self.cb_titles.isChecked()
-        t_subs = self.cb_subs.isChecked()
-        t_desc = self.cb_desc.isChecked()
-        custom_context = self.context_in.text().strip()
+        t_titles = self.settings_tab.cb_titles.isChecked()
+        t_subs = self.settings_tab.cb_subs.isChecked()
+        t_desc = self.settings_tab.cb_desc.isChecked()
+        custom_context = self.settings_tab.context_in.text().strip()
         policy = self.policy_box.currentText()
         target_lang = self.lang_box.currentText()
 
@@ -1995,8 +2613,8 @@ class App(QMainWindow):
         m = SNBTManager(
             first_key, prov, model, custom_context, target_lang_name, target_lang_code,
             concurrency_limit=concurrency, mixed_pool=mixed_pool, modpack=modpack_name,
-            batch_size=self.batch_spin.value(), min_batch_size=self.min_batch_spin.value(),
-            max_concurrent_requests=self.max_requests_spin.value(), custom_base_url=custom_url
+            batch_size=self.settings_tab.batch_spin.value(), min_batch_size=self.settings_tab.min_batch_spin.value(),
+            max_concurrent_requests=self.settings_tab.max_requests_spin.value(), custom_base_url=custom_url
         )
         
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
@@ -2031,13 +2649,13 @@ class App(QMainWindow):
             unique_keys,
             prov,
             model or "",
-            self.context_in.text().strip(),
+            custom_context,
             target_lang_name,
             target_lang_code,
             mixed_pool=mixed_pool,
-            batch_size=self.batch_spin.value(),
-            min_batch_size=self.min_batch_spin.value(),
-            max_concurrent_requests=self.max_requests_spin.value(),
+            batch_size=self.settings_tab.batch_spin.value(),
+            min_batch_size=self.settings_tab.min_batch_spin.value(),
+            max_concurrent_requests=self.settings_tab.max_requests_spin.value(),
             custom_base_url=custom_url
         )
         cache = TranslationCache(target_lang_code=target_lang_code)
