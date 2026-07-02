@@ -20,13 +20,6 @@ backups/
 *.bak
 MANIFEST_*.md
 
-# IDEs & AI Agent Workspaces
-.continue/
-.aider*
-.vscode/
-.idea/
-.env
-
 # Testing
 .pytest_cache/
 
