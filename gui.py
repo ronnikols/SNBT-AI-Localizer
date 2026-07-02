@@ -57,8 +57,8 @@ LOCALES = {
         "settings_min_batch_size": "Min Batch Size:",
         "settings_max_requests": "Max API Requests:",
         "settings_ui_language": "UI Language",
-        "settings_resource_pack_mode": "Resource Pack Mode (Coming soon)",
-        "settings_resource_pack_desc": "Saves KubeJS/JSON translations into a clean standalone Resource Pack under 'resourcepacks/' instead of overwriting original files.",
+        "settings_resource_pack_mode": "Resource Pack Mode (Isolate JSONs)",
+        "settings_resource_pack_desc": "Saves KubeJS/JSON translations into a clean standalone Resource Pack. WARNING: Some modpacks (like KubeJS in ATM9) ignore resource packs for script translations. If translations don't load in-game, disable this mode to translate directly in-place.",
         "tm_search_placeholder": "Search by original or translation...",
         "tm_all_modpacks": "All Modpacks",
         "tm_original": "Original",
@@ -120,8 +120,8 @@ LOCALES = {
         "settings_min_batch_size": "Минимальный размер пакета:",
         "settings_max_requests": "Максимум API запросов:",
         "settings_ui_language": "Язык интерфейса",
-        "settings_resource_pack_mode": "Режим ресурспака (В разработке)",
-        "settings_resource_pack_desc": "Сохраняет переводы KubeJS в отдельный ресурспак в 'resourcepacks/', не перезаписывая оригинальные файлы сборки.",
+        "settings_resource_pack_mode": "Режим ресурс-пака (Изоляция JSON)",
+        "settings_resource_pack_desc": "Сохраняет переводы KubeJS/JSON в отдельный ресурс-пак. ВНИМАНИЕ: Некоторые сборки (например, KubeJS в ATM9) игнорируют переводы из ресурс-паков. Если перевод не работает в игре, отключите этот режим для прямого перевода на диск.",
         "tm_search_placeholder": "Поиск по оригиналу или переводу...",
         "tm_all_modpacks": "Все модпаки",
         "tm_original": "Оригинал",
@@ -183,8 +183,8 @@ LOCALES = {
         "settings_min_batch_size": "Tamaño mínimo del lote:",
         "settings_max_requests": "Máximo de solicitudes API:",
         "settings_ui_language": "Idioma de la interfaz",
-        "settings_resource_pack_mode": "Modo paquete de recursos (Próximamente)",
-        "settings_resource_pack_desc": "Guarda las traducciones de KubeJS en un paquete de recursos independiente en lugar de modificar los archivos directamente.",
+        "settings_resource_pack_mode": "Modo paquete de recursos (Aislar JSONs)",
+        "settings_resource_pack_desc": "Guarda las traducciones KubeJS/JSON en un paquete de recursos independiente. ADVERTENCIA: Algunos modpacks (como KubeJS en ATM9) ignoran los paquetes de recursos para traducciones de scripts. Si las traducciones no se cargan en el juego, desactive este modo para traducir directamente en el lugar.",
         "tm_search_placeholder": "Buscar por original o traducción...",
         "tm_all_modpacks": "Todos los modpacks",
         "tm_original": "Original",
@@ -246,8 +246,8 @@ LOCALES = {
         "settings_min_batch_size": "Minimale Stapelgröße:",
         "settings_max_requests": "Max. API-Anfragen:",
         "settings_ui_language": "UI-Sprache",
-        "settings_resource_pack_mode": "Ressourcenpaket-Modus (Demnächst)",
-        "settings_resource_pack_desc": "Speichert KubeJS/JSON-Übersetzungen in einem sauberen eigenständigen Ressourcenpaket unter 'resourcepacks/' statt die Originaldateien zu überschreiben.",
+        "settings_resource_pack_mode": "Ressourcenpaket-Modus (JSONs isolieren)",
+        "settings_resource_pack_desc": "Speichert KubeJS/JSON-Übersetzungen in einem sauberen eigenständigen Ressourcenpaket. WARNUNG: Einige Modpacks (wie KubeJS in ATM9) ignorieren Ressourcenpakete für Skriptübersetzungen. Wenn Übersetzungen im Spiel nicht geladen werden, deaktivieren Sie diesen Modus, um direkt vor Ort zu übersetzen.",
         "tm_search_placeholder": "Suche nach Original oder Übersetzung...",
         "tm_all_modpacks": "Alle Modpacks",
         "tm_original": "Original",
@@ -309,8 +309,8 @@ LOCALES = {
         "settings_min_batch_size": "Taille minimale du lot :",
         "settings_max_requests": "Requêtes API max :",
         "settings_ui_language": "Langue de l'interface",
-        "settings_resource_pack_mode": "Mode pack de ressources (Bientôt)",
-        "settings_resource_pack_desc": "Enregistre les traductions KubeJS/JSON dans un pack de ressources autonome propre sous 'resourcepacks/' au lieu d'écraser les fichiers originaux.",
+        "settings_resource_pack_mode": "Mode pack de ressources (Isoler les JSON)",
+        "settings_resource_pack_desc": "Enregistre les traductions KubeJS/JSON dans un pack de ressources autonome propre. ATTENTION : Certains modpacks (comme KubeJS dans ATM9) ignorent les packs de ressources pour les traductions de scripts. Si les traductions ne se chargent pas en jeu, désactivez ce mode pour traduire directement sur place.",
         "tm_search_placeholder": "Rechercher par original ou traduction...",
         "tm_all_modpacks": "Tous les modpacks",
         "tm_original": "Original",
@@ -372,8 +372,8 @@ LOCALES = {
         "settings_min_batch_size": "Tamanho mínimo do lote:",
         "settings_max_requests": "Máximo de solicitações de API:",
         "settings_ui_language": "Idioma da interface",
-        "settings_resource_pack_mode": "Modo pacote de recursos (Em breve)",
-        "settings_resource_pack_desc": "Salva traduções KubeJS/JSON em um pacote de recursos autônomo limpo em 'resourcepacks/' em vez de sobrescrever os arquivos originais.",
+        "settings_resource_pack_mode": "Modo pacote de recursos (Isolar JSONs)",
+        "settings_resource_pack_desc": "Salva traduções KubeJS/JSON em um pacote de recursos autônomo limpo. AVISO: Alguns modpacks (como KubeJS no ATM9) ignoram pacotes de recursos para traduções de scripts. Se as traduções não carregarem no jogo, desative este modo para traduzir diretamente no local.",
         "tm_search_placeholder": "Pesquisar por original ou tradução...",
         "tm_all_modpacks": "Todos os modpacks",
         "tm_original": "Original",
@@ -435,8 +435,8 @@ LOCALES = {
         "settings_min_batch_size": "最小批次大小：",
         "settings_max_requests": "最大 API 请求数：",
         "settings_ui_language": "界面语言",
-        "settings_resource_pack_mode": "资源包模式（即将推出）",
-        "settings_resource_pack_desc": "将 KubeJS/JSON 翻译保存到 'resourcepacks/' 下的干净独立资源包中，而不是覆盖原始文件。",
+        "settings_resource_pack_mode": "资源包模式（隔离 JSON）",
+        "settings_resource_pack_desc": "将 KubeJS/JSON 翻译保存到干净独立的资源包中。警告：某些模组包（如 ATM9 中的 KubeJS）会忽略资源包中的脚本翻译。如果翻译在游戏中无法加载，请禁用此模式以直接进行原地翻译。",
         "tm_search_placeholder": "按原文或翻译搜索...",
         "tm_all_modpacks": "所有模组包",
         "tm_original": "原文",
@@ -851,10 +851,12 @@ class CreditsTab(QWidget):
         main_layout.addWidget(card)
 
 class SettingsTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, config, parent=None):
         super().__init__(parent)
+        self.config = config
         self.settings = QSettings("MineAI", "SNBT-Localizer")
         self.setup_ui()
+        self.setLayout(self.layout)
         self._load_settings()
 
     def _load_settings(self):
@@ -868,11 +870,11 @@ class SettingsTab(QWidget):
         self.cb_desc.setChecked(self.settings.value("cb_desc", "true") == "true")
 
     def setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        self.layout = QVBoxLayout()
+        self.layout.setSpacing(12)
+        self.layout.setContentsMargins(16, 16, 16, 16)
 
-        context_frame = QFrame()
+        context_frame = QFrame(self)
         context_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
         context_layout = QVBoxLayout(context_frame)
         context_layout.setContentsMargins(12, 12, 12, 12)
@@ -883,9 +885,9 @@ class SettingsTab(QWidget):
         self.context_in.setPlaceholderText("e.g. Medieval RPG modpack with magic, technology, and dragons")
         context_layout.addWidget(self.context_label)
         context_layout.addWidget(self.context_in)
-        layout.addWidget(context_frame)
+        self.layout.addWidget(context_frame)
 
-        settings_frame = QFrame()
+        settings_frame = QFrame(self)
         settings_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
         settings_layout = QVBoxLayout(settings_frame)
         settings_layout.setContentsMargins(12, 12, 12, 12)
@@ -928,9 +930,9 @@ class SettingsTab(QWidget):
 
         settings_row.addStretch()
         settings_layout.addLayout(settings_row)
-        layout.addWidget(settings_frame)
+        self.layout.addWidget(settings_frame)
 
-        filters_frame = QFrame()
+        filters_frame = QFrame(self)
         filters_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
         filters_layout = QVBoxLayout(filters_frame)
         filters_layout.setContentsMargins(12, 12, 12, 12)
@@ -949,9 +951,9 @@ class SettingsTab(QWidget):
         filters_row.addWidget(self.cb_desc)
         filters_row.addStretch()
         filters_layout.addLayout(filters_row)
-        layout.addWidget(filters_frame)
+        self.layout.addWidget(filters_frame)
 
-        ui_settings_frame = QFrame()
+        ui_settings_frame = QFrame(self)
         ui_settings_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
         ui_settings_layout = QVBoxLayout(ui_settings_frame)
         ui_settings_layout.setContentsMargins(12, 12, 12, 12)
@@ -975,16 +977,21 @@ class SettingsTab(QWidget):
         line_ui.setStyleSheet("background-color: #2d2d30; max-height: 1px; border: none;")
         ui_settings_layout.addWidget(line_ui)
 
-        self.cb_resource_pack = QCheckBox("Resource Pack Mode (Coming soon)")
-        self.cb_resource_pack.setEnabled(False)
+        self.cb_resource_pack = QCheckBox("Resource Pack Mode (Isolate JSONs)")
+        self.cb_resource_pack.setEnabled(True)
+        self.cb_resource_pack.setChecked(self.config.resource_pack_mode)
+        self.cb_resource_pack.toggled.connect(self._on_rp_mode_toggled)
         ui_settings_layout.addWidget(self.cb_resource_pack)
 
-        self.resource_pack_desc = QLabel("Saves KubeJS/JSON translations into a clean standalone Resource Pack under 'resourcepacks/' instead of overwriting original files.")
+        self.resource_pack_desc = QLabel("Saves KubeJS/JSON translations into a clean standalone Resource Pack. WARNING: Some modpacks (like KubeJS in ATM9) ignore resource packs for script translations. If translations don't load in-game, disable this mode to translate directly in-place.")
         self.resource_pack_desc.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 20px;")
         ui_settings_layout.addWidget(self.resource_pack_desc)
+        self.layout.addWidget(ui_settings_frame)
+        self.layout.addStretch()
 
-        layout.addWidget(ui_settings_frame)
-        layout.addStretch()
+    def _on_rp_mode_toggled(self, checked):
+        self.config.resource_pack_mode = checked
+        self.config.save_to_settings()
 
 class TranslationMemoryTab(QWidget):
     language_changed = pyqtSignal(str)
@@ -1310,7 +1317,7 @@ class Worker(QThread):
     lines_translated = pyqtSignal(int, int)
     progress_state = pyqtSignal(int, int, str, int, int, float)
 
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None, custom_base_url=None, translator=None, cache=None):
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None, custom_base_url=None, translator=None, cache=None, resource_pack_mode=False):
         super().__init__()
         self.files = files
         self.keys = keys
@@ -1331,6 +1338,7 @@ class Worker(QThread):
         self.custom_base_url = custom_base_url
         self.translator = translator
         self.cache = cache
+        self.resource_pack_mode = resource_pack_mode
         self.is_aborted = False
         self.is_paused = False
         self._total_strings = 0
@@ -1368,18 +1376,23 @@ class Worker(QThread):
                     if base_dir in processed_dirs:
                         continue
                     processed_dirs.add(base_dir)
+                    def json_progress(processed, total):
+                        self.progress_state.emit(0, 0, "Translating KubeJS JSON strings", processed, total, 0)
+                        self.progress_batch.emit(processed, total)
+
                     manager = JSONManager(
                         base_dir,
                         target_lang_code,
                         self.translator,
                         self.cache,
                         self.modpack,
-                        self.policy
+                        self.policy,
+                        resource_pack_mode=self.resource_pack_mode,
+                        progress_callback=json_progress
                     )
                     asyncio.run(manager.process(
-                        logger=self.log.emit,
-                        check_status=self.check_status,
-                        progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot)
+                        log_callback=self.log.emit,
+                        check_status=self.check_status
                     ))
         except Exception as e:
             self.log.emit(f"Unexpected error: {e}")
@@ -1523,7 +1536,7 @@ class JSONWorker(QThread):
     done = pyqtSignal()
     progress_batch = pyqtSignal(int, int)
 
-    def __init__(self, base_dir, target_lang_code, translator, cache, modpack, policy, concurrency, batch_size, min_batch_size, max_concurrent_requests):
+    def __init__(self, base_dir, target_lang_code, translator, cache, modpack, policy, concurrency, batch_size, min_batch_size, max_concurrent_requests, resource_pack_mode=False):
         super().__init__()
         self.base_dir = base_dir
         self.target_lang_code = target_lang_code
@@ -1535,6 +1548,7 @@ class JSONWorker(QThread):
         self.batch_size = batch_size
         self.min_batch_size = min_batch_size
         self.max_concurrent_requests = max_concurrent_requests
+        self.resource_pack_mode = resource_pack_mode
         self.is_aborted = False
         self.is_paused = False
 
@@ -1561,12 +1575,13 @@ class JSONWorker(QThread):
             self.translator,
             self.cache,
             self.modpack,
-            self.policy
+            self.policy,
+            resource_pack_mode=self.resource_pack_mode,
+            progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot)
         )
         await manager.process(
-            logger=self.log.emit,
-            check_status=self.check_status,
-            progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot)
+            log_callback=self.log.emit,
+            check_status=self.check_status
         )
 
 class App(QMainWindow):
@@ -1786,7 +1801,7 @@ class App(QMainWindow):
         self.translation_memory_tab.language_changed.connect(self.on_tm_language_changed)
         self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
 
-        self.settings_tab = SettingsTab()
+        self.settings_tab = SettingsTab(self.config, parent=self)
         self.settings_tab.ui_lang_combo.currentIndexChanged.connect(self.on_ui_language_changed)
         self.tabs.addTab(self.settings_tab, "Settings")
 
@@ -1814,6 +1829,7 @@ class App(QMainWindow):
         gui_handler.setLevel(logging.INFO)
         gui_logger.addHandler(gui_handler)
         gui_logger.propagate = False
+        self.retranslate_ui()
 
     def on_lang_box_changed(self, lang_text):
         if self._is_initializing:
@@ -2103,14 +2119,19 @@ class App(QMainWindow):
     def update_progress_state(self, current_file_idx, total_files, current_file_name, completed_strings, total_strings, eta_seconds):
         if getattr(self, '_translation_finished', False):
             return
-        self.pb_batch.setRange(0, 100)
-        if total_strings > 0:
-            progress_percent = int((completed_strings / total_strings) * 100)
-            self.pb_batch.setValue(progress_percent)
-            self.pb_batch.setFormat(f"File {current_file_idx}/{total_files}: {current_file_name} | Strings {completed_strings}/{total_strings} | ETA: {self.format_eta(eta_seconds)}")
+        if "JSON" in current_file_name or "strings" in current_file_name:
+            self.pb_batch.setRange(0, total_strings)
+            self.pb_batch.setValue(completed_strings)
+            self.pb_batch.setFormat(f"{current_file_name}: %v / %m strings")
         else:
-            self.pb_batch.setValue(0)
-            self.pb_batch.setFormat("Processing...")
+            self.pb_batch.setRange(0, 100)
+            if total_strings > 0:
+                progress_percent = int((completed_strings / total_strings) * 100)
+                self.pb_batch.setValue(progress_percent)
+                self.pb_batch.setFormat(f"File {current_file_idx}/{total_files}: {current_file_name} | Strings {completed_strings}/{total_strings} | ETA: {self.format_eta(eta_seconds)}")
+            else:
+                self.pb_batch.setValue(0)
+                self.pb_batch.setFormat("Processing...")
 
     def format_eta(self, eta_seconds):
         if eta_seconds <= 0 or eta_seconds is None:
@@ -2570,7 +2591,14 @@ class App(QMainWindow):
         self.key_pool_edit.setEnabled(False)
         self.btn_toggle_keys.setEnabled(False)
         self.dir_box.setEnabled(False)
-        self.context_in.setEnabled(False)
+        self.settings_tab.context_in.setEnabled(False)
+        self.settings_tab.cb_titles.setEnabled(False)
+        self.settings_tab.cb_subs.setEnabled(False)
+        self.settings_tab.cb_desc.setEnabled(False)
+        self.settings_tab.concurrency_spin.setEnabled(False)
+        self.settings_tab.batch_spin.setEnabled(False)
+        self.settings_tab.min_batch_spin.setEnabled(False)
+        self.settings_tab.max_requests_spin.setEnabled(False)
         self.lang_box.setEnabled(False)
         self.policy_box.setEnabled(False)
         self.tabs.setTabEnabled(1, False)
@@ -2659,7 +2687,7 @@ class App(QMainWindow):
             custom_base_url=custom_url
         )
         cache = TranslationCache(target_lang_code=target_lang_code)
-        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.batch_spin.value(), self.min_batch_spin.value(), self.max_requests_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache)
+        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.settings_tab.batch_spin.value(), self.settings_tab.min_batch_spin.value(), self.settings_tab.max_requests_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache, resource_pack_mode=self.config.resource_pack_mode)
         self.w.is_aborted = False
         self.w.is_paused = False
         self.w.log.connect(self.out.append)
@@ -2685,7 +2713,14 @@ class App(QMainWindow):
         self.key_pool_edit.setEnabled(True)
         self.btn_toggle_keys.setEnabled(True)
         self.dir_box.setEnabled(True)
-        self.context_in.setEnabled(True)
+        self.settings_tab.context_in.setEnabled(True)
+        self.settings_tab.cb_titles.setEnabled(True)
+        self.settings_tab.cb_subs.setEnabled(True)
+        self.settings_tab.cb_desc.setEnabled(True)
+        self.settings_tab.concurrency_spin.setEnabled(True)
+        self.settings_tab.batch_spin.setEnabled(True)
+        self.settings_tab.min_batch_spin.setEnabled(True)
+        self.settings_tab.max_requests_spin.setEnabled(True)
         self.lang_box.setEnabled(True)
         self.policy_box.setEnabled(True)
         self.tabs.setTabEnabled(1, True)

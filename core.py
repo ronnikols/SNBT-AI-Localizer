@@ -1200,7 +1200,9 @@ class JSONManager:
         translator: 'UnifiedTranslator',
         cache: TranslationCache,
         modpack: str = None,
-        policy: str = "Complement (Дополнить)"
+        policy: str = "Complement (Дополнить)",
+        resource_pack_mode: bool = False,
+        progress_callback=None
     ):
         self.base_dir = Path(base_dir).resolve()
         self.target_lang_code = target_lang_code
@@ -1208,6 +1210,8 @@ class JSONManager:
         self.cache = cache
         self.modpack = modpack
         self.policy = policy
+        self.resource_pack_mode = resource_pack_mode
+        self.progress_callback = progress_callback
 
     def _find_lang_dirs(self):
         lang_dirs = set()
@@ -1219,10 +1223,10 @@ class JSONManager:
     def _is_translatable(self, text: str) -> bool:
         return len(text) > 1 and not ID_PATTERN.match(text) and not UUID_PATTERN.match(text)
 
-    async def process(self, logger=print, check_status=None, progress_callback=None) -> int:
+    async def process(self, log_callback=print, check_status=None) -> int:
         lang_dirs = self._find_lang_dirs()
         if not lang_dirs:
-            logger(f"No lang directories with en_us.json found in {self.base_dir}")
+            log_callback(f"No lang directories with en_us.json found in {self.base_dir}")
             return 0
 
         total_translated = 0
@@ -1230,7 +1234,35 @@ class JSONManager:
 
         for lang_dir in lang_dirs:
             source_file = lang_dir / "en_us.json"
-            target_file = lang_dir / f"{self.target_lang_code}.json"
+            target_lang = self.target_lang_code.lower().replace("-", "_")
+            if self.resource_pack_mode:
+                modpack_root = self.base_dir
+                while len(modpack_root.parts) > 1:
+                    if (modpack_root / "mods").is_dir() or (modpack_root / "config").is_dir() or (modpack_root / "kubejs").is_dir():
+                        break
+                    modpack_root = modpack_root.parent
+                pack_dir = modpack_root / "resourcepacks" / f"Modpack_Local_{target_lang}"
+                pack_mcmeta_path = pack_dir / "pack.mcmeta"
+                if not pack_mcmeta_path.exists():
+                    pack_dir.mkdir(parents=True, exist_ok=True)
+                    pack_mcmeta_path.write_text(json.dumps({
+                        "pack": {
+                            "pack_format": 15,
+                            "description": f"SNBT AI Localizer compiled translations"
+                        }
+                    }, indent=2), encoding="utf-8")
+                logo_path = Path(__file__).parent / "resources" / "logo.png"
+                if logo_path.exists():
+                    try:
+                        (pack_dir / "pack.png").write_bytes(logo_path.read_bytes())
+                    except Exception:
+                        pass
+                rel_path = lang_dir.relative_to(self.base_dir)
+                target_lang_dir = pack_dir / rel_path
+                target_lang_dir.mkdir(parents=True, exist_ok=True)
+                target_file = target_lang_dir / f"{target_lang}.json"
+            else:
+                target_file = lang_dir / f"{target_lang}.json"
 
             with open(source_file, 'r', encoding='utf-8') as f:
                 source_data = json.load(f)
@@ -1261,6 +1293,7 @@ class JSONManager:
             total_strings += len(all_values)
 
             batch_size = 50
+            processed_strings = 0
             for i in range(0, len(all_values), batch_size):
                 if check_status:
                     await check_status()
@@ -1281,13 +1314,13 @@ class JSONManager:
                     try:
                         translations = await self.translator.translate(
                             texts_to_translate,
-                            logger,
+                            log_callback,
                             check_status,
                             context="JSON"
                         )
                         translations = [clean_and_unpack_string(t) for t in translations]
                     except Exception as e:
-                        logger(f"Translation failed: {e}")
+                        log_callback(f"Translation failed: {e}")
                         translations = texts_to_translate
 
                     for (key, _), translation in zip(cache_misses, translations):
@@ -1303,8 +1336,10 @@ class JSONManager:
                         strings_to_translate[key] = cache_hits[key]
                         total_translated += 1
 
-                if progress_callback:
-                    progress_callback(total_translated, total_strings)
+                processed_strings += len(batch_values)
+                log_callback(f"Translating JSON: {processed_strings}/{total_strings} strings ({(processed_strings / total_strings) * 100:.1f}%)")
+                if self.progress_callback:
+                    self.progress_callback(processed_strings, total_strings)
 
             result_data = {}
             for key, value in source_data.items():
@@ -1327,10 +1362,10 @@ class JSONManager:
             with open(target_file, 'w', encoding='utf-8') as f:
                 json.dump(result_data, f, ensure_ascii=False, indent=4)
 
-        if progress_callback:
-            progress_callback(total_translated, total_strings)
+        if self.progress_callback:
+            self.progress_callback(total_translated, total_strings)
 
-        logger(f"JSON translation completed. Translated {total_translated} strings.")
+        log_callback(f"JSON translation completed. Translated {total_translated} strings.")
         return total_translated
 
 KubeJSManager = JSONManager
