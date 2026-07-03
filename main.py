@@ -215,7 +215,10 @@ def normalize_path(path: str) -> Path:
     die(f"Path does not exist: {path} -> {absolute}")
 
 def is_interactive() -> bool:
-    return sys.stdin.isatty()
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except:
+        return False
 
 def get_cli_settings():
     if QSettings is None:
@@ -1188,7 +1191,7 @@ async def main_async() -> int:
     parsed = config.parse_cli_args()
     setup_logging(debug=parsed.debug)
 
-    if parsed.gui:
+    if parsed.gui or not is_interactive():
         from gui import main as gui_main
         gui_main()
         return 0
