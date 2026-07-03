@@ -356,6 +356,8 @@ def parse_snbt_map(content: str) -> Dict[str, str]:
 
 class TranslationCache:
     def __init__(self, db_path="cache.sqlite", target_lang_code="ru_ru"):
+        if db_path == "cache.sqlite":
+            db_path = str(Path.home() / ".snbt-tr" / "cache.sqlite")
         self.db_path = os.path.abspath(db_path)
         parent_dir = os.path.dirname(self.db_path)
         if parent_dir and not os.path.exists(parent_dir):

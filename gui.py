@@ -5,15 +5,17 @@ import asyncio
 import time
 import logging
 import weakref
+import tempfile
+import subprocess
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QFileDialog, QLineEdit, 
                              QTextEdit, QLabel, QComboBox, QListView, QCheckBox, 
                              QCompleter, QStyleFactory, QProgressBar, QMessageBox,
                              QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
-                             QTabWidget, QHeaderView, QFrame)
-from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot
-from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon
+                             QTabWidget, QHeaderView, QFrame, QProgressDialog)
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot, QUrl
+from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices
 import httpx
 from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path
 from config import ConfigManager
@@ -802,6 +804,51 @@ def detect_instances() -> tuple[dict, dict]:
                 except Exception:
                     pass
     return detected, quest_dirs_mapping
+
+class UpdateChecker(QThread):
+    update_available = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        try:
+            asyncio.run(self._check_updates())
+        except Exception as e:
+            logging.getLogger("snbt_localizer.gui").error(f"Update check failed: {e}")
+
+    async def _check_updates(self):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get("https://api.github.com/repos/ronnikols/SNBT-AI-Localizer/releases/latest")
+                response.raise_for_status()
+                data = response.json()
+                remote_version = data.get("tag_name", "v0.0.0").lstrip("v")
+                from config import APP_VERSION
+                current_version = APP_VERSION.lstrip("v")
+
+                if self._compare_versions(remote_version, current_version) > 0:
+                    asset_url = ""
+                    for asset in data.get("assets", []):
+                        if asset.get("name") == "snbt-tr.exe":
+                            asset_url = asset.get("browser_download_url", "")
+                            break
+                    if asset_url:
+                        self.update_available.emit(remote_version, asset_url)
+        except Exception as e:
+            logging.getLogger("snbt_localizer.gui").error(f"Update check error: {e}")
+
+    def _compare_versions(self, v1, v2):
+        v1_parts = list(map(int, v1.split('.')))
+        v2_parts = list(map(int, v2.split('.')))
+        for i in range(max(len(v1_parts), len(v2_parts))):
+            part1 = v1_parts[i] if i < len(v1_parts) else 0
+            part2 = v2_parts[i] if i < len(v2_parts) else 0
+            if part1 > part2:
+                return 1
+            elif part1 < part2:
+                return -1
+        return 0
 
 class CreditsTab(QWidget):
     def __init__(self, parent=None):
@@ -1838,6 +1885,70 @@ class App(QMainWindow):
         gui_logger.addHandler(gui_handler)
         gui_logger.propagate = False
         self.retranslate_ui()
+
+        self.update_checker = UpdateChecker()
+        self.update_checker.update_available.connect(self.on_update_available)
+        self.update_checker.start()
+
+    def on_update_available(self, new_version, asset_url):
+        msg = f"New version v{new_version} is available! Download now?"
+        reply = QMessageBox.question(
+            self,
+            "Update Available",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.download_and_update(asset_url)
+
+    def download_and_update(self, asset_url):
+        temp_dir = Path(tempfile.gettempdir())
+        temp_path = temp_dir / "snbt-tr_new.exe"
+
+        progress_dialog = QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
+        progress_dialog.setWindowTitle("Downloading Update")
+        progress_dialog.setModal(True)
+        progress_dialog.show()
+
+        def download_with_progress():
+            try:
+                with httpx.stream("GET", asset_url, timeout=30.0) as response:
+                    response.raise_for_status()
+                    total_size = int(response.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(temp_path, "wb") as f:
+                        for chunk in response.iter_bytes(chunk_size=8192):
+                            if progress_dialog.wasCanceled():
+                                temp_path.unlink(missing_ok=True)
+                                return False
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total_size > 0:
+                                progress = int((downloaded / total_size) * 100)
+                                progress_dialog.setValue(progress)
+                                QApplication.processEvents()
+                        progress_dialog.setValue(100)
+                    return True
+            except Exception as e:
+                logging.getLogger("snbt_localizer.gui").error(f"Download failed: {e}")
+                temp_path.unlink(missing_ok=True)
+                return False
+
+        success = download_with_progress()
+        progress_dialog.close()
+
+        if success:
+            if os.name == "nt":
+                current_exe = Path(sys.executable)
+                ps_command = (
+                    f'Start-Sleep -Milliseconds 500; '
+                    f'Move-Item -Path "{temp_path}" -Destination "{current_exe}" -Force; '
+                    f'Start-Process "{current_exe}"'
+                )
+                subprocess.Popen(["powershell", "-Command", ps_command], creationflags=subprocess.DETACHED_PROCESS)
+                QApplication.quit()
+            else:
+                QDesktopServices.openUrl(QUrl(asset_url))
 
     def on_lang_box_changed(self, lang_text):
         if self._is_initializing or self._is_syncing_language:
