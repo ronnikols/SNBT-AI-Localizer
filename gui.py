@@ -819,8 +819,8 @@ class UpdateChecker(QThread):
 
     async def _check_updates(self):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get("https://api.github.com/repos/ronnikols/SNBT-AI-Localizer/releases/latest")
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                response = await client.get("https://api.github.com/repos/ronnikols/SNBT-AI-Localizer/releases/latest", follow_redirects=True)
                 response.raise_for_status()
                 data = response.json()
                 remote_version = data.get("tag_name", "v0.0.0").lstrip("v")
@@ -1436,7 +1436,9 @@ class Worker(QThread):
                         self.modpack,
                         self.policy,
                         resource_pack_mode=self.resource_pack_mode,
-                        progress_callback=json_progress
+                        progress_callback=json_progress,
+                        batch_size=self.batch_size,
+                        min_batch_size=self.min_batch_size
                     )
                     asyncio.run(manager.process(
                         log_callback=self.log.emit,
@@ -1625,7 +1627,9 @@ class JSONWorker(QThread):
             self.modpack,
             self.policy,
             resource_pack_mode=self.resource_pack_mode,
-            progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot)
+            progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot),
+            batch_size=self.batch_size,
+            min_batch_size=self.min_batch_size
         )
         await manager.process(
             log_callback=self.log.emit,
@@ -1912,7 +1916,7 @@ class App(QMainWindow):
 
         def download_with_progress():
             try:
-                with httpx.stream("GET", asset_url, timeout=30.0) as response:
+                with httpx.stream("GET", asset_url, timeout=30.0, follow_redirects=True) as response:
                     response.raise_for_status()
                     total_size = int(response.headers.get("content-length", 0))
                     downloaded = 0

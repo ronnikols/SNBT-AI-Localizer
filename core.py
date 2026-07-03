@@ -1236,7 +1236,9 @@ class JSONManager:
         policy: str = "Complement (Дополнить)",
         resource_pack_mode: bool = False,
         progress_callback=None,
-        modpack_root: Optional[Path] = None
+        modpack_root: Optional[Path] = None,
+        batch_size: int = 50,
+        min_batch_size: int = 1
     ):
         self.base_dir = Path(base_dir).resolve()
         self.target_lang_code = target_lang_code
@@ -1247,6 +1249,8 @@ class JSONManager:
         self.resource_pack_mode = resource_pack_mode
         self.progress_callback = progress_callback
         self.modpack_root = modpack_root
+        self.batch_size = batch_size
+        self.min_batch_size = min_batch_size
         if self.modpack_root is None and base_dir is not None:
             self.modpack_root = find_modpack_root(self.base_dir)
         if self.modpack_root and self.translator.modpack_root is None:
@@ -1254,6 +1258,38 @@ class JSONManager:
             mod_context = build_mod_context(self.modpack_root)
             if mod_context:
                 self.translator.prompt += f" {mod_context}"
+
+    async def _translate_with_recovery(self, texts, log_callback, check_status, context):
+        if not texts:
+            return []
+
+        try:
+            translations = await self.translator.translate(
+                texts,
+                log_callback,
+                check_status,
+                context=context
+            )
+            translations = [clean_and_unpack_string(t) for t in translations]
+            if len(translations) == len(texts):
+                return translations
+            raise ValueError(f"Array length mismatch: expected {len(texts)}, got {len(translations)}")
+        except (ValueError, json.JSONDecodeError) as e:
+            if len(texts) <= self.min_batch_size:
+                log_callback(f"[BinarySplit] Failed to translate single item: {str(e)[:100]}")
+                return texts
+
+            mid = len(texts) // 2
+            log_callback(f"[BinarySplit] Splitting batch of size {len(texts)} into {mid} + {len(texts) - mid} due to: {str(e)[:100]}")
+
+            left_task = self._translate_with_recovery(texts[:mid], log_callback, check_status, context)
+            right_task = self._translate_with_recovery(texts[mid:], log_callback, check_status, context)
+            left_trans, right_trans = await asyncio.gather(left_task, right_task)
+
+            return left_trans + right_trans
+        except Exception as e:
+            log_callback(f"Unexpected translation error: {e}")
+            return texts
 
     def _find_lang_dirs(self):
         lang_dirs = set()
@@ -1339,7 +1375,7 @@ class JSONManager:
             all_values = list(strings_to_translate.values())
             total_strings += len(all_values)
 
-            batch_size = 50
+            batch_size = self.batch_size
             processed_strings = 0
             for i in range(0, len(all_values), batch_size):
                 if check_status:
@@ -1358,17 +1394,12 @@ class JSONManager:
 
                 if cache_misses:
                     texts_to_translate = [value for _, value in cache_misses]
-                    try:
-                        translations = await self.translator.translate(
-                            texts_to_translate,
-                            log_callback,
-                            check_status,
-                            context="JSON"
-                        )
-                        translations = [clean_and_unpack_string(t) for t in translations]
-                    except Exception as e:
-                        log_callback(f"Translation failed: {e}")
-                        translations = texts_to_translate
+                    translations = await self._translate_with_recovery(
+                        texts_to_translate,
+                        log_callback,
+                        check_status,
+                        "JSON"
+                    )
 
                     for (key, _), translation in zip(cache_misses, translations):
                         cache_hits[key] = translation
