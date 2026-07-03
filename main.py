@@ -238,7 +238,7 @@ def load_cli_setting(key: str, default: str = "") -> str:
 async def run_setup_wizard(config: ConfigManager, parsed=None) -> tuple[Path, str, str | None, str | None, str, str]:
     logging.getLogger("snbt_localizer.cli").info("=== SNBT AI Localizer - Setup Wizard ===")
 
-    if parsed and hasattr(parsed, 'dir') and parsed.dir:
+    if parsed and hasattr(parsed, 'dir') and parsed.dir is not None:
         quest_dir = normalize_path(parsed.dir)
         config.add_custom_path(str(quest_dir))
         logging.getLogger("snbt_localizer.cli").info(f"Using directory from command line: {quest_dir}")
@@ -1329,11 +1329,18 @@ async def main_async() -> int:
             concurrency = max(1, min(config.concurrency, 10))
         return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency, parsed.resource_pack)
     else:
-        quest_dir = normalize_path(parsed.dir)
-        quest_dirs = find_all_quest_dirs(quest_dir)
-        if not quest_dirs:
-            logging.getLogger("snbt_localizer.cli").error(f"No quest directories found in {quest_dir}")
-            return 1
+        if parsed.dir is None:
+            result = await run_setup_wizard(config, parsed)
+            if result is None:
+                return 1
+            quest_dir, provider, api_key, model, lang_name, lang_code = result
+            quest_dirs = find_all_quest_dirs(quest_dir)
+        else:
+            quest_dir = normalize_path(parsed.dir)
+            quest_dirs = find_all_quest_dirs(quest_dir)
+            if not quest_dirs:
+                logging.getLogger("snbt_localizer.cli").error(f"No quest directories found in {quest_dir}")
+                return 1
         provider = config.provider
         if config.provider == "Mixed Providers":
             api_keys = []

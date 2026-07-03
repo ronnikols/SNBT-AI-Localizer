@@ -200,7 +200,7 @@ class ConfigManager:
         parser.add_argument("-m", "--model", help="Model name (default: provider default)")
         parser.add_argument("-k", "--key", help="API key(s), comma-separated (env/QSettings fallback)")
         parser.add_argument("-l", "--lang", default="ru", help="Language code (default: ru)")
-        parser.add_argument("-d", "--dir", default=".", help="Path to quests directory (default: .)")
+        parser.add_argument("-d", "--dir", default=None, help="Path to quests directory (default: auto-detect)")
         parser.add_argument("-c", "--context", default="", help="Custom translation context")
         parser.add_argument("--policy", default="complement", choices=["complement", "overwrite", "skip"],
                             help="Existing files policy: complement, overwrite, skip (default: complement)")
