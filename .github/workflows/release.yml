@@ -13,7 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pyinstaller
+      - run: pip install pyinstaller pillow
       - run: pip install -r requirements.txt
       - run: pyinstaller --onefile --noconsole --icon=resources/logo.png --add-data "resources;resources" main.py --name snbt-tr
       - uses: softprops/action-gh-release@v2
