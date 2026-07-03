@@ -883,6 +883,231 @@ def test_get_unique_modpacks():
         if os.path.exists(db_path):
             os.remove(db_path)
 
+# ==================== v1.6.0: Local Contextual RAG Mod Scanner Tests ====================
+
+def test_clean_mod_filename_standard_cases():
+    from core import clean_mod_filename
+    assert clean_mod_filename("appliedenergistics2-forge-15.0.2.jar") == "appliedenergistics2"
+    assert clean_mod_filename("gregtech-1.20.1-1.0.4-beta.jar") == "gregtech"
+    assert clean_mod_filename("botania-1.20.1-445.jar") == "botania"
+    assert clean_mod_filename("create-1.20.1-0.5.1d.jar") == "create"
+    assert clean_mod_filename("tinkersconstruct-3.7.3.10.jar") == "tinkersconstruct"
+
+def test_clean_mod_filename_edge_cases():
+    from core import clean_mod_filename
+    # Only version numbers
+    assert clean_mod_filename("1.20.1-445.jar") == "1.20.1"
+    # No hyphens
+    assert clean_mod_filename("botania.jar") == "botania"
+    # Multiple version segments
+    assert clean_mod_filename("modname-1.20.1-4.0.0-beta-1.2.jar") == "modname"
+    # Empty after cleaning (fallback)
+    assert clean_mod_filename("123-456.jar") == "123"
+    # Test with forge in name
+    assert clean_mod_filename("appliedenergistics2-forge-15.0.2.jar") == "appliedenergistics2"
+
+def test_find_modpack_root():
+    from core import find_modpack_root
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        # Create a deep structure
+        deep_dir = tmpdir / "saves" / "world" / "ftbquests" / "quests"
+        deep_dir.mkdir(parents=True)
+        # Add mods dir at root
+        (tmpdir / "mods").mkdir()
+        # Test from deep directory
+        result = find_modpack_root(deep_dir)
+        assert result == tmpdir
+        # Test with minecraft dir
+        (tmpdir / "minecraft").mkdir()
+        result = find_modpack_root(deep_dir)
+        assert result == tmpdir
+        # Test with config dir
+        (tmpdir / "config").mkdir()
+        result = find_modpack_root(deep_dir)
+        assert result == tmpdir
+
+def test_find_modpack_root_not_found():
+    from core import find_modpack_root
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        empty_dir = tmpdir / "empty" / "dir"
+        empty_dir.mkdir(parents=True)
+        result = find_modpack_root(empty_dir)
+        assert result is None
+
+def test_scan_mods_dir():
+    from core import scan_mods_dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        mods_dir = tmpdir / "mods"
+        mods_dir.mkdir()
+        # Create test jar files
+        (mods_dir / "gregtech-1.20.1-1.0.4.jar").touch()
+        (mods_dir / "appliedenergistics2-forge-15.0.2.jar").touch()
+        (mods_dir / "botania-1.20.1-445.jar").touch()
+        (mods_dir / "create-1.20.1-0.5.1d.jar").touch()
+        # Create non-jar file (should be ignored)
+        (mods_dir / "readme.txt").touch()
+        result = scan_mods_dir(tmpdir)
+        assert sorted(result) == ["appliedenergistics2", "botania", "create", "gregtech"]
+
+def test_scan_mods_dir_empty():
+    from core import scan_mods_dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        result = scan_mods_dir(tmpdir)
+        assert result == []
+
+def test_scan_mods_dir_missing():
+    from core import scan_mods_dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        # No mods directory
+        result = scan_mods_dir(tmpdir)
+        assert result == []
+
+def test_load_mod_rules_from_resources():
+    from core import load_mod_rules
+    rules = load_mod_rules()
+    assert isinstance(rules, dict)
+    assert "mod_overrides" in rules
+    assert "gregtech" in rules["mod_overrides"]
+    assert "appliedenergistics2" in rules["mod_overrides"]
+    assert "global_hints" in rules
+
+def test_load_mod_rules_fallback_to_config():
+    from core import load_mod_rules
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        config_dir = tmpdir / "config"
+        config_dir.mkdir()
+        test_rules = {
+            "mod_overrides": {"testmod": {"translation_hint": "Test hint"}},
+            "global_hints": ["Test global hint"]
+        }
+        (config_dir / "mod_rules.json").write_text(json.dumps(test_rules), encoding="utf-8")
+        # Temporarily patch get_resource_path to return non-existent path
+        with patch('core.get_resource_path') as mock_get_resource:
+            mock_get_resource.return_value = Path("/nonexistent/path/mod_rules.json")
+            # Change working directory to tmpdir so config/mod_rules.json is found
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                rules = load_mod_rules()
+                assert rules == test_rules
+            finally:
+                os.chdir(original_cwd)
+
+def test_load_mod_rules_corrupt_file():
+    from core import load_mod_rules
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        config_dir = tmpdir / "config"
+        config_dir.mkdir()
+        (config_dir / "mod_rules.json").write_text("invalid json {", encoding="utf-8")
+        with patch('core.get_resource_path') as mock_get_resource:
+            mock_get_resource.return_value = Path("/nonexistent/path/mod_rules.json")
+            rules = load_mod_rules()
+            assert rules == {}
+
+def test_build_mod_context_with_rules():
+    from core import build_mod_context
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        mods_dir = tmpdir / "mods"
+        mods_dir.mkdir()
+        (mods_dir / "gregtech-1.20.1-1.0.4.jar").touch()
+        (mods_dir / "appliedenergistics2-forge-15.0.2.jar").touch()
+        (mods_dir / "botania-1.20.1-445.jar").touch()
+        context = build_mod_context(tmpdir)
+        assert "gregtech" in context
+        assert "appliedenergistics2" in context
+        assert "botania" in context
+        assert "Не переводить термины" in context  # From gregtech rule
+
+def test_build_mod_context_no_mods():
+    from core import build_mod_context
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        context = build_mod_context(tmpdir)
+        assert context == ""
+
+def test_build_mod_context_none_input():
+    from core import build_mod_context
+    context = build_mod_context(None)
+    assert context == ""
+
+def test_unified_translator_mod_context_integration():
+    from core import UnifiedTranslator, build_mod_context
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        mods_dir = tmpdir / "mods"
+        mods_dir.mkdir()
+        (mods_dir / "gregtech-1.20.1-1.0.4.jar").touch()
+        translator = UnifiedTranslator(
+            ["test_key"],
+            "Groq Cloud (Fast)",
+            "test-model",
+            modpack_root=tmpdir
+        )
+        assert "gregtech" in translator.prompt
+        assert "Не переводить термины" in translator.prompt
+
+def test_unified_translator_no_mod_context():
+    from core import UnifiedTranslator
+    translator = UnifiedTranslator(
+        ["test_key"],
+        "Groq Cloud (Fast)",
+        "test-model",
+        modpack_root=None
+    )
+    assert "gregtech" not in translator.prompt
+    assert "Detected mods" not in translator.prompt
+
+def test_snbt_manager_modpack_root_integration():
+    from core import SNBTManager
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        mods_dir = tmpdir / "mods"
+        mods_dir.mkdir()
+        (mods_dir / "gregtech-1.20.1-1.0.4.jar").touch()
+        manager = SNBTManager(
+            "test_key",
+            "Groq Cloud (Fast)",
+            "test-model",
+            modpack_root=tmpdir
+        )
+        assert manager.modpack_root == tmpdir
+        assert manager.translator.modpack_root == tmpdir
+        assert "gregtech" in manager.translator.prompt
+
+def test_json_manager_modpack_root_integration():
+    from core import JSONManager, UnifiedTranslator, TranslationCache, build_mod_context
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        mods_dir = tmpdir / "mods"
+        mods_dir.mkdir()
+        (mods_dir / "gregtech-1.20.1-1.0.4.jar").touch()
+        lang_dir = tmpdir / "kubejs" / "assets" / "kubejs" / "lang"
+        lang_dir.mkdir(parents=True)
+        (lang_dir / "en_us.json").write_text('{"key": "value"}', encoding="utf-8")
+        translator = UnifiedTranslator(["test_key"], "Groq Cloud (Fast)", "test-model", modpack_root=tmpdir)
+        cache = TranslationCache(target_lang_code="ru_ru")
+        manager = JSONManager(
+            lang_dir,
+            "ru_ru",
+            translator,
+            cache,
+            modpack_root=tmpdir
+        )
+        assert manager.modpack_root == tmpdir
+        assert manager.translator.modpack_root == tmpdir
+        # The translator's prompt should already have mod context from initialization
+        expected_context = build_mod_context(tmpdir)
+        assert expected_context in manager.translator.prompt
+        assert "gregtech" in manager.translator.prompt
+
 def test_json_manager_resource_pack_mode():
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)

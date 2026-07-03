@@ -1,0 +1,17 @@
+{
+  "mod_overrides": {
+    "gregtech": {
+      "name_override": "GregTech",
+      "translation_hint": "Не переводить термины: GT, EU, LV, MV, HV, EV, IV, LuV, ZPM, UV, UHV, AE, ME. Сохранять аббревиатуры и технические термины на английском."
+    },
+    "appliedenergistics2": {
+      "name_override": "Applied Energistics 2",
+      "translation_hint": "Не переводить термины: ME, AE, Network, Channel, Storage, Import/Export Bus, Pattern, Crafting CPU. Сохранять названия блоков и предметов в оригинальном виде."
+    }
+  },
+  "global_hints": [
+    "Никогда не переводить сырые игровые IDs предметов в формате `modid:item_name`",
+    "Сохранять регистр для имен собственных (например, 'Tinkers' Construct')",
+    "Не переводить названия модов (например, 'GregTech', 'Applied Energistics 2')"
+  ]
+}

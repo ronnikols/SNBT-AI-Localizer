@@ -653,7 +653,7 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
     return resolved
 
 class UnifiedTranslator:
-    def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, custom_base_url: Optional[str] = None):
+    def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, custom_base_url: Optional[str] = None, modpack_root: Optional[Path] = None):
         cleaned = []
         seen = set()
         for k in api_keys:
@@ -683,6 +683,11 @@ class UnifiedTranslator:
         self.request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         if not model:
             model = get_default_model(provider)
+
+        # Dynamic mod context integration
+        self.modpack_root = modpack_root
+        mod_context = build_mod_context(modpack_root) if modpack_root else ""
+
         if provider == "Mixed Providers":
             if mixed_pool:
                 self.mixed_pool = mixed_pool
@@ -716,6 +721,7 @@ class UnifiedTranslator:
                 raise ValueError(f"No API keys provided for provider: {provider}")
             for key in cleaned:
                 self.mixed_pool.append({"provider": provider, "api_key": key, "model": model, "base_url": get_base_url(provider)})
+
         context_str = f"<user_context>{custom_context}</user_context>" if custom_context else "Modpack FTB Quests context."
         self.prompt = (
             f"Translate the JSON array of strings to {target_lang_name}. "
@@ -727,6 +733,8 @@ class UnifiedTranslator:
             "Output ONLY a valid JSON array of strings. "
             "Keep placeholders like __TAG_X__ exactly as they are without translation, spacing or modification."
         )
+        if mod_context:
+            self.prompt += f" {mod_context}"
         self.provider_instances = {}
         for entry in self.mixed_pool:
             prov = entry["provider"]
@@ -931,7 +939,7 @@ class UnifiedTranslator:
         return res
 
 class SNBTManager:
-    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None, custom_base_url: Optional[str] = None):
+    def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None, custom_base_url: Optional[str] = None, modpack_root: Optional[Path] = None):
         self.cache = TranslationCache(target_lang_code=target_lang_code)
         self.target_lang_code = target_lang_code
         self.provider = provider
@@ -942,11 +950,17 @@ class SNBTManager:
         self.min_batch_size = min_batch_size
         self.max_concurrent_requests = max_concurrent_requests
         self.modpack = modpack
+        self.modpack_root = modpack_root
         if translator is not None:
             self.translator = translator
         else:
             keys = [api_key] if api_key and api_key != "SKIP" else []
-            self.translator = UnifiedTranslator(keys, provider, model, custom_context, target_lang_name, target_lang_code, mixed_pool=mixed_pool, batch_size=batch_size, min_batch_size=min_batch_size, max_concurrent_requests=max_concurrent_requests, custom_base_url=custom_base_url)
+            self.translator = UnifiedTranslator(
+                keys, provider, model, custom_context, target_lang_name, target_lang_code,
+                mixed_pool=mixed_pool, batch_size=batch_size, min_batch_size=min_batch_size,
+                max_concurrent_requests=max_concurrent_requests, custom_base_url=custom_base_url,
+                modpack_root=modpack_root
+            )
 
     def close(self):
         self.cache.close()
@@ -1208,7 +1222,8 @@ class JSONManager:
         modpack: str = None,
         policy: str = "Complement (Дополнить)",
         resource_pack_mode: bool = False,
-        progress_callback=None
+        progress_callback=None,
+        modpack_root: Optional[Path] = None
     ):
         self.base_dir = Path(base_dir).resolve()
         self.target_lang_code = target_lang_code
@@ -1218,6 +1233,9 @@ class JSONManager:
         self.policy = policy
         self.resource_pack_mode = resource_pack_mode
         self.progress_callback = progress_callback
+        self.modpack_root = modpack_root
+        if modpack_root is None and base_dir is not None:
+            self.modpack_root = find_modpack_root(base_dir)
 
     def _find_lang_dirs(self):
         lang_dirs = set()
@@ -1269,6 +1287,11 @@ class JSONManager:
                 target_file = target_lang_dir / f"{target_lang}.json"
             else:
                 target_file = lang_dir / f"{target_lang}.json"
+
+            # Update translator with modpack_root if not already set
+            if self.translator.modpack_root is None and self.modpack_root is not None:
+                self.translator.modpack_root = self.modpack_root
+                self.translator.prompt += f" {build_mod_context(self.modpack_root)}"
 
             with open(source_file, 'r', encoding='utf-8') as f:
                 source_data = json.load(f)
@@ -1373,5 +1396,121 @@ class JSONManager:
 
         log_callback(f"JSON translation completed. Translated {total_translated} strings.")
         return total_translated
+
+def find_modpack_root(path: Path) -> Optional[Path]:
+    """
+    Climbs up the directory tree from `path` to find the modpack root.
+    Returns the first directory that contains 'config', 'minecraft', or 'mods' at its immediate level.
+    """
+    current = Path(path).resolve()
+    for _ in range(10):  # Prevent infinite loop
+        # Check if current directory has mods, config, or minecraft as immediate children
+        has_mods = (current / "mods").is_dir()
+        has_config = (current / "config").is_dir()
+        has_minecraft = (current / "minecraft").is_dir()
+        if has_mods or has_config or has_minecraft:
+            return current
+        parent = current.parent
+        if parent == current:  # Reached filesystem root
+            break
+        current = parent
+    return None
+
+def clean_mod_filename(filename: str) -> str:
+    """
+    Cleans a mod jar filename by:
+    1. Removing .jar extension
+    2. Taking the first segment before the first hyphen
+    3. Lowercasing the result
+    """
+    stem = Path(filename).stem
+    first_segment = stem.split('-')[0]
+    return first_segment.lower()
+
+def load_mod_rules() -> dict:
+    """
+    Safely loads mod_rules.json from resources/ or config/.
+    Returns empty dict on any failure.
+    """
+    paths = [
+        get_resource_path("resources/mod_rules.json"),
+        Path("config/mod_rules.json")
+    ]
+    for path in paths:
+        if path.exists():
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+                logger.warning(f"Failed to load mod_rules.json from {path}: {e}")
+                return {}
+    return {}
+
+def scan_mods_dir(root_dir: Path) -> list[str]:
+    """
+    Scans the 'mods' directory in root_dir for .jar files,
+    extracts clean mod names, and returns a sorted unique list.
+    """
+    mods_dir = root_dir / "mods"
+    if not mods_dir.is_dir():
+        return []
+    mod_files = mods_dir.glob("*.jar")
+    mod_names = {clean_mod_filename(f.name) for f in mod_files}
+    return sorted(mod_names)
+
+def build_mod_context(modpack_root: Optional[Path]) -> str:
+    """
+    Builds dynamic LLM context from detected mods and rules.
+    Returns empty string if no mods found or on error.
+    """
+    if not modpack_root:
+        return ""
+
+    try:
+        mod_names = scan_mods_dir(modpack_root)
+        if not mod_names:
+            return ""
+
+        rules = load_mod_rules()
+        mod_overrides = rules.get("mod_overrides", {})
+        global_hints = rules.get("global_hints", [])
+
+        matched_mods = []
+        unmatched_mods = []
+        hints = []
+
+        for mod_name in mod_names:
+            matched = False
+            for rule_key in mod_overrides:
+                if rule_key.lower() in mod_name:
+                    hints.append(mod_overrides[rule_key].get("translation_hint", ""))
+                    matched_mods.append(mod_name)
+                    matched = True
+                    break
+            if not matched:
+                unmatched_mods.append(mod_name)
+
+        context_parts = []
+        if matched_mods:
+            context_parts.append(f"Detected mods with custom rules: {', '.join(matched_mods)}.")
+            for hint in hints:
+                if hint:
+                    context_parts.append(f"Rule: {hint}")
+
+        if unmatched_mods:
+            context_parts.append(
+                f"Other mods: {', '.join(unmatched_mods)}. "
+                "Use official Russian translations for these mods."
+            )
+
+        if global_hints:
+            context_parts.append("Global rules:")
+            for hint in global_hints:
+                context_parts.append(f"- {hint}")
+
+        return " ".join(context_parts).strip()
+    except Exception as e:
+        logger.warning(f"Failed to build mod context: {e}")
+        return ""
 
 KubeJSManager = JSONManager

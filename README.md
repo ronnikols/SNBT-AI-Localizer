@@ -4,7 +4,7 @@
 
 English | [Русский](README_RU.md)
 
-Advanced asynchronous translator for Minecraft FTB Quests files (`.snbt`) with support for multiple local and cloud translation engines, featuring a dual-tab GUI and intelligent SQLite caching system.
+Advanced asynchronous translator for Minecraft FTB Quests files (`.snbt`) with support for multiple local and cloud translation engines, featuring a 4-tab GUI and intelligent SQLite caching system.
 
 ## Installation
 
@@ -41,7 +41,7 @@ snbt-tr --fastdir
 
 ## Features
 
-### Dual-Tab GUI Architecture
+### 4-Tab GUI Architecture
 - **Workspace Tab**: Primary translation interface with provider/model selection, API key pool management (up to 10 keys), custom context input, target language dropdown, batch processing controls (Start/Pause/Stop), and live logging output
 - **Translation Memory Tab**: Visual cache manager with:
   - Real-time search across original and translated text with 300ms debounce
@@ -50,6 +50,8 @@ snbt-tr --fastdir
   - 4-column QTableWidget (Original, Translation, Modpack, Added) with auto-stretch column width layout
   - Inline editing of translations directly in the table
   - Bulk operations: Load More (pagination), Delete Selected, Save Changes, Clear Cache
+- **Settings Tab**: Configuration management for providers, models, API keys, and application settings
+- **Credits Tab**: Displays project credits and acknowledgments
 
 ### Asynchronous Processing
 - Non-blocking I/O with `asyncio` and `httpx.AsyncClient`
