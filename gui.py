@@ -18,7 +18,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, Q
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices
 import httpx
 from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path
-from config import ConfigManager
+from config import ConfigManager, APP_VERSION
 
 ICON_PATH = get_resource_path("resources/logo.png")
 
@@ -824,7 +824,6 @@ class UpdateChecker(QThread):
                 response.raise_for_status()
                 data = response.json()
                 remote_version = data.get("tag_name", "v0.0.0").lstrip("v")
-                from config import APP_VERSION
                 current_version = APP_VERSION.lstrip("v")
 
                 if self._compare_versions(remote_version, current_version) > 0:
