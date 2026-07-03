@@ -1,0 +1,19 @@
+app-id: org.mineai.snbt-tr
+runtime: org.kde.Platform
+runtime-version: '6.6'
+sdk: org.kde.Sdk
+command: snbt-tr
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=x11
+  - --share=network
+  - --filesystem=host
+modules:
+  - name: snbt-tr
+    buildsystem: simple
+    build-commands:
+      - pip install --prefix=/app .
+    sources:
+      - type: dir
+        path: .

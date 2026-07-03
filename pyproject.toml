@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "snbt-ai-localizer"
-version = "1.0.0"
+name = "snbt-tr"
+version = "1.0.4"
 description = "Advanced SNBT quest localizer using AI key pools"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,3 +24,8 @@ snbt-tr = "main:main"
 
 [tool.setuptools]
 py-modules = ["config", "core", "gui", "main"]
+packages = ["resources"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+resources = ["**/*"]

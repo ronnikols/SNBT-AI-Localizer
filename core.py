@@ -17,9 +17,18 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 def get_resource_path(relative_path):
+    import sys
+    import os
+    from pathlib import Path
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / relative_path
-    return Path(__file__).parent.resolve() / relative_path
+    try:
+        import resources
+        base_path = Path(os.path.dirname(os.path.abspath(resources.__file__)))
+        sub_path = relative_path.replace("resources/", "", 1) if relative_path.startswith("resources/") else relative_path
+        return base_path / sub_path
+    except Exception:
+        return Path(os.path.abspath(relative_path))
 
 def clean_and_unpack_string(text: str) -> str:
     text = text.strip()
@@ -687,6 +696,8 @@ class UnifiedTranslator:
         # Dynamic mod context integration
         self.modpack_root = modpack_root
         mod_context = build_mod_context(modpack_root) if modpack_root else ""
+        if mod_context:
+            mod_context = f" {mod_context}"
 
         if provider == "Mixed Providers":
             if mixed_pool:
@@ -734,7 +745,7 @@ class UnifiedTranslator:
             "Keep placeholders like __TAG_X__ exactly as they are without translation, spacing or modification."
         )
         if mod_context:
-            self.prompt += f" {mod_context}"
+            self.prompt += mod_context
         self.provider_instances = {}
         for entry in self.mixed_pool:
             prov = entry["provider"]
@@ -1234,8 +1245,13 @@ class JSONManager:
         self.resource_pack_mode = resource_pack_mode
         self.progress_callback = progress_callback
         self.modpack_root = modpack_root
-        if modpack_root is None and base_dir is not None:
-            self.modpack_root = find_modpack_root(base_dir)
+        if self.modpack_root is None and base_dir is not None:
+            self.modpack_root = find_modpack_root(self.base_dir)
+        if self.modpack_root and self.translator.modpack_root is None:
+            self.translator.modpack_root = self.modpack_root
+            mod_context = build_mod_context(self.modpack_root)
+            if mod_context:
+                self.translator.prompt += f" {mod_context}"
 
     def _find_lang_dirs(self):
         lang_dirs = set()

@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import ctypes
 import httpx
 import logging
 from pathlib import Path
@@ -264,15 +265,15 @@ async def run_setup_wizard(config: ConfigManager, parsed=None) -> tuple[Path, st
             if is_valid_custom_instance(p) and not any(str(p) == path_str for _, path_str, _ in instances):
                 instances.append((p.name, str(p), "Custom"))
 
-    if not instances:
-        logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
-        custom_path = input("Enter path to modpack manually: ").strip()
-        if not custom_path:
-            die("No path provided")
-        quest_dir = normalize_path(custom_path)
-        config.add_custom_path(str(quest_dir))
-    else:
-        instances = sorted(instances, key=lambda x: x[1])
+        if not instances:
+            logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
+            custom_path = input("Enter path to modpack manually: ").strip()
+            if not custom_path:
+                die("No path provided")
+            quest_dir = normalize_path(custom_path)
+            config.add_custom_path(str(quest_dir))
+        else:
+            instances = sorted(instances, key=lambda x: x[1])
         last_instance = load_cli_setting("cli_last_instance", "")
         default_idx = 0
         if last_instance:
@@ -552,15 +553,15 @@ async def run_mix_setup_wizard(config: ConfigManager, parsed=None) -> tuple[Path
                 except Exception:
                     pass
 
-        if not instances:
-            logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
-            custom_path = input("Enter path to modpack manually: ").strip()
-            if not custom_path:
-                return None
-            quest_dir = normalize_path(custom_path)
-            config.add_custom_path(str(quest_dir))
-        else:
-            instances = sorted(instances, key=lambda x: x[1])
+            if not instances:
+                logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
+                custom_path = input("Enter path to modpack manually: ").strip()
+                if not custom_path:
+                    return None
+                quest_dir = normalize_path(custom_path)
+                config.add_custom_path(str(quest_dir))
+            else:
+                instances = sorted(instances, key=lambda x: x[1])
             last_instance = load_cli_setting("cli_last_instance", "")
             default_idx = 0
             if last_instance:
@@ -1350,6 +1351,11 @@ async def main_async() -> int:
 
 def main() -> None:
     try:
+        if os.name == "nt":
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("mineai.snbt-tr.localizer.1.0")
+            except:
+                pass
         exit_code = asyncio.run(main_async())
         sys.exit(exit_code)
     except KeyboardInterrupt:

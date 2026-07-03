@@ -13,10 +13,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
                              QTabWidget, QHeaderView, QFrame)
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot
-from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut
+from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon
 import httpx
-from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager
+from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path
 from config import ConfigManager
+
+ICON_PATH = get_resource_path("resources/logo.png")
 
 LOCALES = {
     "en": {
@@ -1588,6 +1590,11 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SNBT AI Localizer")
+        try:
+            if ICON_PATH and os.path.exists(ICON_PATH):
+                self.setWindowIcon(QIcon(ICON_PATH))
+        except Exception:
+            pass
         self.resize(750, 680)
         self.setStyleSheet(STYLE_SHEET)
         
