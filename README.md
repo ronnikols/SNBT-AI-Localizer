@@ -112,7 +112,7 @@ This prevents charging for translations of:
 | Google Gemini (Free API) | models/gemini-3.1-flash-lite | Yes | Google's latest free model |
 | Sambanova | DeepSeek-V3.1 | No | High-performance inference |
 | OpenAI | gpt-4o-mini | No | Optimized for speed |
-| Mistral AI | mistral-large-latest | No | Open-source frontier models |
+| Mistral AI | mistral-large-latest | Yes | Open-source frontier models |
 | Anthropic (Claude) | claude-3-5-sonnet-20241022 | No | High-quality responses |
 | Cohere | command-r-plus | No | Production-ready |
 | Ollama (Local / Free) | qwen2.5:7b | Yes | Self-hosted, no API key |
