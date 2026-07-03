@@ -1,3 +1,5 @@
+import os
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 import pytest
 
 @pytest.fixture(scope="session", autouse=True)
