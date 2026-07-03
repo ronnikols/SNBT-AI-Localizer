@@ -71,10 +71,31 @@ snbt-tr --fastdir
 - SQLite-based cache with WAL mode for concurrent access
 - Per-language tables (`cache_{lang_code}`) to prevent cross-contamination
 - Modpack isolation: Translations can be filtered and managed by modpack
-- Pluralization Guard: Prevents duplicate API calls for similar phrases (90% similarity threshold)
 - Thread-safe operations with locking
 - Real-time persistence between chunks
 - Defensive sanitization: Automatic cleanup of nested dictionaries in SNBT and protection against malformed JSON in responses
+
+### 🛡️ Pluralization Guard
+**Prevents redundant API calls for highly similar strings with a 90% similarity threshold**
+
+The Pluralization Guard is a sophisticated fuzzy-matching system that automatically detects and reuses translations for similar phrases, preventing duplicate API calls and saving costs. It works by:
+
+1. **Exact Match Check**: First attempts to find an exact match in the cache
+2. **Length Filtering**: Searches for candidates within ±15% length of the input text
+3. **Number Preservation**: Ensures strings with different numbers (e.g., "item 1" vs "item 2") are NOT matched
+4. **Fuzzy Matching**: Uses `difflib.SequenceMatcher` with a **90% similarity threshold**
+5. **Tail Preservation**: Maintains Minecraft formatting codes at the end of strings (e.g., "hello§a" → cached "привет" + "§a")
+
+**Example:**
+- Input: `"Get 5 diamonds"` → Cache miss
+- Input: `"Get 6 diamonds"` → **Cache hit!** (90%+ similarity, same structure)
+- Input: `"Get diamond"` → Cache miss (different number count)
+- Input: `"Get 5 diamonds§a"` → **Cache hit!** (matches "Get 5 diamonds" + preserves "§a")
+
+This prevents charging for translations of:
+- Plural variations: "apple" → "apples"
+- Number variations: "item 1" → "item 2" (if structure matches)
+- Minor formatting differences: "text" → "text§a"
 
 ### Minecraft Formatting Protection
 - Regex shielding for namespace tags (`#c:ender_pearl_dusts`), UUIDs, and entity IDs
@@ -92,8 +113,11 @@ snbt-tr --fastdir
 | Sambanova | DeepSeek-V3.1 | No | High-performance inference |
 | OpenAI | gpt-4o-mini | No | Optimized for speed |
 | Mistral AI | mistral-large-latest | No | Open-source frontier models |
+| Anthropic (Claude) | claude-3-5-sonnet-20241022 | No | High-quality responses |
+| Cohere | command-r-plus | No | Production-ready |
 | Ollama (Local / Free) | qwen2.5:7b | Yes | Self-hosted, no API key |
 | Google Translate (Free) | N/A | Yes | Traditional MT, no API key |
+| Local LLM / Custom | (Custom) | Yes | Custom local models |
 
 ## Feedback & Community
 For feedback, suggestions, and bug reports, please contact us via:

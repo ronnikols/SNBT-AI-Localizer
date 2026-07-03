@@ -234,34 +234,35 @@ def load_cli_setting(key: str, default: str = "") -> str:
         return str(val) if val else default
     return default
 
-async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None, str | None, str, str]:
+async def run_setup_wizard(config: ConfigManager, parsed=None) -> tuple[Path, str, str | None, str | None, str, str]:
     logging.getLogger("snbt_localizer.cli").info("=== SNBT AI Localizer - Setup Wizard ===")
-    logging.getLogger("snbt_localizer.cli").info("Step 1: Select modpack instance")
-    launcher_paths = get_launcher_paths()
-    instances = []
-    for base, launcher_name in launcher_paths:
-        if not base.exists():
-            continue
-        try:
-            for sub in base.iterdir():
-                if sub.is_dir():
-                    quests_path = sub / "config" / "ftbquests" / "quests"
-                    if not quests_path.exists():
-                        quests_path = sub / "minecraft" / "config" / "ftbquests" / "quests"
-                    if quests_path.exists() and quests_path.is_dir():
-                        instances.append((sub.name, str(sub), launcher_name))
-        except Exception:
-            pass
 
-    for custom_path in config.custom_instances_paths:
-        p = Path(custom_path)
-        if is_valid_custom_instance(p) and not any(str(p) == path_str for _, path_str, _ in instances):
-            instances.append((p.name, str(p), "Custom"))
+    if parsed and hasattr(parsed, 'dir') and parsed.dir:
+        quest_dir = normalize_path(parsed.dir)
+        config.add_custom_path(str(quest_dir))
+        logging.getLogger("snbt_localizer.cli").info(f"Using directory from command line: {quest_dir}")
+    else:
+        logging.getLogger("snbt_localizer.cli").info("Step 1: Select modpack instance")
+        launcher_paths = get_launcher_paths()
+        instances = []
+        for base, launcher_name in launcher_paths:
+            if not base.exists():
+                continue
+            try:
+                for sub in base.iterdir():
+                    if sub.is_dir():
+                        quests_path = sub / "config" / "ftbquests" / "quests"
+                        if not quests_path.exists():
+                            quests_path = sub / "minecraft" / "config" / "ftbquests" / "quests"
+                        if quests_path.exists() and quests_path.is_dir():
+                            instances.append((sub.name, str(sub), launcher_name))
+            except Exception:
+                pass
 
-    for custom_path in config.custom_instances_paths:
-        p = Path(custom_path)
-        if is_valid_custom_instance(p) and not any(str(p) == path_str for _, path_str, _ in instances):
-            instances.append((p.name, str(p), "Custom"))
+        for custom_path in config.custom_instances_paths:
+            p = Path(custom_path)
+            if is_valid_custom_instance(p) and not any(str(p) == path_str for _, path_str, _ in instances):
+                instances.append((p.name, str(p), "Custom"))
 
     if not instances:
         logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
@@ -271,6 +272,7 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
         quest_dir = normalize_path(custom_path)
         config.add_custom_path(str(quest_dir))
     else:
+        instances = sorted(instances, key=lambda x: x[1])
         last_instance = load_cli_setting("cli_last_instance", "")
         default_idx = 0
         if last_instance:
@@ -309,32 +311,44 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
 
     logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {quest_dir}")
 
-    logging.getLogger("snbt_localizer.cli").info("Step 2: Select translation provider")
-    providers = list(dict.fromkeys(PROVIDER_ALIASES.values()))
-    last_provider = load_cli_setting("cli_last_provider", "")
-    default_idx = 0
-    if last_provider and last_provider in providers:
-        default_idx = providers.index(last_provider)
+    if parsed and hasattr(parsed, 'provider') and parsed.provider:
+        provider_alias = parsed.provider.lower()
+        if provider_alias in PROVIDER_ALIASES:
+            provider = PROVIDER_ALIASES[provider_alias]
+        else:
+            provider = parsed.provider
+        if provider not in dict.fromkeys(PROVIDER_ALIASES.values()):
+            logging.getLogger("snbt_localizer.cli").error(f"Unknown provider: {parsed.provider}")
+            sys.exit(1)
+        logging.getLogger("snbt_localizer.cli").info(f"Using provider from command line: {provider}")
+        save_cli_setting("cli_last_provider", provider)
+    else:
+        logging.getLogger("snbt_localizer.cli").info("Step 2: Select translation provider")
+        providers = list(dict.fromkeys(PROVIDER_ALIASES.values()))
+        last_provider = load_cli_setting("cli_last_provider", "")
+        default_idx = 0
+        if last_provider and last_provider in providers:
+            default_idx = providers.index(last_provider)
 
-    logging.getLogger("snbt_localizer.cli").info("Available providers:")
-    for i, p in enumerate(providers):
-        marker = " (last used)" if i == default_idx else ""
-        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {p}{marker}")
+        logging.getLogger("snbt_localizer.cli").info("Available providers:")
+        for i, p in enumerate(providers):
+            marker = " (last used)" if i == default_idx else ""
+            logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {p}{marker}")
 
-    while True:
-        choice = input(f"Choice [{default_idx + 1}]: ").strip()
-        choice = choice or str(default_idx + 1)
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(providers):
-                provider = providers[idx]
-                save_cli_setting("cli_last_provider", provider)
-                break
-        except ValueError:
-            pass
-        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
+        while True:
+            choice = input(f"Choice [{default_idx + 1}]: ").strip()
+            choice = choice or str(default_idx + 1)
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(providers):
+                    provider = providers[idx]
+                    save_cli_setting("cli_last_provider", provider)
+                    break
+            except ValueError:
+                pass
+            logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {provider}")
+        logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {provider}")
 
     if provider == "Mixed Providers":
         save_cli_setting("cli_last_provider", provider)
@@ -348,34 +362,46 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
         config.save_to_settings()
         return quest_dir, provider, None, None, lang_name, lang_code
 
-    print("Step 3: API Key")
     api_key = None
     if provider not in ("Google Translate (Free)", "Ollama (Local / Free)"):
-        env_key = load_key_from_env_or_settings(provider)
-        if env_key:
-            masked = "*" * (len(env_key) - 4) + env_key[-4:] if len(env_key) > 4 else "****"
-            logging.getLogger("snbt_localizer.cli").info(f"API key detected in system. Press Enter to use it or enter a new one:")
-            user_key = input(f"Use saved key [{masked}]: ").strip()
-            if user_key:
-                api_key = user_key
-            else:
-                api_key = env_key
+        if parsed and hasattr(parsed, 'key') and parsed.key:
+            api_key = parsed.key
             settings_key = SETTINGS_KEY_MAP.get(provider)
             if settings_key and api_key:
                 save_cli_setting(settings_key, api_key)
+            logging.getLogger("snbt_localizer.cli").info("Using API key from command line")
         else:
-            while True:
-                api_key = input("API Key: ").strip()
-                if api_key:
-                    settings_key = SETTINGS_KEY_MAP.get(provider)
-                    if settings_key:
-                        save_cli_setting(settings_key, api_key)
-                    break
-                logging.getLogger("snbt_localizer.cli").warning("API Key cannot be empty")
+            logging.getLogger("snbt_localizer.cli").info("\nStep 3: API Key")
+            env_key = load_key_from_env_or_settings(provider)
+            if env_key:
+                masked = "*" * (len(env_key) - 4) + env_key[-4:] if len(env_key) > 4 else "****"
+                logging.getLogger("snbt_localizer.cli").info(f"API key detected in system. Press Enter to use it or enter a new one:")
+                user_key = input(f"Use saved key [{masked}]: ").strip()
+                if user_key:
+                    api_key = user_key
+                else:
+                    api_key = env_key
+                settings_key = SETTINGS_KEY_MAP.get(provider)
+                if settings_key and api_key:
+                    save_cli_setting(settings_key, api_key)
+            else:
+                while True:
+                    api_key = input("API Key: ").strip()
+                    if api_key:
+                        settings_key = SETTINGS_KEY_MAP.get(provider)
+                        if settings_key:
+                            save_cli_setting(settings_key, api_key)
+                        break
+                    logging.getLogger("snbt_localizer.cli").warning("API Key cannot be empty")
 
-    logging.getLogger("snbt_localizer.cli").info("\nStep 4: Model and Language")
     model = None
     if provider != "Google Translate (Free)":
+        if parsed and hasattr(parsed, 'model') and parsed.model:
+            model = parsed.model
+            save_cli_setting(f"cli_last_model_{provider}", model)
+            logging.getLogger("snbt_localizer.cli").info(f"Using model from command line: {model}")
+        else:
+            logging.getLogger("snbt_localizer.cli").info("\nStep 4: Model and Language")
         models = await fetch_models(provider, api_key)
         if "gemini" in provider.lower() or "google" in provider.lower():
             for i in range(len(models)):
@@ -426,42 +452,57 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
     else:
         model = None
 
-    seen_codes = set()
-    unique_langs = []
-    for alias, (name, code) in LANG_ALIASES.items():
-        if code not in seen_codes:
-            seen_codes.add(code)
-            unique_langs.append((alias, (name, code)))
-    
-    langs = unique_langs
-    last_lang = load_cli_setting("cli_last_lang", "")
-    default_idx = 0
-    if last_lang:
-        for i, (_, (name, code)) in enumerate(langs):
-            if code == last_lang or name == last_lang:
-                default_idx = i
-                break
+    if parsed and hasattr(parsed, 'lang') and parsed.lang:
+        lang_input = parsed.lang.lower()
+        if lang_input in LANG_ALIASES:
+            lang_name, lang_code = LANG_ALIASES[lang_input]
+        else:
+            for alias, (name, code) in LANG_ALIASES.items():
+                if lang_input == code or lang_input == name.lower():
+                    lang_name, lang_code = name, code
+                    break
+            else:
+                logging.getLogger("snbt_localizer.cli").error(f"Unknown language: {parsed.lang}")
+                sys.exit(1)
+        save_cli_setting("cli_last_lang", lang_code)
+        logging.getLogger("snbt_localizer.cli").info(f"Using language from command line: {lang_name} ({lang_code})")
+    else:
+        seen_codes = set()
+        unique_langs = []
+        for alias, (name, code) in LANG_ALIASES.items():
+            if code not in seen_codes:
+                seen_codes.add(code)
+                unique_langs.append((alias, (name, code)))
 
-    logging.getLogger("snbt_localizer.cli").info("Available languages:")
-    for i, (alias, (name, code)) in enumerate(langs):
-        marker = " (last used)" if i == default_idx else ""
-        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} ({code}){marker}")
+        langs = unique_langs
+        last_lang = load_cli_setting("cli_last_lang", "")
+        default_idx = 0
+        if last_lang:
+            for i, (_, (name, code)) in enumerate(langs):
+                if code == last_lang or name == last_lang:
+                    default_idx = i
+                    break
 
-    while True:
-        choice = input(f"Choice [{default_idx + 1}]: ").strip()
-        choice = choice or str(default_idx + 1)
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(langs):
-                lang_name, lang_code = langs[idx][1]
-                save_cli_setting("cli_last_lang", lang_code)
-                break
-        except ValueError:
-            pass
-        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
+        logging.getLogger("snbt_localizer.cli").info("Available languages:")
+        for i, (alias, (name, code)) in enumerate(langs):
+            marker = " (last used)" if i == default_idx else ""
+            logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} ({code}){marker}")
 
-    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {lang_name} ({lang_code})")
-    logging.getLogger("snbt_localizer.cli").info("Starting translation...")
+        while True:
+            choice = input(f"Choice [{default_idx + 1}]: ").strip()
+            choice = choice or str(default_idx + 1)
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(langs):
+                    lang_name, lang_code = langs[idx][1]
+                    save_cli_setting("cli_last_lang", lang_code)
+                    break
+            except ValueError:
+                pass
+            logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
+
+        logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {lang_name} ({lang_code})")
+        logging.getLogger("snbt_localizer.cli").info("Starting translation...")
 
     config.provider = provider
     config.model = model
@@ -474,95 +515,128 @@ async def run_setup_wizard(config: ConfigManager) -> tuple[Path, str, str | None
     config.save_to_settings()
     return quest_dir, provider, api_key, model, lang_name, lang_code
 
-async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] | None:
+async def run_mix_setup_wizard(config: ConfigManager, parsed=None) -> tuple[Path, str, str] | None:
     logging.getLogger("snbt_localizer.cli").info("=== SNBT AI Localizer - Mixed Mode Setup ===")
 
-    launcher_paths = get_launcher_paths()
-    instances = []
-    for base, launcher_name in launcher_paths:
-        if not base.exists():
-            continue
-        try:
-            for sub in base.iterdir():
-                if sub.is_dir():
-                    quests_path = sub / "config" / "ftbquests" / "quests"
-                    if not quests_path.exists():
-                        quests_path = sub / "minecraft" / "config" / "ftbquests" / "quests"
-                    if quests_path.exists() and quests_path.is_dir():
-                        instances.append((sub.name, str(sub), launcher_name))
-        except Exception:
-            pass
-
-    if not instances:
-        logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
-        custom_path = input("Enter path to modpack manually: ").strip()
-        if not custom_path:
-            return None
-        quest_dir = normalize_path(custom_path)
+    if parsed and hasattr(parsed, 'dir') and parsed.dir:
+        quest_dir = normalize_path(parsed.dir)
         config.add_custom_path(str(quest_dir))
+        logging.getLogger("snbt_localizer.cli").info(f"Using directory from command line: {quest_dir}")
     else:
-        last_instance = load_cli_setting("cli_last_instance", "")
-        default_idx = 0
-        if last_instance:
-            for i, (_, path, _) in enumerate(instances):
-                if path == last_instance:
-                    instances.insert(0, instances.pop(i))
-                    default_idx = 0
-                    break
-
-        logging.getLogger("snbt_localizer.cli").info("Found instances:")
-        for i, (name, path, launcher) in enumerate(instances):
-            marker = " (last used)" if i == 0 and last_instance else ""
-            logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} [{launcher}]{marker}")
-        logging.getLogger("snbt_localizer.cli").info(f"  {len(instances) + 1}) Enter path manually...")
-
-        while True:
-            choice = input(f"Choice [{default_idx + 1}]: ").strip()
-            choice = choice or str(default_idx + 1)
+        launcher_paths = get_launcher_paths()
+        instances = []
+        for base, launcher_name in launcher_paths:
+            if not base.exists():
+                continue
             try:
-                idx = int(choice) - 1
-                if 0 <= idx < len(instances):
-                    quest_dir = Path(instances[idx][1])
-                    save_cli_setting("cli_last_instance", str(quest_dir))
-                    break
-                elif idx == len(instances):
-                    custom_path = input("Enter path to modpack: ").strip()
-                    if not custom_path:
-                        continue
-                    quest_dir = normalize_path(custom_path)
-                    config.add_custom_path(str(quest_dir))
-                    save_cli_setting("cli_last_instance", str(quest_dir))
-                    break
-            except ValueError:
+                for sub in base.iterdir():
+                    if sub.is_dir():
+                        quests_path = sub / "config" / "ftbquests" / "quests"
+                        if not quests_path.exists():
+                            quests_path = sub / "minecraft" / "config" / "ftbquests" / "quests"
+                        if quests_path.exists() and quests_path.is_dir():
+                            instances.append((sub.name, str(sub), launcher_name))
+            except Exception:
                 pass
-            logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
+
+        if not instances:
+            for base, launcher_name in launcher_paths:
+                if not base.exists():
+                    continue
+                try:
+                    for sub in base.iterdir():
+                        if sub.is_dir():
+                            quest_dirs = find_all_quest_dirs(sub)
+                            if quest_dirs:
+                                instances.append((sub.name, str(sub), launcher_name, quest_dirs))
+                except Exception:
+                    pass
+
+        if not instances:
+            logging.getLogger("snbt_localizer.cli").info("No modpack instances with FTB Quests found.")
+            custom_path = input("Enter path to modpack manually: ").strip()
+            if not custom_path:
+                return None
+            quest_dir = normalize_path(custom_path)
+            config.add_custom_path(str(quest_dir))
+        else:
+            instances = sorted(instances, key=lambda x: x[1])
+            last_instance = load_cli_setting("cli_last_instance", "")
+            default_idx = 0
+            if last_instance:
+                for i, (_, path, _, _) in enumerate(instances):
+                    if path == last_instance:
+                        instances.insert(0, instances.pop(i))
+                        default_idx = 0
+                        break
+
+            logging.getLogger("snbt_localizer.cli").info("Found instances:")
+            for i, (name, path, launcher, _) in enumerate(instances):
+                marker = " (last used)" if i == 0 and last_instance else ""
+                folder_note = " [Multiple Folders]" if len(instances[i][3]) > 1 else ""
+                logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} [{launcher}]{marker}{folder_note}")
+            logging.getLogger("snbt_localizer.cli").info(f"  {len(instances) + 1}) Enter path manually...")
+
+            while True:
+                choice = input(f"Choice [{default_idx + 1}]: ").strip()
+                choice = choice or str(default_idx + 1)
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(instances):
+                        quest_dir = Path(instances[idx][1])
+                        save_cli_setting("cli_last_instance", str(quest_dir))
+                        break
+                    elif idx == len(instances):
+                        custom_path = input("Enter path to modpack: ").strip()
+                        if not custom_path:
+                            continue
+                        quest_dir = normalize_path(custom_path)
+                        config.add_custom_path(str(quest_dir))
+                        save_cli_setting("cli_last_instance", str(quest_dir))
+                        break
+                except ValueError:
+                    pass
+                logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
     logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {quest_dir}")
 
-    providers = [p for p in dict.fromkeys(PROVIDER_ALIASES.values()) if p != "Mixed Providers"]
-    logging.getLogger("snbt_localizer.cli").info("Select providers for Mixed mode (enter numbers separated by space, or press Enter to use saved keys):")
-    for i, p in enumerate(providers, 1):
-        logging.getLogger("snbt_localizer.cli").info(f"  {i}) {p}")
+    if parsed and hasattr(parsed, 'mix') and parsed.mix:
+        selected_providers = [p for p in dict.fromkeys(PROVIDER_ALIASES.values()) if p != "Mixed Providers"]
+        logging.getLogger("snbt_localizer.cli").info("Using all available providers for Mixed mode")
+    else:
+        providers = [p for p in dict.fromkeys(PROVIDER_ALIASES.values()) if p != "Mixed Providers"]
+        logging.getLogger("snbt_localizer.cli").info("Select providers for Mixed mode (enter numbers separated by space, or press Enter to use saved keys):")
+        for i, p in enumerate(providers, 1):
+            logging.getLogger("snbt_localizer.cli").info(f"  {i}) {p}")
 
-    choice = input("Choice: ").strip()
-    if choice:
-        selected_indices = []
-        for part in choice.split():
-            try:
-                idx = int(part) - 1
-                if 0 <= idx < len(providers):
-                    selected_indices.append(idx)
-            except:
-                pass
-        if not selected_indices:
-            logging.getLogger("snbt_localizer.cli").error("No valid providers selected.")
-            return None
-        selected_providers = [providers[i] for i in selected_indices]
-        settings = QSettings("MineAI", "SNBT-Localizer")
-        settings.setValue("mixed_providers", selected_providers)
-        settings.sync()
+        choice = input("Choice: ").strip()
+        if choice:
+            selected_indices = []
+            for part in choice.split():
+                try:
+                    idx = int(part) - 1
+                    if 0 <= idx < len(providers):
+                        selected_indices.append(idx)
+                except:
+                    pass
+            if not selected_indices:
+                logging.getLogger("snbt_localizer.cli").error("No valid providers selected.")
+                return None
+            selected_providers = [providers[i] for i in selected_indices]
+            settings = QSettings("MineAI", "SNBT-Localizer")
+            settings.setValue("mixed_providers", selected_providers)
+            settings.sync()
+        else:
+            selected_providers = providers
 
-        for prov in selected_providers:
+    for prov in selected_providers:
+        if parsed and hasattr(parsed, 'key') and parsed.key:
+            api_key = parsed.key
+            settings_key = SETTINGS_KEY_MAP.get(prov, f"{prov}_api_key")
+            save_cli_setting(settings_key, api_key)
+            config.set_api_keys(prov, [api_key])
+            logging.getLogger("snbt_localizer.cli").info(f"Using API key from command line for {prov}")
+        else:
             api_key = load_key_from_env_or_settings(prov)
             if not api_key:
                 api_key = input(f"API Key for {prov}: ").strip()
@@ -574,6 +648,11 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                     logging.getLogger("snbt_localizer.cli").warning(f"Skipping {prov} - no API key provided.")
                     continue
 
+        if parsed and hasattr(parsed, 'model') and parsed.model:
+            model = parsed.model
+            save_cli_setting(f"cli_last_model_{prov}", model)
+            logging.getLogger("snbt_localizer.cli").info(f"Using model from command line for {prov}: {model}")
+        else:
             models = await fetch_models(prov, api_key)
             if models:
                 logging.getLogger("snbt_localizer.cli").info(f"\nSelect model for {prov}:")
@@ -589,42 +668,57 @@ async def run_mix_setup_wizard(config: ConfigManager) -> tuple[Path, str, str] |
                 model = PROVIDER_DEFAULTS.get(prov, "")
             save_cli_setting(f"cli_last_model_{prov}", model)
 
-    seen_codes = set()
-    unique_langs = []
-    for alias, (name, code) in LANG_ALIASES.items():
-        if code not in seen_codes:
-            seen_codes.add(code)
-            unique_langs.append((alias, (name, code)))
+    if parsed and hasattr(parsed, 'lang') and parsed.lang:
+        lang_input = parsed.lang.lower()
+        if lang_input in LANG_ALIASES:
+            lang_name, lang_code = LANG_ALIASES[lang_input]
+        else:
+            for alias, (name, code) in LANG_ALIASES.items():
+                if lang_input == code or lang_input == name.lower():
+                    lang_name, lang_code = name, code
+                    break
+            else:
+                logging.getLogger("snbt_localizer.cli").error(f"Unknown language: {parsed.lang}")
+                sys.exit(1)
+        save_cli_setting("cli_last_lang", lang_code)
+        logging.getLogger("snbt_localizer.cli").info(f"Using language from command line: {lang_name} ({lang_code})")
+    else:
+        seen_codes = set()
+        unique_langs = []
+        for alias, (name, code) in LANG_ALIASES.items():
+            if code not in seen_codes:
+                seen_codes.add(code)
+                unique_langs.append((alias, (name, code)))
 
-    langs = unique_langs
-    last_lang = load_cli_setting("cli_last_lang", "")
-    default_idx = 0
-    if last_lang:
-        for i, (_, (name, code)) in enumerate(langs):
-            if code == last_lang or name == last_lang:
-                default_idx = i
-                break
+        langs = unique_langs
+        last_lang = load_cli_setting("cli_last_lang", "")
+        default_idx = 0
+        if last_lang:
+            for i, (_, (name, code)) in enumerate(langs):
+                if code == last_lang or name == last_lang:
+                    default_idx = i
+                    break
 
-    logging.getLogger("snbt_localizer.cli").info("Available languages:")
-    for i, (alias, (name, code)) in enumerate(langs):
-        marker = " (last used)" if i == default_idx else ""
-        logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} ({code}){marker}")
+        logging.getLogger("snbt_localizer.cli").info("Available languages:")
+        for i, (alias, (name, code)) in enumerate(langs):
+            marker = " (last used)" if i == default_idx else ""
+            logging.getLogger("snbt_localizer.cli").info(f"  {i + 1}) {name} ({code}){marker}")
 
-    while True:
-        choice = input(f"Choice [{default_idx + 1}]: ").strip()
-        choice = choice or str(default_idx + 1)
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(langs):
-                lang_name, lang_code = langs[idx][1]
-                save_cli_setting("cli_last_lang", lang_code)
-                break
-        except ValueError:
-            pass
-        logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
+        while True:
+            choice = input(f"Choice [{default_idx + 1}]: ").strip()
+            choice = choice or str(default_idx + 1)
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(langs):
+                    lang_name, lang_code = langs[idx][1]
+                    save_cli_setting("cli_last_lang", lang_code)
+                    break
+            except ValueError:
+                pass
+            logging.getLogger("snbt_localizer.cli").warning("Invalid choice")
 
-    logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {lang_name} ({lang_code})")
-    logging.getLogger("snbt_localizer.cli").info("Starting translation...")
+        logging.getLogger("snbt_localizer.cli").info(f"\nSelected: {lang_name} ({lang_code})")
+        logging.getLogger("snbt_localizer.cli").info("Starting translation...")
     config.provider = "Mixed Providers"
     config.target_lang = lang_code
     config.quest_dir = quest_dir
@@ -859,7 +953,15 @@ def parse_key_model_pairs(api_keys: List[str]) -> List[Dict[str, str | None]]:
             pairs.append({"key": k, "model": None})
     return pairs
 
-async def run_translation(config: ConfigManager, provider: str, model: str | None, api_keys: List[str], lang_name: str, lang_code: str, quest_dirs: list[Path], concurrency: Optional[int] = None) -> int:
+def find_modpack_root_from_quest_dir(qd: Path) -> Path:
+    curr = qd.resolve()
+    while curr != curr.parent:
+        if curr.name in ("config", "minecraft"):
+            return curr.parent
+        curr = curr.parent
+    return qd.parent.parent.parent.parent
+
+async def run_translation(config: ConfigManager, provider: str, model: str | None, api_keys: List[str], lang_name: str, lang_code: str, quest_dirs: list[Path], concurrency: Optional[int] = None, resource_pack_mode: bool = False) -> int:
     logging.getLogger("snbt_localizer.cli").info(f"Provider: {provider}")
     if model:
         logging.getLogger("snbt_localizer.cli").info(f"Model: {model}")
@@ -922,46 +1024,13 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
 
     json_lang_dirs = set()
     for qd in quest_dirs:
-        for lang_dir in qd.rglob("lang"):
+        modpack_root = find_modpack_root_from_quest_dir(qd)
+        for lang_dir in modpack_root.rglob("lang"):
+            if "resourcepacks" in lang_dir.parts:
+                continue
             if lang_dir.is_dir() and (lang_dir / "en_us.json").exists():
                 json_lang_dirs.add(lang_dir.parent)
-
-    if json_lang_dirs:
-        base_dir = next(iter(json_lang_dirs))
-        logging.getLogger("snbt_localizer.cli").info("JSON translation mode detected. Processing lang files...")
-        translator = UnifiedTranslator(
-            api_keys,
-            provider,
-            model or "",
-            config.custom_context,
-            lang_name,
-            lang_code,
-            mixed_pool=mixed_pool,
-            batch_size=config.batch_size,
-            min_batch_size=config.min_batch_size,
-            max_concurrent_requests=config.max_concurrent_requests
-        )
-        cache = TranslationCache(target_lang_code=lang_code)
-        manager = JSONManager(
-            base_dir,
-            lang_code,
-            translator,
-            cache,
-            modpack=base_dir.name,
-            policy=resolve_policy(config.policy)
-        )
-        try:
-            translated_count = asyncio.run(manager.process(
-                logger=logging.getLogger("snbt_localizer.cli").info
-            ))
-            logging.getLogger("snbt_localizer.cli").info(
-                f"JSON translation completed. Translated {translated_count} strings. "
-                "In Minecraft, run '/ftbquests reload' or restart the game to apply changes."
-            )
-            return 0
-        except Exception as e:
-            logging.getLogger("snbt_localizer.cli").error(f"JSON translation failed: {e}")
-            return 1
+    json_lang_dirs = sorted(json_lang_dirs, key=lambda x: str(x))
 
     all_files = []
     for qd in quest_dirs:
@@ -994,7 +1063,7 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         render_cli_progress(overall, total_files, prefix="Progress", suffix="Complete")
 
     def make_file_progress_callback(idx):
-        def callback(chunk_idx, total_chunks):
+        def callback(chunk_idx, total_chunks, *args, **kwargs):
             if total_chunks > 0:
                 file_progress[idx] = chunk_idx / total_chunks
             else:
@@ -1045,6 +1114,71 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     sys.stdout.write('\n')
     sys.stdout.flush()
     logging.getLogger("snbt_localizer.cli").info("Finished.")
+    logging.getLogger("snbt_localizer.cli").info(
+        f"Успешно обработано {len(files)} файлов квестов (.snbt). Для применения квестов введите в игре команду: /ftbquests reload"
+    )
+
+    if json_lang_dirs:
+        translator = UnifiedTranslator(
+            api_keys,
+            provider,
+            model or "",
+            config.custom_context,
+            lang_name,
+            lang_code,
+            mixed_pool=mixed_pool,
+            batch_size=config.batch_size,
+            min_batch_size=config.min_batch_size,
+            max_concurrent_requests=config.max_concurrent_requests
+        )
+        cache = TranslationCache(target_lang_code=lang_code)
+        for base_dir in json_lang_dirs:
+            logging.getLogger("snbt_localizer.cli").info(f"JSON translation mode detected. Processing lang files in {base_dir}...")
+            manager = JSONManager(
+                base_dir,
+                lang_code,
+                translator,
+                cache,
+                modpack=base_dir.name,
+                policy=resolve_policy(config.policy),
+                resource_pack_mode=resource_pack_mode
+            )
+            try:
+                translated_count = await manager.process(
+                    log_callback=logging.getLogger("snbt_localizer.cli").info,
+                    check_status=None
+                )
+                logging.getLogger("snbt_localizer.cli").info(
+                    f"JSON translation completed for {base_dir}. Translated {translated_count} strings. "
+                    "In Minecraft, run '/ftbquests reload' or restart the game to apply changes."
+                )
+            except Exception as e:
+                logging.getLogger("snbt_localizer.cli").error(f"JSON translation failed for {base_dir}: {e}")
+                return 1
+
+        if resource_pack_mode:
+            modpack_root = next(iter(json_lang_dirs))
+            while len(modpack_root.parts) > 1:
+                if (modpack_root / "mods").is_dir() or (modpack_root / "config").is_dir() or (modpack_root / "kubejs").is_dir():
+                    break
+                modpack_root = modpack_root.parent
+            pack_dir = modpack_root / "resourcepacks" / f"Modpack_Local_{lang_code}"
+            pack_mcmeta_path = pack_dir / "pack.mcmeta"
+            pack_png_path = pack_dir / "pack.png"
+
+            if pack_mcmeta_path.exists():
+                logging.getLogger("snbt_localizer.cli").info(f"Ресурс-пак успешно создан/обновлен по пути: {pack_dir}")
+                if pack_png_path.exists():
+                    logging.getLogger("snbt_localizer.cli").info("  └─ Фирменная иконка pack.png успешно добавлена в ресурс-пак!")
+                else:
+                    logging.getLogger("snbt_localizer.cli").warning("  └─ Предупреждение: Иконка pack.png пропущена (логотип logo.png не найден в ресурсах)")
+            else:
+                logging.getLogger("snbt_localizer.cli").error(f"ВНИМАНИЕ: Ошибка создания ресурс-пака по пути: {pack_dir}. Проверьте права доступа к папке.")
+    elif resource_pack_mode:
+        logging.getLogger("snbt_localizer.cli").warning(
+            "ВНИМАНИЕ: Флаг -r / --resource-pack передан, но в модпаке не найдена папка KubeJS (kubejs/assets/). Ресурс-пак не был создан."
+        )
+
     return 0
 
 async def main_async() -> int:
@@ -1059,9 +1193,42 @@ async def main_async() -> int:
         return 0
     cli_logger = logging.getLogger("snbt_localizer.cli")
     
-    if len(sys.argv) == 1 or (len(sys.argv) == 2 and parsed.mix):
+    if parsed.clear_cache:
+        if is_interactive():
+            confirm = input("Are you sure you want to clear the entire translation cache? (y/n) [n]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                logging.getLogger("snbt_localizer.cli").info("Cancelled.")
+                return 0
+        cache = TranslationCache()
+        cache.clear_all()
+        logging.getLogger("snbt_localizer.cli").info("Кэш переводов SQLite успешно очищен.")
+        sys.exit(0)
+
+    if parsed.fastdir:
+        result = cmd_fastdir(config)
+        if result is None:
+            logging.getLogger("snbt_localizer.cli").warning("No instance selected. Exiting.")
+            return 1
+        quest_dir, quest_dirs = result
+
+        provider = config.provider
+        if config.provider == "Mixed Providers":
+            api_keys = []
+            for prov in config.api_keys_pool:
+                api_keys.extend(config.api_keys_pool[prov])
+        else:
+            api_keys = config.get_api_keys()
+        model = config.model
+        lang_name, lang_code = config.resolve_language(config.target_lang)
+
+        if provider == "Mixed Providers":
+            concurrency = max(config.concurrency, len(api_keys), 5)
+        else:
+            concurrency = max(1, min(config.concurrency, 10))
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency, parsed.resource_pack)
+    else:
         if parsed.mix:
-            result = await run_mix_setup_wizard(config)
+            result = await run_mix_setup_wizard(config, parsed)
             if result is None:
                 return 1
             quest_dir, lang_name, lang_code = result
@@ -1076,7 +1243,7 @@ async def main_async() -> int:
             config.policy = "Complement (Дополнить)"
             config.save_to_settings()
         else:
-            quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config)
+            quest_dir, provider, api_key, model, lang_name, lang_code = await run_setup_wizard(config, parsed)
             quest_dirs = find_all_quest_dirs(quest_dir)
             if config.provider == "Mixed Providers":
                 api_keys = []
@@ -1085,12 +1252,13 @@ async def main_async() -> int:
             else:
                 api_keys = config.get_api_keys()
             config.save_to_settings()
+
         if parsed.mix:
             concurrency = max(config.concurrency, len(api_keys), 5)
         else:
             concurrency = max(1, min(config.concurrency, 10))
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
-    
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency, parsed.resource_pack)
+
     if parsed.clear_cache:
         if is_interactive():
             confirm = input("Are you sure you want to clear the entire translation cache? (y/n) [n]: ").strip().lower()
@@ -1158,7 +1326,7 @@ async def main_async() -> int:
             concurrency = max(config.concurrency, len(api_keys), 5)
         else:
             concurrency = max(1, min(config.concurrency, 10))
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency, parsed.resource_pack)
     else:
         quest_dir = normalize_path(parsed.dir)
         quest_dirs = find_all_quest_dirs(quest_dir)
@@ -1178,7 +1346,7 @@ async def main_async() -> int:
             concurrency = max(config.concurrency, len(api_keys), 5)
         else:
             concurrency = max(1, min(config.concurrency, 10))
-        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency)
+        return await run_translation(config, provider, model, api_keys, lang_name, lang_code, quest_dirs, concurrency, parsed.resource_pack)
 
 def main() -> None:
     try:

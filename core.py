@@ -11,9 +11,15 @@ import threading
 import time
 import aiofiles
 import logging
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import List, Dict, Optional
+
+def get_resource_path(relative_path):
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / relative_path
+    return Path(__file__).parent.resolve() / relative_path
 
 def clean_and_unpack_string(text: str) -> str:
     text = text.strip()
@@ -1251,7 +1257,7 @@ class JSONManager:
                             "description": f"SNBT AI Localizer compiled translations"
                         }
                     }, indent=2), encoding="utf-8")
-                logo_path = Path(__file__).parent / "resources" / "logo.png"
+                logo_path = get_resource_path("resources/logo.png")
                 if logo_path.exists():
                     try:
                         (pack_dir / "pack.png").write_bytes(logo_path.read_bytes())

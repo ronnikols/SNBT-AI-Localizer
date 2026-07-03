@@ -111,6 +111,7 @@ class ConfigManager:
         self.model: Optional[str] = None
         self.custom_context: str = ""
         self.policy: str = "Complement (Дополнить)"
+        self.resource_pack_mode: bool = False
         self.api_keys_pool: Dict[str, List[str]] = {prov: [] for prov in PROVIDER_ALIASES.values()}
         self.custom_instances_paths: List[str] = []
         self.batch_size: int = 50
@@ -147,6 +148,11 @@ class ConfigManager:
         self.batch_size = int(s.value("batch_size", 50))
         self.min_batch_size = int(s.value("min_batch_size", 1))
         self.max_concurrent_requests = int(s.value("max_concurrent_requests", 10))
+        self.resource_pack_mode = s.value("resource_pack_mode", self.resource_pack_mode)
+        if isinstance(self.resource_pack_mode, str):
+            self.resource_pack_mode = self.resource_pack_mode.lower() == "true"
+        quest_dir_value = s.value("quest_dir", "")
+        self.quest_dir = Path(quest_dir_value) if quest_dir_value else None
 
         for prov in PROVIDER_ALIASES.values():
             raw = s.value(f"api_keys_pool_{prov}", "")
@@ -183,6 +189,8 @@ class ConfigManager:
         s.setValue("batch_size", self.batch_size)
         s.setValue("min_batch_size", self.min_batch_size)
         s.setValue("max_concurrent_requests", self.max_concurrent_requests)
+        s.setValue("resource_pack_mode", self.resource_pack_mode)
+        s.setValue("quest_dir", str(self.quest_dir) if self.quest_dir else "")
         s.sync()
 
     def parse_cli_args(self, args: Optional[List[str]] = None):
@@ -210,6 +218,7 @@ class ConfigManager:
                             help="Minimum batch size before failing (default: 1)")
         parser.add_argument("--max-concurrent-requests", type=int, default=10,
                             help="Max concurrent API requests (default: 10)")
+        parser.add_argument("--resource-pack", "-r", action="store_true", help="Enable Resource Pack Mode for JSON translation")
 
         parsed = parser.parse_args(args)
 
@@ -264,6 +273,7 @@ class ConfigManager:
             self.min_batch_size = max(1, parsed.min_batch_size)
         if parsed.max_concurrent_requests:
             self.max_concurrent_requests = max(1, parsed.max_concurrent_requests)
+
 
         if parsed.key:
             keys = [k.strip() for k in parsed.key.split(",") if k.strip()]

@@ -4,6 +4,7 @@ import tempfile
 import sqlite3
 import os
 import shutil
+import json
 from pathlib import Path
 from unittest.mock import patch, AsyncMock
 from PyQt6.QtCore import Qt, QSettings
@@ -131,9 +132,10 @@ def test_cli_mix_flag():
 
     with patch('config.QSettings') as mock_qsettings:
         mock_settings = mock_qsettings.return_value
-        mock_settings.value.side_effect = lambda key, default: {
+        mock_settings.value.side_effect = lambda key, default=None, type=None: {
             "api_keys_pool_Groq Cloud (Fast)": "groq_key1\ngroq_key2",
             "api_keys_pool_NVIDIA NIM": "nvapi_key1",
+            "resource_pack_mode": False,
         }.get(key, default)
 
         config = ConfigManager()
@@ -149,10 +151,11 @@ def test_cli_mix_flag_api_keys_collection():
 
     with patch('config.QSettings') as mock_qsettings:
         mock_settings = mock_qsettings.return_value
-        mock_settings.value.side_effect = lambda key, default: {
+        mock_settings.value.side_effect = lambda key, default=None, type=None: {
             "api_keys_pool_Groq Cloud (Fast)": "groq_key1\ngroq_key2",
             "api_keys_pool_NVIDIA NIM": "nvapi_key1",
             "api_keys_pool_OpenAI": "sk-proj-123",
+            "resource_pack_mode": False,
         }.get(key, default)
 
         config = ConfigManager()
@@ -186,14 +189,15 @@ def test_model_placeholder_substring_protection():
 def test_provider_specific_model_saving():
     with patch('config.QSettings') as mock_qsettings:
         mock_settings = mock_qsettings.return_value
-        mock_settings.value.side_effect = lambda key, default: {
+        mock_settings.value.side_effect = lambda key, default=None, type=None: {
             "provider": "Groq Cloud (Fast)",
             "model": "global-model",
             "model_Groq Cloud (Fast)": "groq-specific-model",
             "target_lang": "ru_ru",
             "concurrency_limit": 3,
             "custom_context": "",
-            "policy": "Complement"
+            "policy": "Complement",
+            "resource_pack_mode": False,
         }.get(key, default)
 
         config = ConfigManager()
@@ -229,7 +233,7 @@ def test_cli_mix_concurrency_escalation():
     with patch('main.ConfigManager') as mock_config_manager:
         mock_config = mock_config_manager.return_value
         mock_config.concurrency = 2
-        mock_parsed = type('obj', (object,), {'mix': True, 'debug': False, 'clear_cache': False, 'fastdir': False, 'dir': None, 'gui': False})()
+        mock_parsed = type('obj', (object,), {'mix': True, 'debug': False, 'clear_cache': False, 'fastdir': False, 'dir': None, 'gui': False, 'resource_pack': False})()
         mock_config.parse_cli_args.return_value = mock_parsed
         mock_config.provider = "Mixed Providers"
         mock_config.api_keys_pool = {
@@ -318,7 +322,7 @@ def test_cli_settings_persistence_before_translation():
     from unittest.mock import patch, AsyncMock
     import asyncio
 
-    async def mock_wizard_side_effect(cfg):
+    async def mock_wizard_side_effect(cfg, parsed=None):
         cfg.provider = "Groq Cloud (Fast)"
         cfg.model = "test_model"
         cfg.target_lang = "ru_ru"
@@ -331,7 +335,7 @@ def test_cli_settings_persistence_before_translation():
     with patch('main.ConfigManager') as mock_config_manager:
         mock_config = mock_config_manager.return_value
         mock_config.concurrency = 2
-        mock_parsed = type('obj', (object,), {'mix': False, 'debug': False, 'clear_cache': False, 'fastdir': False, 'dir': None, 'gui': False})()
+        mock_parsed = type('obj', (object,), {'mix': False, 'debug': False, 'clear_cache': False, 'fastdir': False, 'dir': None, 'gui': False, 'resource_pack': False})()
         mock_config.parse_cli_args.return_value = mock_parsed
         mock_config.provider = ""
         mock_config.model = None
@@ -361,6 +365,9 @@ def test_cli_mix_true_concurrency():
     mock_config.concurrency = 3
     mock_config.custom_context = ""
     mock_config.policy = "Complement (Дополнить)"
+    mock_config.max_concurrent_requests = 10
+    mock_config.batch_size = 50
+    mock_config.min_batch_size = 1
 
     mock_m = MagicMock()
     mock_m.process_file = AsyncMock(return_value=None)
@@ -875,6 +882,52 @@ def test_get_unique_modpacks():
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+def test_json_manager_resource_pack_mode():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        modpack_dir = temp_path / "modpack"
+        modpack_dir.mkdir()
+        kubejs_root = modpack_dir / "kubejs"
+        lang_dir = kubejs_root / "assets" / "kubejs" / "lang"
+        lang_dir.mkdir(parents=True)
+        en_us_path = lang_dir / "en_us.json"
+        en_us_path.write_text(json.dumps({"key1": "Hello", "key2": "World"}), encoding="utf-8")
+
+        from core import JSONManager, UnifiedTranslator, TranslationCache
+        from unittest.mock import AsyncMock
+
+        mock_translator = AsyncMock()
+        mock_translator.translate = AsyncMock(return_value=["Привет", "Мир"])
+
+        cache = TranslationCache(target_lang_code="ru_ru")
+        manager = JSONManager(
+            base_dir=kubejs_root,
+            target_lang_code="ru_ru",
+            translator=mock_translator,
+            cache=cache,
+            resource_pack_mode=True
+        )
+
+        import asyncio
+        asyncio.run(manager.process())
+
+        resourcepack_dir = modpack_dir / "resourcepacks" / "Modpack_Local_ru_ru"
+        pack_mcmeta_path = resourcepack_dir / "pack.mcmeta"
+        target_lang_dir = resourcepack_dir / "assets" / "kubejs" / "lang"
+        target_file = target_lang_dir / "ru_ru.json"
+
+        assert pack_mcmeta_path.exists()
+        assert target_file.exists()
+        assert not (lang_dir / "ru_ru.json").exists()
+
+        pack_mcmeta_content = json.loads(pack_mcmeta_path.read_text(encoding="utf-8"))
+        assert pack_mcmeta_content["pack"]["pack_format"] == 15
+        assert "SNBT AI Localizer" in pack_mcmeta_content["pack"]["description"]
+
+        target_content = json.loads(target_file.read_text(encoding="utf-8"))
+        assert target_content["key1"] == "Привет"
+        assert target_content["key2"] == "Мир"
 
 def test_sqlite_guard_and_indexing():
     with pytest.raises(ValueError):

@@ -1592,6 +1592,7 @@ class App(QMainWindow):
         self.setStyleSheet(STYLE_SHEET)
         
         self._is_initializing = True
+        self._is_syncing_language = False
         self.last_valid_index = 0
         self._key_validation_cache = {}
         self._translation_finished = False
@@ -1832,24 +1833,32 @@ class App(QMainWindow):
         self.retranslate_ui()
 
     def on_lang_box_changed(self, lang_text):
-        if self._is_initializing:
+        if self._is_initializing or self._is_syncing_language:
             return
         if not hasattr(self, 'translation_memory_tab'):
             return
-        self.translation_memory_tab.lang_filter.blockSignals(True)
-        self.translation_memory_tab.lang_filter.setCurrentText(lang_text)
-        self.translation_memory_tab.lang_filter.blockSignals(False)
-        lang_name, lang_code = parse_target_lang(lang_text)
-        self.translation_memory_tab.set_language_code(lang_code)
-        self.save_timer.start(500)
+        self._is_syncing_language = True
+        try:
+            self.translation_memory_tab.lang_filter.blockSignals(True)
+            self.translation_memory_tab.lang_filter.setCurrentText(lang_text)
+            self.translation_memory_tab.lang_filter.blockSignals(False)
+            lang_name, lang_code = parse_target_lang(lang_text)
+            self.translation_memory_tab.set_language_code(lang_code)
+            self.save_timer.start(500)
+        finally:
+            self._is_syncing_language = False
 
     def on_tm_language_changed(self, lang_text):
-        if self._is_initializing:
+        if self._is_initializing or self._is_syncing_language:
             return
-        self.lang_box.blockSignals(True)
-        self.lang_box.setCurrentText(lang_text)
-        self.lang_box.blockSignals(False)
-        self.save_timer.start(500)
+        self._is_syncing_language = True
+        try:
+            self.lang_box.blockSignals(True)
+            self.lang_box.setCurrentText(lang_text)
+            self.lang_box.blockSignals(False)
+            self.save_timer.start(500)
+        finally:
+            self._is_syncing_language = False
 
     def _on_tab_changed(self, index):
         if index == 1:
