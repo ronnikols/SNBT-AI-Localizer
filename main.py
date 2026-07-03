@@ -122,7 +122,7 @@ def get_launcher_paths() -> list[tuple[Path, str]]:
             (appdata / ".pojavlauncher/minecraft/versions", "PojavLauncher"),
             (localappdata / ".ftba/instances", "FTBA"),
             (localappdata / "ModrinthApp/profiles", "ModrinthApp"),
-            (home / "curseforge/minecraft/Instances", "Instances", "CurseForge"),
+            (home / "curseforge/minecraft/Instances", "CurseForge"),
             (home / "Documents/curseforge/minecraft/Instances", "CurseForge"),
             (home / ".lunarclient/offline/multiver", "LunarClient"),
         ]
