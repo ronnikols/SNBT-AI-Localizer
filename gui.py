@@ -1644,7 +1644,7 @@ class JSONWorker(QThread):
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SNBT AI Localizer")
+        self.setWindowTitle(f"SNBT AI Localizer v{APP_VERSION}")
         try:
             if ICON_PATH and os.path.exists(ICON_PATH):
                 self.setWindowIcon(QIcon(ICON_PATH))
