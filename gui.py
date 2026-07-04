@@ -823,8 +823,12 @@ class UpdateChecker(QThread):
                 response = await client.get("https://api.github.com/repos/ronnikols/SNBT-AI-Localizer/releases/latest", follow_redirects=True)
                 response.raise_for_status()
                 data = response.json()
-                remote_version = data.get("tag_name", "v0.0.0").lstrip("v")
-                current_version = APP_VERSION.lstrip("v")
+                remote_version = data.get("tag_name", "v0.0.0")
+                if remote_version.startswith("v"):
+                    remote_version = remote_version[1:]
+                current_version = APP_VERSION
+                if current_version.startswith("v"):
+                    current_version = current_version[1:]
 
                 if self._compare_versions(remote_version, current_version) > 0:
                     asset_url = ""

@@ -23,6 +23,7 @@ exe = EXE(
     a.datas,
     [],
     name='snbt-tr',
+    version='1.1.16',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
