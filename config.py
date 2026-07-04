@@ -11,7 +11,7 @@ try:
 except ImportError:
     QSettings = None
 
-APP_VERSION = "1.1.26"
+APP_VERSION = "1.1.28"
 
 PROVIDER_ALIASES = {
     "google": "Google Translate (Free)",

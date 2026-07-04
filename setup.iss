@@ -1,6 +1,6 @@
 [Setup]
 AppName=SNBT AI Localizer
-AppVersion=1.1.26
+AppVersion=1.1.28
 DefaultDirName={userappdata}\Programs\SNBT-AI-Localizer
 DefaultGroupName=SNBT AI Localizer
 OutputDir=.

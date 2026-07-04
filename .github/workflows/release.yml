@@ -27,3 +27,8 @@ jobs:
           files: |
             dist/snbt-tr.exe
             snbt-tr-Windows-Installer.exe
+      - uses: vedantmgoyal2009/winget-releaser@v2
+        with:
+          identifier: "ronnikols.snbt-tr"
+          installers-regex: "snbt-tr-Windows-Installer\\.exe$"
+          token: "${{ secrets.WINGET_TOKEN }}"
