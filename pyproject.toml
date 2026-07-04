@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snbt-tr"
-version = "1.1.23"
+version = "1.1.24"
 description = "Advanced SNBT quest localizer using AI key pools"
 readme = "README.md"
 requires-python = ">=3.10"

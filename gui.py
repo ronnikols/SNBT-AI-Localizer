@@ -21,8 +21,6 @@ import httpx
 from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path
 from config import ConfigManager, APP_VERSION
 
-ICON_PATH = get_resource_path("resources/logo.png")
-
 LOCALES = {
     "en": {
         "window_title": "SNBT AI Localizer",
@@ -1646,11 +1644,9 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"SNBT AI Localizer v{APP_VERSION}")
-        try:
-            if ICON_PATH and os.path.exists(ICON_PATH):
-                self.setWindowIcon(QIcon(ICON_PATH))
-        except Exception:
-            pass
+        icon_path = get_resource_path("resources/logo.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.resize(750, 680)
         self.setStyleSheet(STYLE_SHEET)
         
@@ -2859,6 +2855,7 @@ def main():
         except:
             pass
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(get_resource_path("resources/logo.ico")))
     app.setStyle(QStyleFactory.create("Fusion"))
 
     dark_palette = QPalette()
