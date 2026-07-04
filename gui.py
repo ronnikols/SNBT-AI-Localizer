@@ -1,5 +1,6 @@
 import os
 import sys
+import ctypes
 import re
 import asyncio
 import time
@@ -2852,6 +2853,11 @@ def main():
         file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
         root_logger.addHandler(file_handler)
         root_logger.propagate = False
+    if os.name == 'nt':
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('org.mineai.snbt-tr')
+        except:
+            pass
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
 
