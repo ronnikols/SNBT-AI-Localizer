@@ -1956,7 +1956,7 @@ class App(QMainWindow):
                     f'Start-Process "{current_exe}"'
                 )
                 subprocess.Popen(["powershell", "-Command", ps_command], creationflags=subprocess.DETACHED_PROCESS)
-                QApplication.quit()
+                os._exit(0)
             else:
                 QDesktopServices.openUrl(QUrl(asset_url))
 
