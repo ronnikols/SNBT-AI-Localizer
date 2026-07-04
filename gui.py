@@ -831,9 +831,10 @@ class UpdateChecker(QThread):
                     current_version = current_version[1:]
 
                 if self._compare_versions(remote_version, current_version) > 0:
+                    current_exe_name = Path(sys.executable).name
                     asset_url = ""
                     for asset in data.get("assets", []):
-                        if asset.get("name") == "snbt-tr.exe":
+                        if asset.get("name") == current_exe_name:
                             asset_url = asset.get("browser_download_url", "")
                             break
                     if asset_url:
@@ -1912,7 +1913,8 @@ class App(QMainWindow):
 
     def download_and_update(self, asset_url):
         temp_dir = Path(tempfile.gettempdir())
-        temp_path = temp_dir / "snbt-tr_new.exe"
+        current_exe_name = Path(sys.executable).name
+        temp_path = temp_dir / current_exe_name
 
         progress_dialog = QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
         progress_dialog.setWindowTitle("Downloading Update")
@@ -1956,6 +1958,7 @@ class App(QMainWindow):
                     f'Start-Process "{current_exe}"'
                 )
                 subprocess.Popen(["powershell", "-Command", ps_command], creationflags=subprocess.DETACHED_PROCESS)
+                time.sleep(0.5)
                 os._exit(0)
             else:
                 QDesktopServices.openUrl(QUrl(asset_url))
