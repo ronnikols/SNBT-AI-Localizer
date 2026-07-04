@@ -2265,7 +2265,7 @@ class App(QMainWindow):
 
     def retranslate_ui(self):
         locale = get_locale()
-        self.setWindowTitle(locale["window_title"])
+        self.setWindowTitle(f"{locale['window_title']} v{APP_VERSION}")
 
         self.tabs.setTabText(0, locale["workspace_tab"])
         self.tabs.setTabText(1, locale["translation_memory_tab"])
