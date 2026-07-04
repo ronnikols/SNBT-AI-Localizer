@@ -1949,8 +1949,9 @@ class App(QMainWindow):
         if success:
             if os.name == "nt":
                 current_exe = Path(sys.executable)
+                pid = os.getpid()
                 ps_command = (
-                    f'Start-Sleep -Milliseconds 500; '
+                    f'while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 100 }}; '
                     f'Move-Item -Path "{temp_path}" -Destination "{current_exe}" -Force; '
                     f'Start-Process "{current_exe}"'
                 )
