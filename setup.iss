@@ -10,13 +10,15 @@ SolidCompression=yes
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64
 ArchitecturesAllowed=x64
+ChangesEnvironment=yes
 
 [Files]
 Source: "dist\snbt-tr.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\snbt-tr-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\SNBT AI Localizer"; Filename: "{app}\snbt-tr.exe"; WorkingDir: "{app}"
-Name: "{userdesktop}\SNBT AI Localizer"; Filename: "{app}\snbt-tr.exe"; WorkingDir: "{app}"
+Name: "{group}\SNBT AI Localizer"; Filename: "{app}\snbt-tr-gui.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\SNBT AI Localizer"; Filename: "{app}\snbt-tr-gui.exe"; WorkingDir: "{app}"
 Name: "{app}\Uninstall SNBT AI Localizer"; Filename: "{uninstallexe}"; WorkingDir: "{app}"
 
 [Registry]
