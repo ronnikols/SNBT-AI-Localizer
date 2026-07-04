@@ -1901,67 +1901,16 @@ class App(QMainWindow):
             self.update_checker.start()
 
     def on_update_available(self, new_version, asset_url):
-        msg = f"New version v{new_version} is available! Download now?"
+        msg = f"New version v{new_version} is available! Download from GitHub releases."
         reply = QMessageBox.question(
             self,
             "Update Available",
             msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.Ok
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.download_and_update(asset_url)
+        if reply == QMessageBox.StandardButton.Ok:
+            QDesktopServices.openUrl(QUrl("https://github.com/ronnikols/SNBT-AI-Localizer/releases"))
 
-    def download_and_update(self, asset_url):
-        temp_dir = Path(tempfile.gettempdir())
-        current_exe_name = Path(sys.executable).name
-        temp_path = temp_dir / current_exe_name
-
-        progress_dialog = QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
-        progress_dialog.setWindowTitle("Downloading Update")
-        progress_dialog.setModal(True)
-        progress_dialog.show()
-
-        def download_with_progress():
-            try:
-                with httpx.stream("GET", asset_url, timeout=30.0, follow_redirects=True) as response:
-                    response.raise_for_status()
-                    total_size = int(response.headers.get("content-length", 0))
-                    downloaded = 0
-                    with open(temp_path, "wb") as f:
-                        for chunk in response.iter_bytes(chunk_size=8192):
-                            if progress_dialog.wasCanceled():
-                                temp_path.unlink(missing_ok=True)
-                                return False
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size > 0:
-                                progress = int((downloaded / total_size) * 100)
-                                progress_dialog.setValue(progress)
-                                QApplication.processEvents()
-                        progress_dialog.setValue(100)
-                    return True
-            except Exception as e:
-                logging.getLogger("snbt_localizer.gui").error(f"Download failed: {e}")
-                temp_path.unlink(missing_ok=True)
-                return False
-
-        success = download_with_progress()
-        progress_dialog.close()
-
-        if success:
-            if os.name == "nt":
-                current_exe = Path(sys.executable)
-                pid = os.getpid()
-                ps_command = (
-                    f'while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 100 }}; '
-                    f'Move-Item -Path "{temp_path}" -Destination "{current_exe}" -Force; '
-                    f'Start-Process "{current_exe}"'
-                )
-                subprocess.Popen(["powershell", "-Command", ps_command], creationflags=subprocess.DETACHED_PROCESS)
-                time.sleep(0.5)
-                os._exit(0)
-            else:
-                QDesktopServices.openUrl(QUrl(asset_url))
 
     def on_lang_box_changed(self, lang_text):
         if self._is_initializing or self._is_syncing_language:

@@ -4,7 +4,7 @@ AppVersion=1.0
 DefaultDirName={userappdata}\Programs\SNBT-AI-Localizer
 DefaultGroupName=SNBT AI Localizer
 OutputDir=.
-OutputBaseFilename=setup
+OutputBaseFilename=snbt-tr-Windows-Installer
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=lowest
@@ -14,21 +14,34 @@ ChangesEnvironment=yes
 
 [Files]
 Source: "dist\snbt-tr.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\snbt-tr-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\SNBT AI Localizer"; Filename: "{app}\snbt-tr-gui.exe"; WorkingDir: "{app}"
-Name: "{userdesktop}\SNBT AI Localizer"; Filename: "{app}\snbt-tr-gui.exe"; WorkingDir: "{app}"
+Name: "{group}\SNBT AI Localizer"; Filename: "{app}\snbt-tr.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\SNBT AI Localizer"; Filename: "{app}\snbt-tr.exe"; WorkingDir: "{app}"
 Name: "{app}\Uninstall SNBT AI Localizer"; Filename: "{uninstallexe}"; WorkingDir: "{app}"
-
-[Registry]
-Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: not PathContainsAppDir('{app}')
-
 
 [Code]
 function PathContainsAppDir(Param: string): Boolean;
 begin
   Result := Pos(';' + Param + ';', ';' + GetEnv('Path') + ';') > 0;
+end;
+
+procedure AddAppDirToPath(AppDir: string);
+var
+  PathStr: string;
+begin
+  if not PathContainsAppDir(AppDir) then
+  begin
+    if RegQueryStringValue(HKCU, 'Environment', 'Path', PathStr) then
+    begin
+      PathStr := PathStr + ';' + AppDir;
+      RegWriteStringValue(HKCU, 'Environment', 'Path', PathStr);
+    end
+    else
+    begin
+      RegWriteStringValue(HKCU, 'Environment', 'Path', AppDir);
+    end;
+  end;
 end;
 
 procedure RemoveAppDirFromPath(AppDir: string);
@@ -49,4 +62,10 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
     RemoveAppDirFromPath(ExpandConstant('{app}'));
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    AddAppDirToPath(ExpandConstant('{app}'));
 end;

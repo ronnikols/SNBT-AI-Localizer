@@ -19,6 +19,9 @@ jobs:
       - run: pip install pyinstaller pillow
       - run: pip install -r requirements.txt
       - run: pyinstaller --onefile --noconsole --icon=resources/logo.png --add-data "resources;resources" main.py --name snbt-tr
+      - run: ISCC setup.iss
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/snbt-tr.exe
+          files: |
+            dist/snbt-tr.exe
+            Output/snbt-tr-Windows-Installer.exe
