@@ -16,6 +16,7 @@ SNBT AI Localizer is an advanced asynchronous translator for Minecraft FTB Quest
 
 | Platform | Package Name | Install Command |
 |----------|--------------|-----------------|
+| Windows (Winget) | `org.mineai.snbt-tr` | `winget install org.mineai.snbt-tr` |
 | Arch Linux AUR | `snbt-tr` | `yay -S snbt-tr` |
 | Flatpak | `org.mineai.snbt-tr` | `flatpak install org.mineai.snbt-tr` |
 | pipx | `snbt-tr` | `pipx install snbt-tr` |

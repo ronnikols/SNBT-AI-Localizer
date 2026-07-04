@@ -1889,7 +1889,8 @@ class App(QMainWindow):
         gui_logger.propagate = False
         self.retranslate_ui()
 
-        if not os.environ.get('SNBT_TR_SKIP_UPDATE_CHECK', '').lower() in ('1', 'true', 'yes'):
+        if (not os.environ.get('SNBT_TR_SKIP_UPDATE_CHECK', '').lower() in ('1', 'true', 'yes') and
+            os.environ.get('QT_QPA_PLATFORM', '') != 'offscreen'):
             self.update_checker = UpdateChecker()
             self.update_checker.update_available.connect(self.on_update_available)
             self.update_checker.start()

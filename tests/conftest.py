@@ -1,5 +1,10 @@
 import os
-os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+import platform
+if platform.system() == "Linux":
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    os.environ["DISPLAY"] = ""
+    os.environ["WAYLAND_DISPLAY"] = ""
+
 import pytest
 
 @pytest.fixture(scope="session", autouse=True)
@@ -16,3 +21,21 @@ def config_app_settings(qapp):
         original_init(self, *args, **kwargs)
 
     QSettings.__init__ = patched_init
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_qthreads():
+    yield
+    try:
+        from PyQt6.QtCore import QThread
+        import time
+        time.sleep(0.1)
+        threads = list(QThread.allThreads())
+        for thread in threads:
+            if thread is not None and thread != QThread.currentThread():
+                if thread.isRunning():
+                    thread.quit()
+                    if not thread.wait(5000):
+                        thread.terminate()
+                        thread.wait()
+    except Exception:
+        pass

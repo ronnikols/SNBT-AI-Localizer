@@ -55,7 +55,18 @@ def test_resolve_mixed_pool_autodetect():
     assert pool[1]["provider"] == "NVIDIA NIM"
     assert pool[1]["model"] == "nemotron-saved"
 
-def test_gui_provider_key_isolation(qtbot):
+def test_gui_provider_key_isolation(qtbot, monkeypatch):
+    import gui
+    from unittest.mock import MagicMock
+    from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+    monkeypatch.setattr(gui, "UpdateChecker", MagicMock)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args, **kwargs: "/mock/modpack/dir")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args, **kwargs: None)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+
     from gui import App
     app = App()
     qtbot.addWidget(app)

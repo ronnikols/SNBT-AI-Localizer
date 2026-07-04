@@ -1,0 +1,14 @@
+PackageIdentifier: org.mineai.snbt-tr
+PackageVersion: 1.1.15
+PackageName: SNBT AI Localizer
+Publisher: MineAI
+License: MIT
+ShortDescription: AI-powered localization utility for Minecraft modpacks (KubeJS JSON and SNBT).
+Installers:
+  - Architecture: x64
+    InstallerType: inno
+    InstallerUrl: https://github.com/ronnikols/SNBT-AI-Localizer/releases/download/v1.1.15/snbt-tr-setup.exe
+    InstallerSha256: SHA256_PLACEHOLDER
+    Scope: user
+ManifestType: singleton
+ManifestVersion: 1.6.0

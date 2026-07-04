@@ -11,6 +11,7 @@ Advanced asynchronous translator for Minecraft FTB Quests files (`.snbt`) with s
 ### Recommended Methods
 | Platform       | Command                          |
 |----------------|----------------------------------|
+| Windows        | `winget install org.mineai.snbt-tr` (Recommended) |
 | Arch Linux AUR | `yay -S snbt-tr`                 |
 | Flatpak        | `flatpak install org.mineai.snbt-tr` |
 | pipx           | `pipx install snbt-tr`           |
