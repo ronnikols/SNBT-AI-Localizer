@@ -1644,7 +1644,7 @@ class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"SNBT AI Localizer v{APP_VERSION}")
-        icon_path = get_resource_path("resources/logo.ico")
+        icon_path = str(get_resource_path("resources/logo.ico"))
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
         self.resize(750, 680)
@@ -2855,7 +2855,7 @@ def main():
         except:
             pass
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(get_resource_path("resources/logo.ico")))
+    app.setWindowIcon(QIcon(str(get_resource_path("resources/logo.ico"))))
     app.setStyle(QStyleFactory.create("Fusion"))
 
     dark_palette = QPalette()
