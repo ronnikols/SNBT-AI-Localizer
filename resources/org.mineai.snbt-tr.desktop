@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=SNBT AI Localizer
+Exec=snbt-tr --gui
+Icon=org.mineai.snbt-tr
+Terminal=false
+Categories=Development;Utility;
