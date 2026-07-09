@@ -1186,3 +1186,198 @@ def test_sqlite_guard_and_indexing():
 
     cache.conn.close()
     shutil.rmtree(temp_dir)
+
+def test_parse_snbt_multiline_array():
+    from core import _find_all_snbt_strings
+    content = '''description: [
+  "Line 1"
+  "Line 2 with \\"quotes\\""
+  "Line 3"
+]'''
+    strings = _find_all_snbt_strings(content)
+    assert len(strings) == 3
+    assert strings[0]['key'] == 'description'
+    assert strings[0]['value'] == 'Line 1'
+    assert strings[1]['key'] == 'description'
+    assert strings[1]['value'] == 'Line 2 with "quotes"'
+    assert strings[2]['key'] == 'description'
+    assert strings[2]['value'] == 'Line 3'
+
+def test_parse_snbt_nested_objects_with_arrays():
+    from core import _find_all_snbt_strings
+    content = '''quest: {
+  title: "Main Title"
+  tasks: [
+    {
+      description: [
+        "Task 1 Line 1"
+        "Task 1 Line 2"
+      ]
+    },
+    {
+      description: [
+        "Task 2 Line 1"
+        "Task 2 Line 2"
+      ]
+    }
+  ]
+}'''
+    strings = _find_all_snbt_strings(content)
+    assert len(strings) == 5
+    title_strings = [s for s in strings if s['key'] == 'title']
+    desc_strings = [s for s in strings if s['key'] == 'description']
+    assert len(title_strings) == 1
+    assert title_strings[0]['value'] == 'Main Title'
+    assert len(desc_strings) == 4
+    assert desc_strings[0]['value'] == 'Task 1 Line 1'
+    assert desc_strings[1]['value'] == 'Task 1 Line 2'
+    assert desc_strings[2]['value'] == 'Task 2 Line 1'
+    assert desc_strings[3]['value'] == 'Task 2 Line 2'
+
+def test_parse_snbt_technical_fields_ignored():
+    from core import _find_all_snbt_strings
+    content = '''quest: {
+  id: "quest_123"
+  icon: "minecraft:diamond"
+  title: "Quest Title"
+  description: [
+    "Line 1"
+    "Line 2"
+  ]
+  x: 10
+  y: 20
+  command: "give @p diamond"
+}'''
+    strings = _find_all_snbt_strings(content)
+    translatable = [s for s in strings if s['key'] in ('title', 'description')]
+    technical = [s for s in strings if s['key'] in ('id', 'icon', 'command')]
+    assert len(translatable) == 3
+    assert len(technical) == 3
+    assert translatable[0]['key'] == 'title'
+    assert translatable[0]['value'] == 'Quest Title'
+    assert translatable[1]['key'] == 'description'
+    assert translatable[1]['value'] == 'Line 1'
+    assert translatable[2]['key'] == 'description'
+    assert translatable[2]['value'] == 'Line 2'
+
+def test_parse_snbt_mixed_keys_and_arrays():
+    from core import _find_all_snbt_strings
+    content = '''chapter: {
+  title: "Chapter 1"
+  quests: [
+    {
+      quest_title: "Quest 1"
+      quest_desc: [
+        "Description line 1"
+        "Description line 2"
+      ]
+      icon: "minecraft:gold_ingot"
+    }
+  ]
+}'''
+    strings = _find_all_snbt_strings(content)
+    title_strings = [s for s in strings if 'title' in s['key']]
+    desc_strings = [s for s in strings if 'desc' in s['key']]
+    icon_strings = [s for s in strings if s['key'] == 'icon']
+    assert len(title_strings) == 2
+    assert len(desc_strings) == 2
+    assert len(icon_strings) == 1
+    assert title_strings[0]['value'] == 'Chapter 1'
+    assert title_strings[1]['value'] == 'Quest 1'
+    assert desc_strings[0]['value'] == 'Description line 1'
+    assert desc_strings[1]['value'] == 'Description line 2'
+    assert icon_strings[0]['value'] == 'minecraft:gold_ingot'
+
+def test_parse_snbt_single_line():
+    from core import _find_all_snbt_strings
+    content = 'title: "Hello" subtitle: "World"'
+    strings = _find_all_snbt_strings(content)
+    assert len(strings) == 2
+    assert strings[0]['key'] == 'title'
+    assert strings[0]['value'] == 'Hello'
+    assert strings[1]['key'] == 'subtitle'
+    assert strings[1]['value'] == 'World'
+
+def test_parse_snbt_escaped_quotes():
+    from core import _find_all_snbt_strings
+    content = 'title: "Hello \\"World\\""'
+    strings = _find_all_snbt_strings(content)
+    assert len(strings) == 1
+    assert strings[0]['value'] == 'Hello "World"'
+
+def test_count_translatable_multiline_array():
+    from core import SNBTManager
+    content = '''description: [
+  "Line 1"
+  "Line 2"
+] title: "Title"'''
+    manager = SNBTManager("test", "Groq Cloud (Fast)", "test")
+    count = manager._count_translatable_in_content(content, True, True, True)
+    assert count == 3
+
+def test_count_translatable_dotted_keys():
+    from core import SNBTManager
+    content = '''chapter.0001.title: "Chapter 1"
+quest.0001.quest_subtitle: "Subtitle"
+quest.0001.quest_desc: [
+  "Description line 1"
+  "Description line 2"
+]'''
+    manager = SNBTManager("test", "Groq Cloud (Fast)", "test")
+    count = manager._count_translatable_in_content(content, True, True, True)
+    assert count == 4
+
+def test_snbt_reconstruction_with_escaping():
+    from core import _find_all_snbt_strings, _escape_snbt_string
+    content = 'title: "Hello"'
+    strings = _find_all_snbt_strings(content)
+    assert len(strings) == 1
+    s = strings[0]
+    assert s['value'] == 'Hello'
+    assert s['content_start'] == 8
+    assert s['content_end'] == 12
+    escaped = _escape_snbt_string('Привет')
+    assert escaped == 'Привет'
+    escaped_quotes = _escape_snbt_string('Text with "quotes"')
+    assert escaped_quotes == 'Text with \\"quotes\\"'
+    before = content[:s['content_start']]
+    after = content[s['content_end']+1:]
+    new_content = before + escaped + after
+    assert new_content == 'title: "Привет"'
+
+def test_snbt_reconstruction_multiline():
+    from core import _find_all_snbt_strings, _escape_snbt_string
+    content = '''description: [
+  "Line 1"
+  "Line 2"
+]'''
+    strings = _find_all_snbt_strings(content)
+    assert len(strings) == 2
+    strings.sort(key=lambda x: x['content_start'], reverse=True)
+    mapping = {"Line 1": "Строка 1", "Line 2": "Строка 2"}
+    final_content = content
+    for s in strings:
+        orig = s['value']
+        if orig in mapping:
+            translated = mapping[orig]
+            escaped = _escape_snbt_string(translated)
+            before = final_content[:s['content_start']]
+            after = final_content[s['content_end']+1:]
+            final_content = before + escaped + after
+    expected = '''description: [
+  "Строка 1"
+  "Строка 2"
+]'''
+    assert final_content == expected
+
+def test_snbt_reconstruction_with_quotes():
+    from core import _find_all_snbt_strings, _escape_snbt_string
+    content = 'title: "Hello"'
+    strings = _find_all_snbt_strings(content)
+    mapping = {"Hello": 'Say "Hello"'}
+    s = strings[0]
+    escaped = _escape_snbt_string(mapping[s['value']])
+    before = content[:s['content_start']]
+    after = content[s['content_end']+1:]
+    final_content = before + escaped + after
+    assert final_content == 'title: "Say \\"Hello\\""'

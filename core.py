@@ -30,6 +30,89 @@ def get_resource_path(relative_path):
     except Exception:
         return Path(os.path.abspath(relative_path))
 
+def sanitize_translation_text(text: str) -> str:
+    """Sanitize translation text by:
+    1. Stripping whitespace
+    2. Removing outer quotes if present
+    3. Escaping unescaped double quotes
+    """
+    if not isinstance(text, str):
+        return text
+
+    # 1. Strip whitespace
+    text = text.strip()
+
+    # 2. Remove outer quotes if present
+    if len(text) >= 2:
+        if (text.startswith('"') and text.endswith('"')) or \
+           (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1]
+
+    # 3. Escape unescaped double quotes
+    # Use temporary marker to preserve already escaped quotes
+    temp_marker = "\x00ESCAPED_QUOTE\x00"
+    text = text.replace('\\"', temp_marker)
+    text = text.replace('"', '\\"')
+    text = text.replace(temp_marker, '\\"')
+
+    return text
+
+def sanitize_with_original(original: str, translated: str) -> str:
+    """
+    Sanitize translated string based on original string's quote context.
+    Implements 4 rules:
+    1. Strip whitespace from both strings
+    2. Recursively remove duplicate outer quotes (e.g., ""text"" -> "text")
+    3. Remove outer quotes from translated if original didn't have them
+    4. Preserve outer quotes in translated if original had them
+    """
+    if not isinstance(translated, str):
+        return translated
+
+    # Rule 1: Strip whitespace from both
+    original_stripped = original.strip() if isinstance(original, str) else ""
+    translated = translated.strip()
+
+    # Rule 2: Recursively remove duplicate outer quotes
+    while len(translated) >= 4:
+        if (translated.startswith('""') and translated.endswith('""')):
+            translated = translated[1:-1]
+        elif (translated.startswith("''") and translated.endswith("''")):
+            translated = translated[1:-1]
+        else:
+            break
+
+    # Determine original's outer quote type
+    orig_has_double_quotes = (
+        len(original_stripped) >= 2 and
+        original_stripped.startswith('"') and
+        original_stripped.endswith('"')
+    )
+    orig_has_single_quotes = (
+        len(original_stripped) >= 2 and
+        original_stripped.startswith("'") and
+        original_stripped.endswith("'")
+    )
+
+    # Rule 3 & 4: Handle quotes based on original
+    if orig_has_double_quotes or orig_has_single_quotes:
+        # Original had quotes - preserve quote type
+        quote_char = '"' if orig_has_double_quotes else "'"
+        # Remove any existing quotes from translated and strip inner whitespace
+        if len(translated) >= 2:
+            if (translated.startswith('"') and translated.endswith('"')) or \
+               (translated.startswith("'") and translated.endswith("'")):
+                translated = translated[1:-1].strip()
+        return f"{quote_char}{translated}{quote_char}"
+    else:
+        # Original had no quotes - remove any outer quotes from translated
+        if len(translated) >= 2:
+            if (translated.startswith('"') and translated.endswith('"')):
+                translated = translated[1:-1].strip()
+            elif (translated.startswith("'") and translated.endswith("'")):
+                translated = translated[1:-1].strip()
+        return translated
+
 def clean_and_unpack_string(text: str) -> str:
     text = text.strip()
     if not text:
@@ -40,15 +123,15 @@ def clean_and_unpack_string(text: str) -> str:
             if isinstance(parsed, dict):
                 for key in ["translation", "translated", "text", "translated_text"]:
                     if key in parsed and isinstance(parsed[key], str):
-                        return parsed[key]
+                        return sanitize_translation_text(parsed[key])
                 for val in parsed.values():
                     if isinstance(val, str):
-                        return val
+                        return sanitize_translation_text(val)
             elif isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], str):
-                return parsed[0]
+                return sanitize_translation_text(parsed[0])
         except (ValueError, SyntaxError):
             pass
-    return text
+    return sanitize_translation_text(text)
 
 PROVIDER_DEFAULTS = {
     "Google Translate (Free)": None,
@@ -350,9 +433,110 @@ def parse_target_lang(lang_str):
         return match.group(1).strip(), match.group(2).strip().lower()
     return lang_str, lang_str.lower()[:5]
 
+def _escape_snbt_string(s: str) -> str:
+    return s.replace('\\', '\\\\').replace('"', '\\"')
+
+def _find_all_snbt_strings(content: str) -> list:
+    results = []
+    i = 0
+    n = len(content)
+
+    current_key = None
+    in_string = False
+    string_start = 0
+    string_chars = []
+    escape_next = False
+
+    def skip_whitespace():
+        nonlocal i
+        while i < n and content[i] in ' \t\n\r':
+            i += 1
+
+    def save_string():
+        nonlocal in_string, string_chars, string_start
+        if in_string:
+            value = ''.join(string_chars)
+            results.append({
+                'key': current_key,
+                'value': value,
+                'content_start': string_start,
+                'content_end': i - 1,
+                'full_start': string_start - 1,
+                'full_end': i
+            })
+            in_string = False
+            string_chars = []
+
+    while i < n:
+        c = content[i]
+
+        if escape_next:
+            string_chars.append(c)
+            escape_next = False
+            i += 1
+            continue
+
+        if c == '\\':
+            escape_next = True
+            i += 1
+            continue
+
+        if in_string:
+            if c == '"':
+                save_string()
+                i += 1
+            else:
+                string_chars.append(c)
+                i += 1
+            continue
+
+        if c == '"':
+            in_string = True
+            string_start = i + 1
+            i += 1
+            continue
+
+        if c == '{' or c == '[':
+            skip_whitespace()
+            i += 1
+            continue
+
+        if c == '}' or c == ']':
+            save_string()
+            skip_whitespace()
+            i += 1
+            continue
+
+        if c == ':':
+            skip_whitespace()
+            i += 1
+            continue
+
+        if c.isalpha() or c == '_' or c == '.':
+            key_start = i
+            key_chars = []
+            while i < n and (content[i].isalnum() or content[i] in '_.-'):
+                key_chars.append(content[i])
+                i += 1
+            current_key = ''.join(key_chars)
+            skip_whitespace()
+            if i < n and content[i] == ':':
+                i += 1
+                skip_whitespace()
+            continue
+
+        i += 1
+
+    save_string()
+    return results
+
 def parse_snbt_map(content: str) -> Dict[str, str]:
-    pairs = re.findall(r'"([^"]*)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content)
-    return dict(pairs)
+    strings = _find_all_snbt_strings(content)
+    result = {}
+    for s in strings:
+        if s['key'] is not None:
+            result[s['key']] = s['value']
+    return result
 
 class TranslationCache:
     def __init__(self, db_path="cache.sqlite", target_lang_code="ru_ru"):
@@ -983,16 +1167,23 @@ class SNBTManager:
             content = f.read()
         return self._count_translatable_in_content(content, t_titles, t_subs, t_desc)
 
+    def _is_translatable_key(self, key: str, t_titles: bool, t_subs: bool, t_desc: bool) -> bool:
+        if key is None:
+            return False
+        if t_titles and (key == 'title' or key.endswith('.title')):
+            return True
+        if t_subs and (key == 'subtitle' or key.endswith('.quest_subtitle')):
+            return True
+        if t_desc and (key == 'description' or key.endswith('.quest_desc')):
+            return True
+        return False
+
     def _count_translatable_in_content(self, content: str, t_titles: bool, t_subs: bool, t_desc: bool) -> int:
+        strings = _find_all_snbt_strings(content)
         count = 0
-        if t_titles:
-            count += len(re.findall(r'title:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content))
-        if t_subs:
-            count += len(re.findall(r'subtitle:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content))
-        if t_desc:
-            count += len(re.findall(r'description:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content))
-            for arr in re.findall(r'description:\s*\[\s*([\s\S]*?)\s*\]', content):
-                count += len(re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', arr))
+        for s in strings:
+            if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
+                count += 1
         return count
 
     def is_valid(self, text: str) -> bool:
@@ -1016,7 +1207,8 @@ class SNBTManager:
             logging.getLogger("snbt_localizer.core").info(f"[SKIP MODE] Skipping file: {filepath.name}")
             return 0
 
-        is_overwrite = "overwrite" in policy.lower()
+        policy_normalized = policy.lower().split('(')[0].strip()
+        is_overwrite = policy_normalized == "overwrite"
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
         is_loc_file = bool(lang_pattern.match(filepath.name))
         is_ru_file = False
@@ -1035,7 +1227,7 @@ class SNBTManager:
                         target_content = await f.read()
                     if target_content != content:
                         is_ru_file = True
-                if is_ru_file and "skip" in policy.lower():
+                if is_ru_file and policy_normalized == "skip":
                     logger(f"Skipping already translated file: {target_path.name}")
                     return 0
                 current_translated_content = target_content if is_ru_file else ""
@@ -1054,7 +1246,7 @@ class SNBTManager:
                 disk_content = await f.read()
 
             is_ru_file = bak_path.exists() and bak_path.stat().st_size > 0
-            if is_ru_file:
+            if is_ru_file and not is_overwrite:
                 async with aiofiles.open(bak_path, 'r', encoding='utf-8') as f:
                     content = await f.read()
             else:
@@ -1066,10 +1258,10 @@ class SNBTManager:
                 current_translated_content = ""
 
         if is_ru_file:
-            if "skip" in policy.lower():
+            if policy_normalized == "skip":
                 logger(f"Skipping already translated file: {target_path.name}")
                 return
-            
+
             if is_overwrite:
                 backup_dir = filepath.parent / "backup"
                 backup_dir.mkdir(exist_ok=True)
@@ -1079,32 +1271,24 @@ class SNBTManager:
                         backup_content = await f.read()
                     async with aiofiles.open(backup_file, 'w', encoding='utf-8') as f:
                         await f.write(backup_content)
-                current_translated_content = ""
 
         mapping = {}
-        if is_ru_file and current_translated_content and "complement" in policy.lower():
+        if is_ru_file and current_translated_content and policy_normalized == "complement":
             en_map = parse_snbt_map(content)
             ru_map = parse_snbt_map(current_translated_content)
             for k, v in en_map.items():
                 if k in ru_map and ru_map[k] != v:
                     mapping[v] = ru_map[k]
 
+        all_strings = _find_all_snbt_strings(content)
         target_texts = set()
         def should_translate(text: str) -> bool:
             return self.is_valid(text) and text not in mapping
 
-        if t_titles:
-            for m in re.findall(r'title:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                if isinstance(m, str) and should_translate(m): target_texts.add(m)
-        if t_subs:
-            for m in re.findall(r'subtitle:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                if isinstance(m, str) and should_translate(m): target_texts.add(m)
-        if t_desc:
-            for m in re.findall(r'description:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                if isinstance(m, str) and should_translate(m): target_texts.add(m)
-            for arr in re.findall(r'description:\s*\[\s*([\s\S]*?)\s*\]', content):
-                for m in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', arr):
-                    if isinstance(m, str) and should_translate(m): target_texts.add(m)
+        for s in all_strings:
+            if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
+                if should_translate(s['value']):
+                    target_texts.add(s['value'])
 
         texts = list(target_texts)
         if not texts:
@@ -1119,6 +1303,7 @@ class SNBTManager:
 
         if is_overwrite:
             to_trans = texts
+            mapping.clear()
         else:
             to_trans = [t for t in texts if not self.cache.get(t)]
             for t in texts:
@@ -1142,7 +1327,9 @@ class SNBTManager:
                     progress_callback(i // chunk_size, total_chunks, min(i + chunk_size, len(to_trans)), len(to_trans))
                 try:
                     res = await self.translator.translate(chunk_to_send, logger, check_status, context=filepath.name)
-                    new_map = dict(zip(chunk_to_send, res))
+                    new_map = {}
+                    for orig, trans in zip(chunk_to_send, res):
+                        new_map[orig] = sanitize_with_original(orig, trans)
                 except (AbortException, ValueError):
                     raise
                 except Exception as e:
@@ -1186,9 +1373,23 @@ class SNBTManager:
             logging.getLogger("snbt_localizer.core").warning(f"Aborted processing of {filepath.name}.")
             raise
 
+        translatable_strings = _find_all_snbt_strings(content)
+        filtered_strings = []
+        for s in translatable_strings:
+            if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
+                filtered_strings.append(s)
+
+        filtered_strings.sort(key=lambda x: x['content_start'], reverse=True)
+
         final_content = content
-        for orig in sorted(mapping.keys(), key=len, reverse=True):
-            final_content = final_content.replace(f'"{orig}"', f'"{mapping[orig]}"')
+        for s in filtered_strings:
+            orig = s['value']
+            if orig in mapping:
+                translated = mapping[orig]
+                escaped = _escape_snbt_string(translated)
+                before = final_content[:s['content_start']]
+                after = final_content[s['content_end']+1:]
+                final_content = before + escaped + after
 
         if is_loc_file:
             tmp_path = target_path.with_suffix('.snbt.tmp')
@@ -1245,7 +1446,7 @@ class JSONManager:
         self.translator = translator
         self.cache = cache
         self.modpack = modpack
-        self.policy = policy
+        self.policy = policy.lower().split('(')[0].strip()
         self.resource_pack_mode = resource_pack_mode
         self.progress_callback = progress_callback
         self.modpack_root = modpack_root
@@ -1351,7 +1552,8 @@ class JSONManager:
                 source_data = json.load(f)
 
             target_data = {}
-            if target_file.exists() and "Complement" in self.policy:
+            policy_normalized = self.policy.lower().split('(')[0].strip()
+            if target_file.exists() and policy_normalized == "complement":
                 try:
                     with open(target_file, 'r', encoding='utf-8') as f:
                         target_data = json.load(f)
@@ -1364,7 +1566,7 @@ class JSONManager:
                     continue
                 if not self._is_translatable(value):
                     continue
-                if "Complement" in self.policy and key in target_data and target_data[key] and target_data[key] != value:
+                if policy_normalized == "complement" and key in target_data and target_data[key] and target_data[key] != value:
                     continue
                 strings_to_translate[key] = value
 
@@ -1401,8 +1603,8 @@ class JSONManager:
                         "JSON"
                     )
 
-                    for (key, _), translation in zip(cache_misses, translations):
-                        cache_hits[key] = translation
+                    for (key, original_value), translation in zip(cache_misses, translations):
+                        cache_hits[key] = sanitize_with_original(original_value, clean_and_unpack_string(translation))
 
                     self.cache.save_batch(
                         {value: translation for value, translation in zip(texts_to_translate, translations)},
@@ -1423,7 +1625,7 @@ class JSONManager:
             for key, value in source_data.items():
                 if isinstance(value, str) and key in strings_to_translate:
                     result_data[key] = strings_to_translate[key]
-                elif "Complement" in self.policy and key in target_data and target_data[key]:
+                elif policy_normalized == "complement" and key in target_data and target_data[key]:
                     result_data[key] = target_data[key]
                 else:
                     result_data[key] = value
