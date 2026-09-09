@@ -46,8 +46,8 @@ PROVIDER_ENDPOINTS = {
     "Sambanova": "https://api.sambanova.ai/v1/models",
     "OpenAI": "https://api.openai.com/v1/models",
     "Mistral AI": "https://api.mistral.ai/v1/models",
-    "Anthropic (Claude)": "https://api.anthropic.com/v1/messages",
-    "Cohere": "https://api.cohere.ai/v1/chat",
+    "Anthropic (Claude)": "https://api.anthropic.com/v1/models",
+    "Cohere": "https://api.cohere.com/v1/models",
     "OpenCode": "https://opencode.ai/zen/v1/models",
     "Crusoe Cloud": "https://api.inference.crusoecloud.com/v1/models",
     "RunInfra": "https://api.runinfra.ai/v1/models",
@@ -143,19 +143,41 @@ class ConfigManager:
             return None
         return QSettings("MineAI", "SNBT-Localizer")
 
+    @staticmethod
+    def _int_setting(s, key, default):
+        """Crash-proof int reading: a corrupted setting must not brick the app."""
+        try:
+            return int(s.value(key, default))
+        except (TypeError, ValueError):
+            return default
+
     def load_from_settings(self):
         s = self._settings()
         if s is None:
             return
 
-        self.provider = s.value("provider", self.provider)
+        provider = s.value("provider", self.provider)
+        # Migration: old releases stored the pre-rename provider name
+        if provider == "Local LLM / Custom":
+            new_provider = "Custom (OpenAI-compatible)"
+            legacy_keys = s.value("api_keys_pool_Local LLM / Custom", "")
+            if legacy_keys and not s.value(f"api_keys_pool_{new_provider}", ""):
+                s.setValue(f"api_keys_pool_{new_provider}", legacy_keys)
+            s.setValue("provider", new_provider)
+            provider = new_provider
+        if provider not in self.AVAILABLE_PROVIDERS and provider != "Mixed Providers":
+            logging.getLogger("snbt_localizer.cli").warning(
+                f"Unknown saved provider '{provider}', falling back to Google Translate (Free)"
+            )
+            provider = "Google Translate (Free)"
+        self.provider = provider
         self.model = s.value("model", self.model)
         if self.provider and self.provider != "Mixed Providers":
             provider_model = s.value(f"model_{self.provider}", "")
             if provider_model:
                 self.model = provider_model
         self.target_lang = s.value("target_lang", self.target_lang)
-        self.concurrency = int(s.value("concurrency_limit", self.concurrency))
+        self.concurrency = self._int_setting(s, "concurrency_limit", self.concurrency)
         self.custom_context = s.value("custom_context", self.custom_context)
         self.policy = s.value("policy", self.policy)
 
@@ -165,9 +187,9 @@ class ConfigManager:
 
         self.custom_base_url = s.value("custom_base_url", "")
 
-        self.batch_size = int(s.value("batch_size", 50))
-        self.min_batch_size = int(s.value("min_batch_size", 1))
-        self.max_concurrent_requests = int(s.value("max_concurrent_requests", 10))
+        self.batch_size = self._int_setting(s, "batch_size", 50)
+        self.min_batch_size = self._int_setting(s, "min_batch_size", 1)
+        self.max_concurrent_requests = self._int_setting(s, "max_concurrent_requests", 10)
         self.resource_pack_mode = s.value("resource_pack_mode", self.resource_pack_mode)
         if isinstance(self.resource_pack_mode, str):
             self.resource_pack_mode = self.resource_pack_mode.lower() == "true"
@@ -218,28 +240,28 @@ class ConfigManager:
     def parse_cli_args(self, args: Optional[List[str]] = None):
         parser = argparse.ArgumentParser(prog='snbt-tr', add_help=False)
         parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
-        parser.add_argument("-p", "--provider", help="Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova)")
+        parser.add_argument("-p", "--provider", help="Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova, openai, mistral, anthropic, claude, cohere, opencode, crusoe, runinfra, ollama, local/custom, mixed, mix)")
         parser.add_argument("-m", "--model", help="Model name (default: provider default)")
         parser.add_argument("-k", "--key", help="API key(s), comma-separated (env/QSettings fallback)")
-        parser.add_argument("-l", "--lang", default="ru", help="Language code (default: ru)")
+        parser.add_argument("-l", "--lang", default=None, help="Language code (default: ru / saved setting)")
         parser.add_argument("-d", "--dir", default=None, help="Path to quests directory (default: auto-detect)")
         parser.add_argument("-c", "--context", default="", help="Custom translation context")
-        parser.add_argument("--policy", default="complement", choices=["complement", "overwrite", "skip"],
-                            help="Existing files policy: complement, overwrite, skip (default: complement)")
-        parser.add_argument("--concurrency", type=int, default=2,
-                            help="Number of parallel translation threads (1-10, default: 3)")
+        parser.add_argument("--policy", default=None, choices=["complement", "overwrite", "skip"],
+                            help="Existing files policy: complement, overwrite, skip (default: saved setting)")
+        parser.add_argument("--concurrency", type=int, default=None,
+                            help="Number of parallel translation threads (1-10, default: saved setting)")
         parser.add_argument("--list-models", action="store_true", help="List available models for provider and exit")
-        parser.add_argument("--fastdir", "--fd", action="store_true", help="Scan launcher paths for instances and exit")
+        parser.add_argument("--fastdir", "--fd", action="store_true", help="Scan launcher paths, pick instance and translate with saved settings")
         parser.add_argument("--clear-cache", "--clear", action="store_true", help="Clear translation cache and exit")
         parser.add_argument("--debug", action="store_true", help="Enable debug logging to console")
         parser.add_argument('--mix', action='store_true', help='Enable Mixed Provider mode using QSettings key pool')
         parser.add_argument('--gui', action='store_true', help='Launch Graphical User Interface (GUI)')
-        parser.add_argument("--batch-size", type=int, default=50,
-                            help="Batch size for translation (default: 50)")
-        parser.add_argument("--min-batch-size", type=int, default=1,
-                            help="Minimum batch size before failing (default: 1)")
-        parser.add_argument("--max-concurrent-requests", type=int, default=10,
-                            help="Max concurrent API requests (default: 10)")
+        parser.add_argument("--batch-size", type=int, default=None,
+                            help="Batch size for translation (default: saved setting)")
+        parser.add_argument("--min-batch-size", type=int, default=None,
+                            help="Minimum batch size before failing (default: saved setting)")
+        parser.add_argument("--max-concurrent-requests", type=int, default=None,
+                            help="Max concurrent API requests (default: saved setting)")
         parser.add_argument("--resource-pack", "-r", action="store_true", help="Enable Resource Pack Mode for JSON translation")
 
         parsed = parser.parse_args(args)
@@ -325,6 +347,8 @@ class ConfigManager:
 
     def smart_parse_key(self, entry: str) -> tuple[str, str]:
         entry = entry.strip()
+        if not entry:
+            raise ValueError("Empty API key entry")
         if "\\" in entry:
             parts = entry.split("\\", 1)
             key = parts[0].strip()
@@ -334,18 +358,32 @@ class ConfigManager:
             # Trailing backslash with no model - use key part for prefix detection
             entry = key
 
-        if entry.startswith("gsk_"):
-            return entry, "llama-3.3-70b-versatile"
-        if entry.startswith("nvapi-"):
-            return entry, "nvidia/nemotron-3-ultra"
-        if entry.startswith("sk-or-"):
-            return entry, "meta-llama/llama-3.3-70b-instruct:free"
-        if entry.startswith("oc-") or entry.startswith("opencode-"):
-            return entry, "deepseek-v4-flash"
-        if entry.startswith("cr_"):
-            return entry, "zai/GLM-5.3-Flash"
-        if entry.startswith("rp_"):
-            return entry, "glm-5-3-flash"
+        # Prefix -> provider; models come from PROVIDER_DEFAULTS (single source
+        # of truth). Order matters: longer prefixes must win over "sk-".
+        prefix_map = (
+            ("gsk_", "Groq Cloud (Fast)"),
+            ("nvapi-", "NVIDIA NIM"),
+            ("sk-or-", "OpenRouter (Cloud AI)"),
+            ("oc-", "OpenCode"),
+            ("opencode-", "OpenCode"),
+            ("cr_", "Crusoe Cloud"),
+            ("rp_", "RunInfra"),
+            ("AIza", "Google Gemini (Free API)"),
+            ("AQ.", "Google Gemini (Free API)"),
+            ("sk-proj-", "OpenAI"),
+            ("sk-ant-", "Anthropic (Claude)"),
+            ("sk-", "OpenAI"),
+            ("sn-", "Sambanova"),
+        )
+        for prefix, prov in prefix_map:
+            if entry.startswith(prefix):
+                return entry, PROVIDER_DEFAULTS.get(prov, "")
+
+        # Heuristic formats (mirror core.detect_provider)
+        if len(entry) == 36 and entry.count('-') == 4:
+            return entry, PROVIDER_DEFAULTS.get("Sambanova", "")
+        if len(entry) == 32 and entry.isalnum():
+            return entry, PROVIDER_DEFAULTS.get("Mistral AI", "")
 
         raise ValueError(f"Unknown key format or provider prefix: {entry[:10]}...")
 

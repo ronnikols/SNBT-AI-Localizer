@@ -1274,11 +1274,13 @@ class TranslationMemoryTab(QWidget):
 
 class ModelLoader(QThread):
     loaded = pyqtSignal(list, str, int, str)
-    def __init__(self, provider, api_key=None, loader_id=0):
+    def __init__(self, provider, api_key=None, loader_id=0, custom_base_url=None):
         super().__init__()
         self.provider = provider
         self.api_key = api_key
         self.loader_id = loader_id
+        self.custom_base_url = custom_base_url
+        self.cancelled = False
 
     def run(self):
         asyncio.run(self.fetch())
@@ -1312,7 +1314,8 @@ class ModelLoader(QThread):
                     elif resp.status_code in (401, 403):
                         error_msg = f"Gemini API error {resp.status_code}: Invalid or missing API key"
                 elif "Ollama" in self.provider:
-                    resp = await client.get("http://localhost:11434/v1/models", timeout=12.0)
+                    ollama_base = (self.custom_base_url or "http://localhost:11434").rstrip('/')
+                    resp = await client.get(f"{ollama_base}/v1/models", timeout=12.0)
                     if resp.status_code == 200:
                         data = resp.json()
                         models = [m["id"] for m in data.get("data", [])]
@@ -1360,10 +1363,10 @@ class ModelLoader(QThread):
                         error_msg = f"Anthropic API error {resp.status_code}: Invalid or missing API key"
                 elif "Cohere" in self.provider and self.api_key:
                     headers = {"Authorization": f"Bearer {self.api_key}"}
-                    resp = await client.get("https://api.cohere.ai/v1/models", headers=headers, timeout=12.0)
+                    resp = await client.get("https://api.cohere.com/v1/models", headers=headers, timeout=12.0)
                     if resp.status_code == 200:
                         data = resp.json()
-                        models = [m["id"] for m in data.get("models", [])]
+                        models = [m.get("name") or m.get("id") if isinstance(m, dict) else m for m in data.get("models", [])]
                     elif resp.status_code in (401, 403):
                         error_msg = f"Cohere API error {resp.status_code}: Invalid or missing API key"
                 elif "OpenCode" in self.provider:
@@ -1393,7 +1396,8 @@ class ModelLoader(QThread):
                         error_msg = f"RunInfra API error {resp.status_code}: Invalid or missing API key"
         except Exception as e:
             error_msg = f"Connection error: {str(e)}"
-        self.loaded.emit(models, error_msg, self.loader_id, self.provider)
+        if not self.cancelled:
+            self.loaded.emit(models, error_msg, self.loader_id, self.provider)
 
 class KeyVerifierWorker(QThread):
     verification_complete = pyqtSignal(dict, dict, str)
@@ -1401,16 +1405,24 @@ class KeyVerifierWorker(QThread):
     def __init__(self, specs):
         super().__init__()
         self.specs = specs
+        self.cancelled = False
 
     def run(self):
         question = random.choice(TEST_QUESTIONS)
         results = {}
         answers = {}
-        for key, provider, model in self.specs:
-            status, answer = asyncio.run(test_key_with_question(provider, key, model, question))
-            results[key] = status
-            answers[key] = answer
-        self.verification_complete.emit(results, answers, question)
+        try:
+            for key, provider, model in self.specs:
+                if self.cancelled:
+                    break
+                status, answer = asyncio.run(test_key_with_question(provider, key, model, question))
+                results[key] = status
+                answers[key] = answer
+        except Exception as e:
+            logging.getLogger("snbt_localizer.gui").error(f"Key verification failed: {repr(e)}")
+        finally:
+            # Always emit: otherwise the Test Keys button stays disabled forever
+            self.verification_complete.emit(results, answers, question)
 
 class Worker(QThread):
     log = pyqtSignal(str)
@@ -1468,7 +1480,11 @@ class Worker(QThread):
                 asyncio.run(run_with_abort_watchdog(self.process(), lambda: self.is_aborted, self.log.emit))
                 self.files = original_files
 
-            if json_files and not self.is_aborted:
+            # skip policy: SNBT files were skipped by design, JSON files must not
+            # be sent to a "SKIP"-keyed translator either (it would 401 and
+            # poison files with untranslated text)
+            skip_mode = any(k == "SKIP" for k in (self.keys or []))
+            if json_files and not self.is_aborted and not skip_mode:
                 self.log.emit("Starting Language translation (JSON)...")
                 _, target_lang_code = parse_target_lang(self.target_lang)
                 processed_dirs = set()
@@ -1588,12 +1604,10 @@ class Worker(QThread):
             async with sem:
                 await self.check_status()
                 self.log.emit(f"Processing: {f.name}")
-                logging.getLogger("snbt_localizer.gui").info(f"Processing: {f.name}")
                 file_total_strings = m.count_translatable_strings(f, self.t_titles, self.t_subs, self.t_desc)
                 file_start = time.time()
                 self._files_last_time[idx] = time.time()
                 self._files_last_strings[idx] = 0
-                m.is_aborted = self.is_aborted
                 lines_processed = await m.process_file(
                     f, self.t_titles, self.t_subs, self.t_desc,
                     lambda x: self.log.emit(str(x)),
@@ -1611,7 +1625,6 @@ class Worker(QThread):
                 self.progress_state.emit(idx, total_files, f.name, self._completed_strings, self._total_strings, eta_seconds)
                 file_elapsed = time.time() - file_start
                 self.log.emit(f"Done: {f.name} (took {file_elapsed:.1f}s)")
-                logging.getLogger("snbt_localizer.gui").info(f"Done: {f.name} (took {file_elapsed:.1f}s)")
                 async with lock:
                     completed_count += 1
                     self.progress_batch.emit(completed_count, total_files)
@@ -1866,7 +1879,8 @@ class App(QMainWindow):
             "overwrite",
             "skip"
         ])
-        self.policy_box.setCurrentText(self.settings.value("policy", "Complement"))
+        self.policy_box.setCurrentText(self.settings.value("policy", "complement"))
+        self.policy_box.currentTextChanged.connect(lambda *_: self.save_timer.start(500))
         policy_layout.addWidget(self.policy_label)
         policy_layout.addWidget(self.policy_box)
         workspace_layout.addLayout(policy_layout)
@@ -1891,6 +1905,8 @@ class App(QMainWindow):
         workspace_layout.addWidget(self.pb_batch)
 
         self.out = QTextEdit(readOnly=True)
+        # Unbounded log growth slows the widget down and leaks memory on long runs
+        self.out.document().setMaximumBlockCount(5000)
         workspace_layout.addWidget(self.out)
 
         control_layout = QHBoxLayout()
@@ -1937,6 +1953,7 @@ class App(QMainWindow):
         saved_geometry = self.settings.value("geometry")
         if saved_geometry:
             self.restoreGeometry(saved_geometry)
+        self._has_files = False
         self.load_saved_settings()
         self.populate_instances()
         self.current_provider = "INIT_STATE"
@@ -1949,7 +1966,8 @@ class App(QMainWindow):
 
         gui_logger = logging.getLogger("snbt_localizer")
         gui_logger.setLevel(logging.DEBUG)
-        gui_logger.handlers.clear()
+        # Do NOT clear handlers here: main() attached the RotatingFileHandler
+        # (app.log) - clearing it kills file logging for the whole session
         gui_handler = QtLoggingHandler(self.out)
         gui_handler.setLevel(logging.INFO)
         gui_logger.addHandler(gui_handler)
@@ -1979,12 +1997,17 @@ class App(QMainWindow):
             return
         if not hasattr(self, 'translation_memory_tab'):
             return
+        lang_name, lang_code = parse_target_lang(lang_text)
+        # Recreating the SQLite cache is expensive and spawns one table per
+        # code: only do it for complete plausible codes (ru_ru, pt-br...),
+        # never for per-keystroke fragments like "r" or "russ"
+        if not re.fullmatch(r'[a-z]{2}[-_][a-z]{2}', lang_code or ''):
+            return
         self._is_syncing_language = True
         try:
             self.translation_memory_tab.lang_filter.blockSignals(True)
             self.translation_memory_tab.lang_filter.setCurrentText(lang_text)
             self.translation_memory_tab.lang_filter.blockSignals(False)
-            lang_name, lang_code = parse_target_lang(lang_text)
             self.translation_memory_tab.set_language_code(lang_code)
             self.save_timer.start(500)
         finally:
@@ -2069,8 +2092,8 @@ class App(QMainWindow):
         self.provider_box.blockSignals(False)
         self.dir_box.blockSignals(False)
 
-    def save_current_settings(self, provider_to_save: str = None):
-        if self._is_updating_models and provider_to_save is None:
+    def save_current_settings(self, provider_to_save: str = None, force: bool = False):
+        if self._is_updating_models and provider_to_save is None and not force:
             return
         provider = provider_to_save or self.config.provider
 
@@ -2223,6 +2246,7 @@ class App(QMainWindow):
     def update_run_status(self):
         path_str = self.dir_box.itemData(self.dir_box.currentIndex())
         has_files = False
+        self._has_files = False
         if path_str and path_str != "MANUAL" and os.path.exists(path_str):
             path = Path(path_str)
             _, modpack_name = self._resolve_instance_root(path)
@@ -2257,6 +2281,7 @@ class App(QMainWindow):
             self.pb_batch.setRange(0, 100)
             self.pb_batch.setValue(0)
 
+        self._has_files = has_files
         self.btn_run.setEnabled(has_files and self.is_model_valid())
 
     def update_batch_progress(self, cur, tot):
@@ -2352,6 +2377,7 @@ class App(QMainWindow):
         self.custom_url_label.setText(locale["custom_url_label"])
         self.custom_base_url_edit.setPlaceholderText(locale["custom_url_placeholder"])
         self.lang_box.clear()
+        saved_lang = self.lang_box.currentText()
         self.lang_box.addItems([
             locale["lang_ru_ru"],
             locale["lang_es_es"],
@@ -2363,13 +2389,19 @@ class App(QMainWindow):
             locale["lang_ja_jp"],
             locale["lang_ko_kr"]
         ])
+        if saved_lang:
+            # Keep the user's selection: clear+addItems resets currentIndex to 0
+            self.lang_box.setCurrentText(saved_lang)
         self.policy_label.setText(locale["policy_label"])
+        saved_policy = self.policy_box.currentText()
         self.policy_box.clear()
         self.policy_box.addItems([
             locale["policy_complement"],
             locale["policy_overwrite"],
             locale["policy_skip"]
         ])
+        if saved_policy:
+            self.policy_box.setCurrentText(saved_policy)
         self.target_lang_label.setText(locale["target_lang_label"])
         self.dir_label.setText(locale["target_dir_label"])
         self.dir_box.setItemText(self.dir_box.count() - 1, locale["target_dir_label"])
@@ -2377,7 +2409,6 @@ class App(QMainWindow):
         self.btn_pause.setText(locale["pause"])
         self.btn_stop.setText(locale["stop"])
         self.btn_clear.setText(locale["clear_log"])
-        self.pb_batch.setFormat(locale["pool_status_unchecked"])
 
         self.provider_box.blockSignals(False)
         self.model_box.blockSignals(False)
@@ -2439,6 +2470,10 @@ class App(QMainWindow):
         self.lbl_key_status.setText("Pool Status: Verifying keys...")
         self.btn_test_keys.setEnabled(False)
 
+        # Cancel any verification still in flight before starting a new one
+        if getattr(self, 'verifier', None) is not None and self.verifier.isRunning():
+            self.verifier.cancelled = True
+
         model = self.model_box.currentText()
         if provider == "Mixed Providers":
             specs = []
@@ -2448,7 +2483,10 @@ class App(QMainWindow):
                     prov = detect_provider(key_part, model_part) or "OpenAI"
                     specs.append((k, prov, model_part or PROVIDER_DEFAULTS.get(prov, "")))
                 except ValueError:
-                    specs.append((k, provider, model))
+                    # Unrecognized format: detect by prefix instead of testing
+                    # against the "Mixed Providers" pseudo-provider (guaranteed 401)
+                    prov = detect_provider(k) or "OpenAI"
+                    specs.append((k, prov, PROVIDER_DEFAULTS.get(prov, "")))
         else:
             if not model or model in ("Loading live models...", "Enter API Key to load models", "Defined per key in pool", "None (Free Engine)"):
                 model = PROVIDER_DEFAULTS.get(provider, "")
@@ -2485,7 +2523,9 @@ class App(QMainWindow):
     def on_model_changed(self, text):
         if not self._is_updating_models:
             self.save_timer.start(500)
-        self.update_run_status()
+        # Model text does not change which files exist: reuse the cached scan
+        # result instead of re-running two full rglob scans per keystroke
+        self.btn_run.setEnabled(getattr(self, '_has_files', False) and self.is_model_valid())
 
     def on_provider_changed(self, new_provider: str):
         if new_provider == self.current_provider and not getattr(self, '_is_initializing', False):
@@ -2577,7 +2617,7 @@ class App(QMainWindow):
             self.completer.setModel(QStringListModel(["Defined per key in pool"]))
         elif "Ollama" in provider:
             self.model_box.setEnabled(True)
-            self._trigger_loader(provider, "")
+            self._trigger_loader(provider, "", self.custom_base_url_edit.text().strip() or None)
         elif provider == "Custom (OpenAI-compatible)":
             self.model_box.setEnabled(True)
             self.model_box.setEditable(True)
@@ -2609,29 +2649,39 @@ class App(QMainWindow):
         self._is_updating_models = False
         self.update_run_status()
 
-    def _trigger_loader(self, provider, key):
+    def _trigger_loader(self, provider, key, custom_base_url=None):
         self.model_box.blockSignals(True)
         self.model_box.clear()
         self.model_box.addItem("Loading live models...")
         self.completer.setModel(QStringListModel(["Loading live models..."]))
         self.model_box.blockSignals(False)
-        
+
+        # Cooperative cancel: quit() is a no-op for threads without a Qt event
+        # loop and wait() blocks the GUI thread; a cancelled loader simply
+        # drops its result. Keep references until finished so GC never
+        # destroys a running QThread.
         for loader in self.running_loaders:
-            if loader.isRunning():
-                loader.quit()
-                loader.wait(1000)
-        self.running_loaders.clear()
-        
+            loader.cancelled = True
+
         self.current_loader_id += 1
         loader_id = self.current_loader_id
-        
-        self.loader = ModelLoader(provider, key, loader_id)
-        self.loader.loaded.connect(self.on_models_loaded)
-        self.loader.start()
-        self.running_loaders.append(self.loader)
+
+        loader = ModelLoader(provider, key, loader_id, custom_base_url)
+        self.loader = loader
+        loader.loaded.connect(self.on_models_loaded)
+        loader.finished.connect(lambda l=loader: self._cleanup_loader(l))
+        loader.start()
+        self.running_loaders.append(loader)
+
+    def _cleanup_loader(self, loader):
+        if loader in self.running_loaders:
+            self.running_loaders.remove(loader)
 
     def on_models_loaded(self, models, error_msg="", loader_id=0, loader_provider=""):
         if loader_provider and loader_provider != self.provider_box.currentText():
+            return
+        # A newer loader may have been started meanwhile: drop stale results
+        if loader_id and loader_id != self.current_loader_id:
             return
         self.model_box.blockSignals(True)
         self.model_box.clear()
@@ -2730,7 +2780,7 @@ class App(QMainWindow):
 
         self.save_timer.start(500)
         prov = self.config.provider
-        policy = self.config.policy
+        policy = self.policy_box.currentText()
         
         raw_keys = self.key_pool_edit.toPlainText().strip().splitlines()
         keys = [k.strip() for k in raw_keys if k.strip()]
@@ -2742,7 +2792,7 @@ class App(QMainWindow):
                 unique_keys.append(k)
         unique_keys = unique_keys[:10]
         
-        if "Skip" in policy or "Пропустить" in policy:
+        if policy.lower().strip() == "skip":
             unique_keys = ["SKIP"]
         
         mixed_pool = None
@@ -2788,7 +2838,20 @@ class App(QMainWindow):
         if prov not in ("Google Translate (Free)", "Ollama (Local / Free)") and not unique_keys:
             QMessageBox.warning(self, "Validation Error", "Please enter at least one API Key in the API Keys Pool section.")
             return
-            
+
+        # Validate target directory BEFORE locking the UI: an early return
+        # after the disable block would leave the app permanently disabled
+        dir_path = self.dir_box.itemData(self.dir_box.currentIndex())
+        if dir_path == "MANUAL" or not dir_path:
+            QMessageBox.warning(self, "Validation Error", "Please select a valid directory first.")
+            return
+        dir_path_obj = Path(dir_path)
+        _, modpack_name = self._resolve_instance_root(dir_path_obj)
+        quest_dirs = self.instance_quest_dirs.get(dir_path_obj) or find_all_quest_dirs(dir_path_obj)
+        if not quest_dirs:
+            QMessageBox.warning(self, "Validation Error", f"No quest directories found in {dir_path}")
+            return
+
         self.btn_run.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
@@ -2818,21 +2881,6 @@ class App(QMainWindow):
         policy = self.policy_box.currentText()
         target_lang = self.lang_box.currentText()
 
-        dir_path = self.dir_box.itemData(self.dir_box.currentIndex())
-        if dir_path == "MANUAL":
-            logging.getLogger("snbt_localizer.gui").error("Error: Please select a valid directory first.")
-            return
-
-        dir_path_obj = Path(dir_path)
-        _, modpack_name = self._resolve_instance_root(dir_path_obj)
-        quest_dirs = [dir_path_obj]
-        if not quest_dirs:
-            quest_dirs = find_all_quest_dirs(dir_path_obj)
-            if not quest_dirs:
-                logging.getLogger("snbt_localizer.gui").error(f"Error: No quest directories found in {dir_path}")
-                return
-
-
         all_files = []
         for qd in quest_dirs:
             snbt_files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
@@ -2843,15 +2891,8 @@ class App(QMainWindow):
 
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
-        first_key = unique_keys[0] if unique_keys else ""
         custom_url = self.custom_base_url_edit.text() if prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
-        m = SNBTManager(
-            first_key, prov, model, custom_context, target_lang_name, target_lang_code,
-            concurrency_limit=concurrency, mixed_pool=mixed_pool, modpack=modpack_name,
-            batch_size=self.settings_tab.batch_spin.value(), min_batch_size=self.settings_tab.min_batch_spin.value(),
-            max_concurrent_requests=self.settings_tab.max_requests_spin.value(), custom_base_url=custom_url
-        )
-        
+
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
         loc_files = [p for p in all_files if lang_pattern.match(p.name)]
         chapter_files = [p for p in all_files if not lang_pattern.match(p.name)]
@@ -2939,17 +2980,28 @@ class App(QMainWindow):
         elif getattr(self.w, 'is_json_mode', False):
             self.out.append("JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
         if getattr(self, '_close_pending', False):
-            self.close()
+            # Defer close: the worker thread may still be finishing its last
+            # instructions and isRunning() would trigger a second dialog
+            self._close_pending = False
+            QTimer.singleShot(200, self.close)
 
     def closeEvent(self, event):
-        if hasattr(self, 'w') and self.w.isRunning():
+        if hasattr(self, 'w') and self.w.isRunning() and not getattr(self, '_close_pending', False):
             reply = QMessageBox.question(self, "Выход", "Идет перевод. Прервать и выйти?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                self.w.is_aborted = True
                 self._close_pending = True
+                self.w.is_aborted = True
+                self.w.is_paused = False
             event.ignore()
         else:
-            self.save_current_settings()
+            # Cooperatively stop helper threads so they don't get destroyed mid-request
+            for loader in list(self.running_loaders):
+                loader.cancelled = True
+            if getattr(self, 'verifier', None) is not None:
+                self.verifier.cancelled = True
+            for loader in list(self.running_loaders):
+                loader.wait(1500)
+            self.save_current_settings(force=True)
             self.settings.setValue("geometry", self.saveGeometry())
             event.accept()
 

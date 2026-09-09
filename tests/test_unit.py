@@ -470,6 +470,7 @@ def test_cli_mix_true_concurrency():
     mock_m.translator = MagicMock()
 
     with patch('main.SNBTManager', return_value=mock_m), \
+         patch('main.find_quests_dir', return_value=mock_quests_dir) as mock_fqd, \
          patch('main.render_cli_progress'), \
          patch('main.sys') as mock_sys:
 
@@ -487,7 +488,7 @@ def test_cli_mix_true_concurrency():
         ))
 
         assert mock_m.process_file.call_count == 5
-        assert mock_m.find_quests_dir.called
+        assert mock_fqd.called
 
 def test_fuzzy_cache_exact_match():
     import tempfile
@@ -1273,3 +1274,131 @@ def test_runinfra_smart_parse():
     assert cm.smart_parse_key("rp_test") == ("rp_test", "glm-5-3-flash")
     assert cm.smart_parse_key("rp_test\\") == ("rp_test", "glm-5-3-flash")
     assert cm.smart_parse_key("rp_test\\glm") == ("rp_test", "glm")
+
+
+def test_snbt_quote_no_double_escape():
+    """Regression: quotes in translations must be escaped exactly once."""
+    import core
+    assert core._escape_snbt_string('Он сказал "привет"') == 'Он сказал \\"привет\\"'
+    assert core.sanitize_translation_text('Он сказал "привет"') == 'Он сказал "привет"'
+
+
+def test_snbt_scanner_newline_preserved():
+    """Regression: \\n inside SNBT strings must not collapse to 'n'."""
+    import core
+    strings = core._find_all_snbt_strings('title: "Line1\\nLine2"\n')
+    assert strings[0]['value'] == 'Line1\nLine2'
+
+
+def test_snbt_scanner_quoted_keys():
+    """Quoted keys like "custom key": "value" must be recognized as keys."""
+    import core
+    strings = core._find_all_snbt_strings('"custom key": "Translate me"\n')
+    assert strings and strings[0]['key'] == 'custom key' and strings[0]['value'] == 'Translate me'
+
+
+def test_snbt_scanner_bare_value_keeps_key():
+    """Bare-word values (type: quest) must not clobber the current key."""
+    import core
+    strings = core._find_all_snbt_strings('type: quest\ntitle: "My Quest"\n')
+    by_key = {s['key']: s['value'] for s in strings if s['key']}
+    assert by_key.get('title') == 'My Quest'
+
+
+def test_detect_provider_prefixes_before_uuid():
+    import core
+    assert core.detect_provider('cr_abc123') == 'Crusoe Cloud'
+    assert core.detect_provider('rp_abc123') == 'RunInfra'
+    assert core.detect_provider('sk-abc123') == 'OpenAI'
+    assert core.detect_provider('sk-or-abc123') == 'OpenRouter (Cloud AI)'
+    # UUID heuristic still works when no explicit prefix matches
+    assert core.detect_provider('a2c3e5f7-9a1b-4c5d-8e9f-0a1b2c3d4e5f') == 'Sambanova'
+
+
+def test_get_base_url_custom_not_shadowed():
+    import core
+    assert core.get_base_url('Custom (OpenAI-compatible)') == ''
+    assert core.get_base_url('OpenAI') == 'https://api.openai.com/v1'
+
+
+def test_cache_update_records_preserves_metadata(tmp_path):
+    import core
+    cache = core.TranslationCache(db_path=str(tmp_path / 'c.db'), target_lang_code='ru_ru')
+    cache.save_batch({'a': 'б'}, modpack='Pack')
+    cache.update_records({'a': 'НОВЫЙ'})
+    trans, created, modpack = cache.conn.execute(
+        "SELECT trans, created_at, modpack FROM cache_ru_ru WHERE orig='a'"
+    ).fetchone()
+    assert trans == 'НОВЫЙ'
+    assert created is not None
+    assert modpack == 'Pack'
+    cache.close()
+
+
+def test_cache_save_batch_identity_filtered(tmp_path):
+    """Failed translations (orig == trans) must never poison the cache."""
+    import core
+    cache = core.TranslationCache(db_path=str(tmp_path / 'c.db'), target_lang_code='ru_ru')
+    cache.save_batch({'same': 'same', 'real': 'реал'}, modpack='Pack')
+    count = cache.conn.execute("SELECT COUNT(*) FROM cache_ru_ru WHERE orig='same'").fetchone()[0]
+    assert count == 0
+    count = cache.conn.execute("SELECT COUNT(*) FROM cache_ru_ru WHERE orig='real'").fetchone()[0]
+    assert count == 1
+    cache.close()
+
+
+def test_translator_survives_multiple_event_loops():
+    """Regression: GUI runs one translator through several asyncio.run() calls.
+
+    asyncio.Lock/Semaphore bind to the first loop that uses them (Python 3.10+);
+    without re-creation the second asyncio.run crashes with
+    'RuntimeError: ... is bound to a different event loop'.
+    """
+    import core
+
+    async def fake_send(texts, api_key, model, logger, check_status, context, prompt):
+        return [t.upper() for t in texts]
+
+    translator = core.UnifiedTranslator(
+        ["gsk_test"], "Groq Cloud (Fast)", "llama-3.3-70b-versatile",
+        "", "Russian", "ru_ru", max_concurrent_requests=1
+    )
+    translator.provider_instances["Groq Cloud (Fast)"] = type(
+        "FakeProvider", (), {"send_request": staticmethod(fake_send), "ping_key": AsyncMock()}
+    )()
+
+    # First loop: contend the semaphore
+    async def run_once():
+        async with translator.request_semaphore:
+            return await translator.translate(["hello"], lambda m: None, None)
+
+    r1 = asyncio.run(run_once())
+    assert r1 == ["HELLO"]
+    # Second loop must not raise
+    r2 = asyncio.run(run_once())
+    assert r2 == ["HELLO"]
+
+
+def test_doraw_pool_shrink_no_indexerror():
+    """A parallel task removing dead keys must not IndexError the pool loop."""
+    import core
+    import httpx
+
+    calls = {"n": 0}
+
+    async def flaky_send(texts, api_key, model, logger, check_status, context, prompt):
+        calls["n"] += 1
+        if api_key == "k1":
+            resp = httpx.Response(401, request=httpx.Request("POST", "http://x"))
+            raise httpx.HTTPStatusError("unauthorized", request=resp.request, response=resp)
+        return ["ok"] * len(texts)
+
+    translator = core.UnifiedTranslator(
+        ["k1", "k2"], "OpenAI", "gpt-4o-mini", "", "Russian", "ru_ru"
+    )
+    fake = type("FakeProvider", (), {"send_request": staticmethod(flaky_send), "ping_key": AsyncMock()})()
+    translator.provider_instances = {"OpenAI": fake}
+
+    result = asyncio.run(translator._do_raw_translation(["hello"], lambda m: None, None))
+    assert result == ["ok"]
+    assert calls["n"] == 2

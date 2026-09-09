@@ -34,7 +34,8 @@ def sanitize_translation_text(text: str) -> str:
     """Sanitize translation text by:
     1. Stripping whitespace
     2. Removing outer quotes if present
-    3. Escaping unescaped double quotes
+    Escaping for SNBT/JSON output is NOT done here - it is the
+    responsibility of _escape_snbt_string() / json.dump at write time.
     """
     if not isinstance(text, str):
         return text
@@ -47,13 +48,6 @@ def sanitize_translation_text(text: str) -> str:
         if (text.startswith('"') and text.endswith('"')) or \
            (text.startswith("'") and text.endswith("'")):
             text = text[1:-1]
-
-    # 3. Escape unescaped double quotes
-    # Use temporary marker to preserve already escaped quotes
-    temp_marker = "\x00ESCAPED_QUOTE\x00"
-    text = text.replace('\\"', temp_marker)
-    text = text.replace('"', '\\"')
-    text = text.replace(temp_marker, '\\"')
 
     return text
 
@@ -155,6 +149,30 @@ logger = logging.getLogger("snbt_localizer.core")
 
 EXCLUDED_DIRS = {'waydroid', 'flatpak', '.steam', '.cache', 'Trash', 'trash', '.git', 'node_modules', 'saves', 'backups', 'simplebackups'}
 
+# Shared httpx clients per event loop: avoids a new TCP+TLS handshake per request.
+# Keyed by the running loop so a second asyncio.run() (new loop) gets a fresh client.
+_shared_httpx_clients = {}
+
+def get_shared_httpx_client(timeout: float = 180.0) -> httpx.AsyncClient:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    client = _shared_httpx_clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0)
+        )
+        _shared_httpx_clients[loop] = client
+    return client
+
+def build_user_content(prompt: str, texts: List[str], context: str) -> str:
+    user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+    if context:
+        user_content += f"\n\nFile context: {context}"
+    return user_content
+
 def detect_kubejs_mode(quest_dir: Path) -> Optional[Path]:
     quest_dir = Path(quest_dir).resolve()
     chapters_dir = quest_dir / "chapters"
@@ -196,7 +214,7 @@ class OpenAIProvider(BaseProvider):
         self.custom_base_url = custom_base_url or "https://api.openai.com/v1"
 
     async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str) -> List[str]:
-        user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        user_content = build_user_content(prompt, texts, context)
         base_url = self.custom_base_url.rstrip('/')
         url = f"{base_url}/chat/completions"
         headers = {
@@ -208,16 +226,16 @@ class OpenAIProvider(BaseProvider):
             "messages": [{"role": "user", "content": user_content}],
             "temperature": 0.1
         }
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data['choices'][0]['message']['content']
-            parsed = extract_json_array(content)
-            if isinstance(parsed, list) and len(parsed) == len(texts):
-                return [str(item) for item in parsed]
-            logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
-            raise ValueError("Invalid response format")
+        client = get_shared_httpx_client()
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data['choices'][0]['message']['content']
+        parsed = extract_json_array(content)
+        if isinstance(parsed, list) and len(parsed) == len(texts):
+            return [str(item) for item in parsed]
+        logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
+        raise ValueError("Invalid response format")
 
     async def ping_key(self, api_key: str, model: str) -> str:
         base_url = self.custom_base_url.rstrip('/')
@@ -235,7 +253,7 @@ class OpenAIProvider(BaseProvider):
 
 class AnthropicProvider(BaseProvider):
     async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str) -> List[str]:
-        user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        user_content = build_user_content(prompt, texts, context)
         system_prompt = "You are a precise translation assistant. Always return a JSON array matching the input length."
         url = "https://api.anthropic.com/v1/messages"
         headers = {
@@ -245,20 +263,22 @@ class AnthropicProvider(BaseProvider):
         }
         payload = {
             "model": model,
-            "max_tokens": 4000,
+            "max_tokens": 8192,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_content}]
         }
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data['content'][0]['text']
-            parsed = extract_json_array(content)
-            if isinstance(parsed, list) and len(parsed) == len(texts):
-                return [str(item) for item in parsed]
-            logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
-            raise ValueError("Invalid response format")
+        client = get_shared_httpx_client()
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        # Thinking models put a `thinking` block first - collect ALL text blocks
+        text_parts = [b.get('text', '') for b in data.get('content', []) if isinstance(b, dict) and b.get('type') == 'text']
+        content = '\n'.join(p for p in text_parts if p)
+        parsed = extract_json_array(content)
+        if isinstance(parsed, list) and len(parsed) == len(texts):
+            return [str(item) for item in parsed]
+        logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
+        raise ValueError("Invalid response format")
 
     async def ping_key(self, api_key: str, model: str) -> str:
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
@@ -275,34 +295,40 @@ class AnthropicProvider(BaseProvider):
 
 class CohereProvider(BaseProvider):
     async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str) -> List[str]:
-        user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        user_content = build_user_content(prompt, texts, context)
         system_prompt = "You are a precise translation assistant. Always return a JSON array matching the input length."
-        url = "https://api.cohere.ai/v1/chat"
+        url = "https://api.cohere.com/v2/chat"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "content-type": "application/json"
         }
         payload = {
             "model": model,
-            "message": user_content,
+            "messages": [{"role": "user", "content": user_content}],
             "preamble": system_prompt
         }
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data['text']
-            parsed = extract_json_array(content)
-            if isinstance(parsed, list) and len(parsed) == len(texts):
-                return [str(item) for item in parsed]
-            logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
-            raise ValueError("Invalid response format")
+        client = get_shared_httpx_client()
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        # v2 returns content blocks; older responses have a plain `text` field
+        content = data.get('text') or ''
+        if not content:
+            content = '\n'.join(
+                b.get('text', '') for b in data.get('content', [])
+                if isinstance(b, dict) and b.get('text')
+            )
+        parsed = extract_json_array(content)
+        if isinstance(parsed, list) and len(parsed) == len(texts):
+            return [str(item) for item in parsed]
+        logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
+        raise ValueError("Invalid response format")
 
     async def ping_key(self, api_key: str, model: str) -> str:
         headers = {"Authorization": f"Bearer {api_key}"}
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get("https://api.cohere.ai/v1/models", headers=headers)
+                resp = await client.get("https://api.cohere.com/v1/models", headers=headers)
                 if resp.status_code == 200:
                     return "Active"
                 if resp.status_code in (401, 403):
@@ -313,7 +339,7 @@ class CohereProvider(BaseProvider):
 
 class OpenCodeProvider(BaseProvider):
     async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str) -> List[str]:
-        user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        user_content = build_user_content(prompt, texts, context)
         url = "https://opencode.ai/zen/v1/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -324,16 +350,16 @@ class OpenCodeProvider(BaseProvider):
             "messages": [{"role": "user", "content": user_content}],
             "temperature": 0.1
         }
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data['choices'][0]['message']['content']
-            parsed = extract_json_array(content)
-            if isinstance(parsed, list) and len(parsed) == len(texts):
-                return [str(item) for item in parsed]
-            logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
-            raise ValueError("Invalid response format")
+        client = get_shared_httpx_client()
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data['choices'][0]['message']['content']
+        parsed = extract_json_array(content)
+        if isinstance(parsed, list) and len(parsed) == len(texts):
+            return [str(item) for item in parsed]
+        logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
+        raise ValueError("Invalid response format")
 
     async def ping_key(self, api_key: str, model: str) -> str:
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -353,7 +379,7 @@ class OllamaProvider(BaseProvider):
         self.custom_base_url = custom_base_url or "http://localhost:11434"
 
     async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str) -> List[str]:
-        user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        user_content = build_user_content(prompt, texts, context)
         base_url = self.custom_base_url.rstrip('/')
         url = f"{base_url}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -362,16 +388,16 @@ class OllamaProvider(BaseProvider):
             "messages": [{"role": "user", "content": user_content}],
             "temperature": 0.1
         }
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data['choices'][0]['message']['content']
-            parsed = extract_json_array(content)
-            if isinstance(parsed, list) and len(parsed) == len(texts):
-                return [str(item) for item in parsed]
-            logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
-            raise ValueError("Invalid response format")
+        client = get_shared_httpx_client()
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data['choices'][0]['message']['content']
+        parsed = extract_json_array(content)
+        if isinstance(parsed, list) and len(parsed) == len(texts):
+            return [str(item) for item in parsed]
+        logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
+        raise ValueError("Invalid response format")
 
     async def ping_key(self, api_key: str, model: str) -> str:
         base_url = self.custom_base_url.rstrip('/')
@@ -461,14 +487,18 @@ def is_valid_custom_instance(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
     try:
-        files = [p for p in path.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
-        return len(files) > 0
-    except:
+        # any() with early exit - no reason to materialize the full file list
+        for p in path.rglob("*.snbt"):
+            if not any(x in p.parts for x in EXCLUDED_DIRS):
+                return True
+        return False
+    except Exception:
         return False
 
 ID_PATTERN = re.compile(r'^#?\w+:[a-z0-9_/]+$')
 UUID_PATTERN = re.compile(r'^[0-9a-fA-F\-]{36}$')
 TAIL_PATTERN = re.compile(r'(?:[.,!?;:\s]|§[0-9a-fk-orA-FK-ORr])+$')
+TAG_SHIELD_PATTERN = re.compile(r'#\w+:[a-zA-Z0-9_/-]+')
 
 class AbortException(Exception):
     pass
@@ -522,7 +552,11 @@ def parse_target_lang(lang_str):
     return lang_str, lang_str.lower()[:5]
 
 def _escape_snbt_string(s: str) -> str:
-    return s.replace('\\', '\\\\').replace('"', '\\"')
+    s = s.replace('\\', '\\\\').replace('"', '\\"')
+    s = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    return s
+
+SNBT_UNESCAPE_MAP = {'n': '\n', 't': '\t', 'r': '\r', 'f': '\f', 'b': '\b', '0': '\0'}
 
 def _find_all_snbt_strings(content: str) -> list:
     results = []
@@ -541,17 +575,24 @@ def _find_all_snbt_strings(content: str) -> list:
             i += 1
 
     def save_string():
-        nonlocal in_string, string_chars, string_start
+        nonlocal in_string, string_chars, string_start, current_key
         if in_string:
             value = ''.join(string_chars)
-            results.append({
-                'key': current_key,
-                'value': value,
-                'content_start': string_start,
-                'content_end': i - 1,
-                'full_start': string_start - 1,
-                'full_end': i
-            })
+            # Lookahead: if a ':' follows the closing quote, this string is a KEY
+            j = i + 1
+            while j < n and content[j] in ' \t\n\r':
+                j += 1
+            if j < n and content[j] == ':':
+                current_key = value
+            else:
+                results.append({
+                    'key': current_key,
+                    'value': value,
+                    'content_start': string_start,
+                    'content_end': i - 1,
+                    'full_start': string_start - 1,
+                    'full_end': i
+                })
             in_string = False
             string_chars = []
 
@@ -559,7 +600,7 @@ def _find_all_snbt_strings(content: str) -> list:
         c = content[i]
 
         if escape_next:
-            string_chars.append(c)
+            string_chars.append(SNBT_UNESCAPE_MAP.get(c, c))
             escape_next = False
             i += 1
             continue
@@ -601,16 +642,17 @@ def _find_all_snbt_strings(content: str) -> list:
             continue
 
         if c.isalpha() or c == '_' or c == '.':
-            key_start = i
             key_chars = []
             while i < n and (content[i].isalnum() or content[i] in '_.-'):
                 key_chars.append(content[i])
                 i += 1
-            current_key = ''.join(key_chars)
             skip_whitespace()
             if i < n and content[i] == ':':
+                # Bare-word key (e.g. `title: "..."`)
+                current_key = ''.join(key_chars)
                 i += 1
                 skip_whitespace()
+            # Bare-word VALUE (e.g. `type: quest`) must NOT clobber current_key
             continue
 
         i += 1
@@ -722,6 +764,12 @@ class TranslationCache:
     def save_batch(self, mapping: Dict[str, str], modpack=None):
         with self.lock:
             clean_mapping = self._sanitize_mapping(mapping)
+            # Anti-poisoning: never persist identity pairs. A failed translation
+            # falls back to the original text - caching it would permanently
+            # mark untranslated text as translated.
+            clean_mapping = {k: v for k, v in clean_mapping.items() if k != v}
+            if not clean_mapping:
+                return
             if modpack is None:
                 self.conn.executemany(
                     f"INSERT OR REPLACE INTO {self.table_name} (orig, trans, created_at) VALUES (?, ?, strftime('%s', 'now'))",
@@ -751,8 +799,6 @@ class TranslationCache:
             self.conn.commit()
             self.conn.execute("VACUUM")
             self.conn.commit()
-            self.conn.execute("VACUUM")
-            self.conn.commit()
 
     def clear_all(self):
         with self.lock:
@@ -761,8 +807,6 @@ class TranslationCache:
             tables = cursor.fetchall()
             for (table_name,) in tables:
                 self.conn.execute(f"DELETE FROM {table_name}")
-            self.conn.commit()
-            self.conn.execute("VACUUM")
             self.conn.commit()
             self.conn.execute("VACUUM")
             self.conn.commit()
@@ -795,14 +839,17 @@ class TranslationCache:
     def update_records(self, updates, modpack=None):
         with self.lock:
             clean_updates = self._sanitize_mapping(updates)
-            if modpack is None:
+            # ON CONFLICT ... DO UPDATE keeps created_at / modpack of the existing row
+            # (INSERT OR REPLACE would wipe them to NULL)
+            self.conn.executemany(
+                f"INSERT INTO {self.table_name} (orig, trans) VALUES (?, ?) "
+                f"ON CONFLICT(orig) DO UPDATE SET trans=excluded.trans",
+                list(clean_updates.items())
+            )
+            if modpack is not None:
                 self.conn.executemany(
-                    f"INSERT OR REPLACE INTO {self.table_name} (orig, trans) VALUES (?, ?)",
-                    list(clean_updates.items())
-                )
-            else:
-                self.conn.executemany(
-                    f"INSERT OR REPLACE INTO {self.table_name} (orig, trans, modpack) VALUES (?, ?, ?)",
+                    f"INSERT INTO {self.table_name} (orig, trans, modpack) VALUES (?, ?, ?) "
+                    f"ON CONFLICT(orig) DO UPDATE SET trans=excluded.trans, modpack=excluded.modpack",
                     [(k, v, modpack) for k, v in clean_updates.items()]
                 )
             self.conn.commit()
@@ -822,23 +869,29 @@ class TranslationCache:
 
 class GoogleFreeTranslator:
     async def translate(self, texts: List[str], target_lang_code: str = "ru_ru") -> List[str]:
-        import httpx
-        import urllib.parse
-        import json
         try:
             lang = target_lang_code.split('_')[0]
-            query = urllib.parse.quote(json.dumps(texts, ensure_ascii=False))
-            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={lang}&dt=t&q={query}"
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            client = get_shared_httpx_client(timeout=30.0)
+            results = []
+            for text in texts:
+                if not text:
+                    results.append(text)
+                    continue
+                query = urllib.parse.quote(text)
+                url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={lang}&dt=t&q={query}"
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()
                 if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list) and len(data[0]) > 0:
-                    return [item[0] for item in data[0]]
-                return texts
+                    # Google splits a single input into multiple segments - join them back
+                    translated = ''.join(str(item[0]) for item in data[0] if isinstance(item, list) and len(item) > 0)
+                    results.append(translated)
+                else:
+                    raise ValueError(f"Unexpected Google Translate response format for text: {text[:50]}")
+            return results
         except Exception as e:
             logging.getLogger("snbt_localizer.core").error(f"Google Translate Error: {repr(e)}")
-            return texts
+            raise ValueError(f"Google Translate error: {repr(e)}") from e
 def detect_provider(api_key: str, model_name: str = "") -> str:
     if api_key.startswith("gsk_"):
         return "Groq Cloud (Fast)"
@@ -848,18 +901,19 @@ def detect_provider(api_key: str, model_name: str = "") -> str:
         return "OpenRouter (Cloud AI)"
     if api_key.startswith("AIza") or api_key.startswith("AQ."):
         return "Google Gemini (Free API)"
-    if api_key.startswith("sn-") or (len(api_key) == 36 and api_key.count('-') == 4):
-        return "Sambanova"
-    if len(api_key) == 32 and api_key.isalnum():
-        return "Mistral AI"
-    if api_key.startswith("sk-proj-") or (api_key.startswith("sk-") and not api_key.startswith("sk-or-")):
-        return "OpenAI"
     if api_key.startswith("oc-"):
         return "OpenCode"
     if api_key.startswith("cr_"):
         return "Crusoe Cloud"
     if api_key.startswith("rp_"):
         return "RunInfra"
+    if api_key.startswith("sk-proj-") or (api_key.startswith("sk-") and not api_key.startswith("sk-or-")):
+        return "OpenAI"
+    # Heuristic checks LAST: explicit prefixes must win over format guessing
+    if api_key.startswith("sn-") or (len(api_key) == 36 and api_key.count('-') == 4):
+        return "Sambanova"
+    if len(api_key) == 32 and api_key.isalnum():
+        return "Mistral AI"
     return None
 
 def get_default_model(provider: str) -> str:
@@ -882,8 +936,6 @@ def get_base_url(provider: str) -> str:
         return "https://api.sambanova.ai/v1"
     if "Ollama" in provider:
         return "http://localhost:11434/v1"
-    if "OpenAI" in provider:
-        return "https://api.openai.com/v1"
     if "OpenCode" in provider:
         return "https://opencode.ai/zen/v1"
     if "Crusoe" in provider:
@@ -895,9 +947,13 @@ def get_base_url(provider: str) -> str:
     if "Anthropic" in provider:
         return "https://api.anthropic.com/v1"
     if "Cohere" in provider:
-        return "https://api.cohere.ai/v1"
-    if "Custom (OpenAI-compatible)" in provider:
+        return "https://api.cohere.com/v2"
+    # Custom check MUST precede the generic OpenAI fallback,
+    # otherwise "OpenAI" in "Custom (OpenAI-compatible)" matches first
+    if "Custom" in provider:
         return ""
+    if "OpenAI" in provider:
+        return "https://api.openai.com/v1"
     return "https://api.openai.com/v1"
 
 def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider):
@@ -1009,24 +1065,7 @@ class UnifiedTranslator:
                     if not prov:
                         prov = "OpenAI"
                     if not model_part:
-                        if key_part.startswith("gsk_"):
-                            model_part = "llama-3.3-70b-versatile"
-                            prov = "Groq Cloud (Fast)"
-                        elif key_part.startswith("nvapi-"):
-                            model_part = "nvidia/nemotron-3-ultra"
-                            prov = "NVIDIA NIM"
-                        elif key_part.startswith("sk-or-") or key_part.startswith("sk-"):
-                            model_part = "meta-llama/llama-3.3-70b-instruct:free"
-                            prov = "OpenRouter (Cloud AI)"
-                        elif key_part.startswith("oc-") or key_part.startswith("opencode-"):
-                            model_part = "deepseek-v4-flash"
-                            prov = "OpenCode"
-                        elif key_part.startswith("cr_"):
-                            model_part = "zai/GLM-5.3-Flash"
-                            prov = "Crusoe Cloud"
-                        elif key_part.startswith("rp_"):
-                            model_part = "glm-5-3-flash"
-                            prov = "RunInfra"
+                        model_part = get_default_model(prov)
                     mdl = model_part if model_part else get_default_model(prov)
                     base = get_base_url(prov)
                     self.mixed_pool.append({"provider": prov, "api_key": key_part, "model": mdl, "base_url": base})
@@ -1035,6 +1074,10 @@ class UnifiedTranslator:
                 raise ValueError(f"No API keys provided for provider: {provider}")
             for key in cleaned:
                 self.mixed_pool.append({"provider": provider, "api_key": key, "model": model, "base_url": get_base_url(provider)})
+            if not self.mixed_pool and provider == "Ollama (Local / Free)":
+                # Ollama needs no key: without a dummy entry the pool is empty
+                # and every translation raises "No providers configured"
+                self.mixed_pool.append({"provider": provider, "api_key": "", "model": model, "base_url": get_base_url(provider)})
 
         context_str = f"<user_context>{custom_context}</user_context>" if custom_context else "Modpack FTB Quests context."
         self.prompt = (
@@ -1058,6 +1101,24 @@ class UnifiedTranslator:
                     base_url = custom_base_url
                 self.provider_instances[prov] = get_provider_class(prov, base_url)
 
+    def _ensure_loop_primitives(self):
+        """Recreate loop-bound asyncio primitives when the running loop changes.
+
+        asyncio.Lock/Semaphore bind to the first event loop that contends them
+        (Python 3.10+ _LoopBoundMixin). The GUI runs the SAME translator through
+        multiple asyncio.run() calls (SNBT phase, then one per JSON base_dir) -
+        without this, the second run crashes with
+        'RuntimeError: ... bound to a different event loop'.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if getattr(self, "_primitives_loop", None) is not loop:
+            self.pool_lock = asyncio.Lock()
+            self.request_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+            self._primitives_loop = loop
+
     async def ping_key(self, api_key: str, provider: str, model: str) -> str:
         if "Google Translate" in provider or "Ollama" in provider:
             return "Active"
@@ -1069,7 +1130,9 @@ class UnifiedTranslator:
         if not texts:
             return []
 
-        tag_pattern = re.compile(r'#\w+:[a-zA-Z0-9_/-]+')
+        self._ensure_loop_primitives()
+
+        tag_pattern = TAG_SHIELD_PATTERN
         shielded_texts = []
         restoration_maps = []
 
@@ -1136,27 +1199,27 @@ class UnifiedTranslator:
         if not self.mixed_pool:
             raise ValueError("No providers configured in mixed pool")
 
-        context = context if context else ""
-        truncated_context = context[:2000] if len(context) > 2000 else context
-        user_content = f"Instructions: {self.prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
-        if truncated_context:
-            user_content += f"\n\nContext: {truncated_context}"
         BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
-        max_attempts = len(BACKOFF_DELAYS) if not any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 1
+        max_attempts = len(BACKOFF_DELAYS)
         res = None
 
         for attempt in range(max_attempts):
             if check_status:
                 await check_status()
 
-            pool_size = len(self.mixed_pool)
             tried = 0
-            while tried < pool_size:
+            # pool length is re-checked every iteration: parallel tasks can
+            # remove dead keys (401/403) mid-flight, and a stale snapshot
+            # would cause an IndexError on self.mixed_pool[idx]
+            while tried < max(len(self.mixed_pool), 1):
                 if check_status:
                     await check_status()
-                idx = self.key_index % pool_size
+                pool = list(self.mixed_pool)
+                if not pool:
+                    raise AbortException("All API keys failed with 401/403.")
+                idx = self.key_index % len(pool)
                 self.key_index += 1
-                entry = self.mixed_pool[idx]
+                entry = pool[idx]
                 now = time.time()
 
                 if entry["api_key"] in self.key_cooldown_until and now < self.key_cooldown_until[entry["api_key"]]:
@@ -1173,68 +1236,77 @@ class UnifiedTranslator:
                         model_name = entry.get("model", self.model) or ''
                         raw_key = str(entry.get("api_key") or "")
                         key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                        if model_name:
-                            logging.getLogger("snbt_localizer.core").error(f"[{context}] Google Translate Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})")
-                        else:
-                            logging.getLogger("snbt_localizer.core").error(f"[{context}] Google Translate Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})")
-                        break
-                provider_instance = self.provider_instances.get(provider_name)
-                if provider_instance:
-                    try:
-                        res = await provider_instance.send_request(texts, entry["api_key"], entry["model"], logger, check_status, context, self.prompt)
-                        self.key_backoff[entry["api_key"]] = 0
-                        break
-                    except httpx.TimeoutException:
-                        api_key = str(entry["api_key"])
-                        self.key_cooldown_until[entry["api_key"]] = now + 150.0
-                        key_suffix = api_key[-4:] if len(api_key) > 4 else api_key
-                        logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
+                        logging.getLogger("snbt_localizer.core").error(f"[{context}] Google Translate Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})")
                         tried += 1
                         continue
-                    except httpx.HTTPStatusError as e:
-                        status = e.response.status_code
-                        reason = getattr(e.response, 'reason_phrase', '') or ''
-                        model_name = entry.get("model", self.model) or ''
-                        raw_key = str(entry.get("api_key") or "")
-                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                        if model_name:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        else:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        if status in (401, 403):
-                            async with self.pool_lock:
-                                if entry in self.mixed_pool:
-                                    self.mixed_pool.remove(entry)
-                                self.key_index = 0
-                                if not self.mixed_pool:
-                                    raise AbortException("All API keys failed with 401/403.")
-                            continue
-                        elif status == 429:
-                            current_backoff = self.key_backoff.get(entry["api_key"], 0)
-                            delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
-                            self.key_cooldown_until[entry["api_key"]] = now + delay
-                            self.key_backoff[entry["api_key"]] = current_backoff + 1
-                            logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
-                            tried += 1
-                            continue
-                        break
-                    except Exception as e:
-                        model_name = entry.get("model", self.model) or ''
-                        raw_key = str(entry.get("api_key") or "")
-                        key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
-                        if model_name:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        else:
-                            logging.getLogger("snbt_localizer.core").error(
-                                f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
-                            )
-                        break
+                provider_instance = self.provider_instances.get(provider_name)
+                if provider_instance is None:
+                    # Unknown provider in pool: skip WITHOUT stalling the loop
+                    logger(f"No provider instance for '{provider_name}', skipping key ...{str(entry.get('api_key', ''))[-4:]}")
+                    tried += 1
+                    continue
+                try:
+                    res = await provider_instance.send_request(texts, entry["api_key"], entry["model"], logger, check_status, context, self.prompt)
+                    self.key_backoff[entry["api_key"]] = 0
+                    break
+                except httpx.TimeoutException:
+                    api_key = str(entry["api_key"])
+                    # fresh timestamp: after a 180s request the pre-request
+                    # `now` is already in the past and the cooldown never applies
+                    self.key_cooldown_until[api_key] = time.time() + 150.0
+                    key_suffix = api_key[-4:] if len(api_key) > 4 else api_key
+                    logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
+                    tried += 1
+                    continue
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    reason = getattr(e.response, 'reason_phrase', '') or ''
+                    model_name = entry.get("model", self.model) or ''
+                    raw_key = str(entry.get("api_key") or "")
+                    key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                    if model_name:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    else:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] HTTP Error {status} ({reason}) on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    if status in (401, 403):
+                        async with self.pool_lock:
+                            if entry in self.mixed_pool:
+                                self.mixed_pool.remove(entry)
+                            self.key_index = 0
+                            if not self.mixed_pool:
+                                raise AbortException("All API keys failed with 401/403.")
+                        continue
+                    elif status == 429:
+                        current_backoff = self.key_backoff.get(entry["api_key"], 0)
+                        delay = BACKOFF_DELAYS[min(current_backoff, len(BACKOFF_DELAYS) - 1)]
+                        self.key_cooldown_until[entry["api_key"]] = time.time() + delay
+                        self.key_backoff[entry["api_key"]] = current_backoff + 1
+                        logging.getLogger("snbt_localizer.core").warning(f"Rate limit on key ending ...{key_suffix}. Backoff: {delay:.1f}s.")
+                        tried += 1
+                        continue
+                    else:
+                        # 5xx and other errors: try the NEXT key instead of
+                        # sleeping the whole pipeline (other keys may be healthy)
+                        tried += 1
+                        continue
+                except Exception as e:
+                    model_name = entry.get("model", self.model) or ''
+                    raw_key = str(entry.get("api_key") or "")
+                    key_suffix = raw_key[-4:] if len(raw_key) > 4 else raw_key
+                    if model_name:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] using model [{model_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    else:
+                        logging.getLogger("snbt_localizer.core").error(
+                            f"[{context}] Network/Execution Error: {repr(e)} on [{provider_name}] (key: ...{key_suffix}) (Attempt {attempt+1}/{max_attempts})"
+                        )
+                    tried += 1
+                    continue
 
             if res is not None:
                 break
@@ -1255,6 +1327,18 @@ class UnifiedTranslator:
         if res is None:
             raise ValueError("Failed to translate chunk as a valid JSON array of correct length.")
         return res
+
+def find_quests_dir(start_path: Path) -> Path:
+    direct = Path(start_path) / "config" / "ftbquests" / "quests"
+    if direct.exists() and direct.is_dir():
+        return direct
+    for root, dirs, _ in os.walk(start_path):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        if "ftbquests" in root and "quests" in root:
+            p = Path(root)
+            if p.is_dir():
+                return p
+    return Path(start_path)
 
 class SNBTManager:
     def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None, custom_base_url: Optional[str] = None, modpack_root: Optional[Path] = None):
@@ -1316,16 +1400,7 @@ class SNBTManager:
         return len(text) > 1 and not ID_PATTERN.match(text) and not UUID_PATTERN.match(text) and not text.startswith('{')
 
     def find_quests_dir(self, start_path: Path) -> Path:
-        direct = start_path / "config" / "ftbquests" / "quests"
-        if direct.exists() and direct.is_dir():
-            return direct
-        for root, dirs, _ in os.walk(start_path):
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
-            if "ftbquests" in root and "quests" in root:
-                p = Path(root)
-                if p.is_dir():
-                    return p
-        return start_path
+        return find_quests_dir(start_path)
 
     async def process_file(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool, logger=print, check_status=None, policy="complement", progress_callback=None) -> int:
         if self.skip_mode:
@@ -1342,11 +1417,14 @@ class SNBTManager:
         if is_loc_file:
             target_name = f"{self.target_lang_code}.snbt"
             target_path = filepath.parent / target_name
+            # Source == target (e.g. running on ru_ru.snbt with ru_ru goal):
+            # translating it in place would corrupt the file
+            if target_path == filepath:
+                return 0
 
             content = ""
             async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
-                async for line in f:
-                    content += line
+                content = await f.read()
 
             if not is_overwrite:
                 target_content = ""
@@ -1360,20 +1438,17 @@ class SNBTManager:
                     return 0
                 current_translated_content = target_content if is_ru_file else ""
             else:
+                # Do NOT unlink the old translation up front: os.replace()
+                # below overwrites atomically; an early unlink loses the file
+                # if anything fails before the write
                 current_translated_content = ""
-                if target_path.exists():
-                    try:
-                        target_path.unlink()
-                    except Exception:
-                        pass
         else:
             target_path = filepath
             bak_path = filepath.with_suffix('.snbt.bak')
 
             disk_content = ""
             async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
-                async for line in f:
-                    disk_content += line
+                disk_content = await f.read()
 
             is_ru_file = bak_path.exists() and bak_path.stat().st_size > 0
             if is_ru_file and not is_overwrite:
@@ -1390,7 +1465,7 @@ class SNBTManager:
         if is_ru_file:
             if policy_normalized == "skip":
                 logger(f"Skipping already translated file: {target_path.name}")
-                return
+                return 0
 
             if is_overwrite:
                 backup_dir = filepath.parent / "backup"
@@ -1410,6 +1485,26 @@ class SNBTManager:
                 if k in ru_map and ru_map[k] != v:
                     mapping[v] = ru_map[k]
 
+        def apply_mapping_to_content(source_content: str) -> str:
+            """Positional replacement by scanner offsets - single pass, join-based.
+            Substring .replace() is unsafe: unescaped quotes/values break SNBT."""
+            translatable = _find_all_snbt_strings(source_content)
+            filtered = [
+                s for s in translatable
+                if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc) and s['value'] in mapping
+            ]
+            if not filtered:
+                return source_content
+            filtered.sort(key=lambda x: x['content_start'])
+            parts = []
+            last = 0
+            for s in filtered:
+                parts.append(source_content[last:s['content_start']])
+                parts.append(_escape_snbt_string(mapping[s['value']]))
+                last = s['content_end'] + 1
+            parts.append(source_content[last:])
+            return ''.join(parts)
+
         all_strings = _find_all_snbt_strings(content)
         target_texts = set()
         def should_translate(text: str) -> bool:
@@ -1424,21 +1519,31 @@ class SNBTManager:
         if not texts:
             logger(f"No new untranslated texts in {filepath.name}.")
             logging.getLogger("snbt_localizer.core").info(f"No new untranslated texts in {filepath.name}.")
-            if is_ru_file and is_overwrite:
-                final_content = content
-                for orig in sorted(mapping.keys(), key=len, reverse=True):
-                    final_content = final_content.replace(f'"{orig}"', f'"{mapping[orig]}"')
-                target_path.write_text(final_content, 'utf-8')
+            if is_ru_file and is_overwrite and mapping:
+                final_content = apply_mapping_to_content(content)
+                tmp_path = target_path.with_suffix('.snbt.tmp')
+                try:
+                    async with aiofiles.open(tmp_path, 'w', encoding='utf-8') as f:
+                        await f.write(final_content)
+                    os.replace(tmp_path, target_path)
+                except BaseException:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
             return 0
 
         if is_overwrite:
             to_trans = texts
             mapping.clear()
         else:
-            to_trans = [t for t in texts if not self.cache.get(t)]
+            # Single cache pass: collect hits and misses together instead of
+            # calling the expensive fuzzy cache.get() twice per string
+            to_trans = []
             for t in texts:
                 c = self.cache.get(t)
-                if c: mapping[t] = c
+                if c:
+                    mapping[t] = c
+                else:
+                    to_trans.append(t)
 
         try:
             chunk_size = 5 if "Ollama" in self.provider else self.batch_size
@@ -1497,38 +1602,27 @@ class SNBTManager:
                     next_chunk = to_trans[i+chunk_size:i+chunk_size*2]
                     next_to_send = [t for t in next_chunk if t not in mapping]
                     if next_to_send:
-                        await countdown_sleep(3, "Delay between chunks", logger, check_status)
+                        # With several keys in the pool round-robin rotation spreads
+                        # the load; the fixed 3s throttle is only needed for small pools
+                        pool_len = max(1, len(getattr(self.translator, 'mixed_pool', []) or []))
+                        if pool_len < 4:
+                            await countdown_sleep(3, "Delay between chunks", logger, check_status)
         except AbortException:
             logger(f"Aborted processing of {filepath.name}.")
             logging.getLogger("snbt_localizer.core").warning(f"Aborted processing of {filepath.name}.")
             raise
 
-        translatable_strings = _find_all_snbt_strings(content)
-        filtered_strings = []
-        for s in translatable_strings:
-            if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
-                filtered_strings.append(s)
-
-        filtered_strings.sort(key=lambda x: x['content_start'], reverse=True)
-
-        final_content = content
-        for s in filtered_strings:
-            orig = s['value']
-            if orig in mapping:
-                translated = mapping[orig]
-                escaped = _escape_snbt_string(translated)
-                before = final_content[:s['content_start']]
-                after = final_content[s['content_end']+1:]
-                final_content = before + escaped + after
+        final_content = apply_mapping_to_content(content)
 
         if is_loc_file:
             tmp_path = target_path.with_suffix('.snbt.tmp')
             try:
                 async with aiofiles.open(tmp_path, 'w', encoding='utf-8') as f:
                     await f.write(final_content)
-                if self.is_aborted:
-                    tmp_path.unlink(missing_ok=True)
-                    return
+                # Live abort check (check_status raises AbortException): a stale
+                # is_aborted snapshot never reflected a mid-run Stop
+                if check_status:
+                    await check_status()
                 os.replace(tmp_path, target_path)
                 logger(f"Localization updated: {target_path.name}")
             except BaseException:
@@ -1545,9 +1639,8 @@ class SNBTManager:
             try:
                 async with aiofiles.open(tmp_path, 'w', encoding='utf-8') as f:
                     await f.write(final_content)
-                if self.is_aborted:
-                    tmp_path.unlink(missing_ok=True)
-                    return
+                if check_status:
+                    await check_status()
                 os.replace(tmp_path, filepath)
                 logger(f"In-place file updated: {filepath.name}")
             except BaseException:
@@ -1646,10 +1739,17 @@ class JSONManager:
             target_lang = self.target_lang_code.lower().replace("-", "_")
             if self.resource_pack_mode:
                 modpack_root = self.base_dir
+                found_root = False
                 while len(modpack_root.parts) > 1:
                     if (modpack_root / "mods").is_dir() or (modpack_root / "config").is_dir() or (modpack_root / "kubejs").is_dir():
+                        found_root = True
                         break
                     modpack_root = modpack_root.parent
+                if not found_root:
+                    # Never mkdir resourcepacks on an arbitrary ancestor (could
+                    # hit the filesystem root); fall back to the instance dir
+                    log_callback(f"Modpack root not found for resource pack mode, using {self.base_dir}")
+                    modpack_root = self.modpack_root or self.base_dir
                 pack_dir = modpack_root / "resourcepacks" / f"Modpack_Local_{target_lang}"
                 pack_mcmeta_path = pack_dir / "pack.mcmeta"
                 if not pack_mcmeta_path.exists():
@@ -1679,8 +1779,13 @@ class JSONManager:
                 self.translator.prompt += f" {build_mod_context(self.modpack_root)}"
 
             source_data = {}
-            with open(source_file, 'r', encoding='utf-8') as f:
-                source_data = json.load(f)
+            try:
+                with open(source_file, 'r', encoding='utf-8') as f:
+                    source_data = json.load(f)
+            except Exception as e:
+                # One broken en_us.json must not kill the whole JSON phase
+                log_callback(f"Failed to read {source_file}: {e}. Skipping directory.")
+                continue
 
             target_data = {}
             policy_normalized = self.policy.lower().split('(')[0].strip()
@@ -1770,8 +1875,14 @@ class JSONManager:
                 except Exception:
                     pass
 
-            with open(target_file, 'w', encoding='utf-8') as f:
-                json.dump(result_data, f, ensure_ascii=False, indent=4)
+            tmp_target = target_file.with_name(target_file.name + ".tmp")
+            try:
+                with open(tmp_target, 'w', encoding='utf-8') as f:
+                    json.dump(result_data, f, ensure_ascii=False, indent=4)
+                os.replace(tmp_target, target_file)
+            except BaseException:
+                tmp_target.unlink(missing_ok=True)
+                raise
 
         if self.progress_callback:
             self.progress_callback(total_translated, total_strings)
