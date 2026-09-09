@@ -111,15 +111,18 @@ Pluralization Guard — это продвинутая система нечёт�
 | Groq Cloud (Fast) | llama-3.3-70b-versatile | Да | Низкая задержка |
 | NVIDIA NIM | nvidia/nemotron-4-340b-instruct | Да | Корпоративные модели |
 | OpenRouter (Cloud AI) | google/gemma-4-31b:free | Да | 100+ бесплатных моделей |
-| Google Gemini (Free API) | models/gemini-3.1-flash-lite | Да | Последняя бесплатная модель |
+| Google Gemini (Free API) | models/gemini-flash-lite-latest | Да | Последняя бесплатная модель |
 | Sambanova | DeepSeek-V3.1 | Нет | Высокопроизводительный инференс |
 | OpenAI | gpt-4o-mini | Нет | Оптимизировано для скорости |
 | Mistral AI | mistral-large-latest | Нет | Фронтирные открытые модели |
 | Anthropic (Claude) | claude-3-5-sonnet-20241022 | Нет | Высококачественные ответы |
 | Cohere | command-r-plus | Нет | Готовность для продакшн |
+| OpenCode | deepseek-v4-flash | Да | Инференс OpenCode Zen |
+| Crusoe Cloud | zai/GLM-5.3-Flash | Да | OpenAI-совместимый serverless-инференс, $5 бесплатных кредитов |
+| RunInfra | glm-5-3-flash | Да | OpenAI-совместимый инференс открытых моделей (ключи `rp_`, env `RUNINFRA_GATEWAY_KEY`) |
 | Ollama (Local / Free) | qwen2.5:7b | Да | Самостоятельный хостинг |
 | Google Translate (Free) | N/A | Да | Традиционный MT, без API-ключа |
-| Local LLM / Custom | (Пользовательская) | Да | Пользовательские локальные модели |
+| Custom (OpenAI-compatible) | (Пользовательская) | Да | Пользовательские OpenAI-совместимые эндпоинты |
 
 ## Обратная связь и предложения
 Для предложений, поддержки и сообщений об ошибках:

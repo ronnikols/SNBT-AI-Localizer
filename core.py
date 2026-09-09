@@ -135,7 +135,7 @@ def clean_and_unpack_string(text: str) -> str:
 
 PROVIDER_DEFAULTS = {
     "Google Translate (Free)": None,
-    "Google Gemini (Free API)": "models/gemini-3.1-flash-lite",
+    "Google Gemini (Free API)": "models/gemini-flash-lite-latest",
     "Ollama (Local / Free)": "qwen2.5:7b",
     "Groq Cloud (Fast)": "llama-3.3-70b-versatile",
     "OpenRouter (Cloud AI)": "google/gemma-4-31b:free",
@@ -145,7 +145,10 @@ PROVIDER_DEFAULTS = {
     "Mistral AI": "mistral-large-latest",
     "Anthropic (Claude)": "claude-3-5-sonnet-20241022",
     "Cohere": "command-r-plus",
-    "Local LLM / Custom": "",
+    "OpenCode": "deepseek-v4-flash",
+    "Crusoe Cloud": "zai/GLM-5.3-Flash",
+    "RunInfra": "glm-5-3-flash",
+    "Custom (OpenAI-compatible)": "",
 }
 
 logger = logging.getLogger("snbt_localizer.core")
@@ -308,6 +311,43 @@ class CohereProvider(BaseProvider):
         except Exception:
             return "Unreachable"
 
+class OpenCodeProvider(BaseProvider):
+    async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str) -> List[str]:
+        user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        url = "https://opencode.ai/zen/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": user_content}],
+            "temperature": 0.1
+        }
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data['choices'][0]['message']['content']
+            parsed = extract_json_array(content)
+            if isinstance(parsed, list) and len(parsed) == len(texts):
+                return [str(item) for item in parsed]
+            logger(f"[DEBUG] Invalid Response Format! Expected: {len(texts)}, Got: {len(parsed) if isinstance(parsed, list) else type(parsed)}. Raw Content: {content}")
+            raise ValueError("Invalid response format")
+
+    async def ping_key(self, api_key: str, model: str) -> str:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://opencode.ai/zen/v1/models", headers=headers)
+                if resp.status_code == 200:
+                    return "Active"
+                if resp.status_code in (401, 403):
+                    return "Invalid"
+                return "Unreachable"
+        except Exception:
+            return "Unreachable"
+
 class OllamaProvider(BaseProvider):
     def __init__(self, custom_base_url: Optional[str] = None):
         self.custom_base_url = custom_base_url or "http://localhost:11434"
@@ -365,9 +405,57 @@ def get_provider_class(provider: str, custom_base_url: Optional[str] = None) -> 
         "Ollama (Local / Free)": OllamaProvider(base_url),
         "Anthropic (Claude)": AnthropicProvider(),
         "Cohere": CohereProvider(),
-        "Local LLM / Custom": OpenAIProvider(base_url),
+        "OpenCode": OpenCodeProvider(),
+        "Crusoe Cloud": OpenAIProvider(base_url),
+        "RunInfra": OpenAIProvider(base_url),
+        "Custom (OpenAI-compatible)": OpenAIProvider(base_url),
     }
     return provider_map.get(provider, OpenAIProvider(base_url))
+
+TEST_QUESTIONS = [
+    "What color is the sky on a clear day?",
+    "What animal says 'meow'?",
+    "How many legs does a spider have?",
+    "What is the opposite of 'hot'?",
+    "What planet do we live on?",
+    "What do bees make?",
+    "What is 2 + 2?",
+    "What season comes after winter?",
+    "What is the largest ocean on Earth?",
+    "What animal is known as man's best friend?",
+    "What liquid do fish live in?",
+    "What color is grass?",
+]
+
+async def test_key_with_question(provider: str, api_key: str, model: str, question: str, timeout: float = 20.0) -> tuple:
+    prov = get_provider_class(provider)
+    prompt = (
+        "You are being tested. Answer the question with EXACTLY ONE word. "
+        "The output JSON array MUST contain EXACTLY the same number of elements as the input array. "
+        "Output ONLY a valid JSON array of strings."
+    )
+    try:
+        result = await asyncio.wait_for(
+            prov.send_request([question], api_key, model, lambda msg: None, None, "", prompt),
+            timeout=timeout
+        )
+        answer = result[0].strip() if result else ""
+        if answer:
+            return "Active", answer
+        return "Unreachable", ""
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        if code in (401, 403):
+            return "Invalid", ""
+        if code == 429:
+            return "Rate Limited", ""
+        return "Unreachable", ""
+    except ValueError:
+        return "Active", ""
+    except asyncio.TimeoutError:
+        return "Timeout", ""
+    except Exception:
+        return "Unreachable", ""
 
 def is_valid_custom_instance(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
@@ -562,11 +650,16 @@ class TranslationCache:
             columns = [col[1] for col in cursor.fetchall()]
             if "created_at" not in columns:
                 cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN created_at INTEGER")
-                cursor.execute(f"UPDATE {self.table_name} SET created_at = strftime('%s', 'now') WHERE created_at IS NULL")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_created_at ON {self.table_name}(created_at)")
+            if "trans" not in columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_trans ON {self.table_name}(trans)")
+            if "orig" not in columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_orig ON {self.table_name}(orig)")
             if "modpack" not in columns:
                 cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN modpack TEXT")
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_modpack ON {self.table_name}(modpack)")
-            cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_orig_modpack ON {self.table_name}(orig, modpack)")
+            if "orig_modpack" not in columns:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.table_name}_orig_modpack ON {self.table_name}(orig, modpack)")
             self.conn.commit()
 
     def _sanitize_mapping(self, mapping):
@@ -761,6 +854,12 @@ def detect_provider(api_key: str, model_name: str = "") -> str:
         return "Mistral AI"
     if api_key.startswith("sk-proj-") or (api_key.startswith("sk-") and not api_key.startswith("sk-or-")):
         return "OpenAI"
+    if api_key.startswith("oc-"):
+        return "OpenCode"
+    if api_key.startswith("cr_"):
+        return "Crusoe Cloud"
+    if api_key.startswith("rp_"):
+        return "RunInfra"
     return None
 
 def get_default_model(provider: str) -> str:
@@ -785,13 +884,19 @@ def get_base_url(provider: str) -> str:
         return "http://localhost:11434/v1"
     if "OpenAI" in provider:
         return "https://api.openai.com/v1"
+    if "OpenCode" in provider:
+        return "https://opencode.ai/zen/v1"
+    if "Crusoe" in provider:
+        return "https://api.inference.crusoecloud.com/v1"
+    if "RunInfra" in provider:
+        return "https://api.runinfra.ai/v1"
     if "Mistral" in provider:
         return "https://api.mistral.ai/v1"
     if "Anthropic" in provider:
         return "https://api.anthropic.com/v1"
     if "Cohere" in provider:
         return "https://api.cohere.ai/v1"
-    if "Local LLM" in provider or "Custom" in provider:
+    if "Custom (OpenAI-compatible)" in provider:
         return ""
     return "https://api.openai.com/v1"
 
@@ -808,9 +913,12 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
             "OpenAI",
             "Anthropic (Claude)",
             "Cohere",
+            "OpenCode",
+            "Crusoe Cloud",
+            "RunInfra",
             "Google Translate (Free)",
             "Ollama (Local / Free)",
-            "Local LLM / Custom"
+            "Custom (OpenAI-compatible)"
         ]
         for prov in providers:
             keys = saved_keys_by_provider.get(prov, [])
@@ -866,7 +974,7 @@ class UnifiedTranslator:
         self.model = model
         self.target_lang_code = target_lang_code
         self.free_google = GoogleFreeTranslator()
-        self.timeout = 180.0 if "Ollama" in provider else 30.0
+        self.timeout = 180.0 if "Ollama" in provider else 60.0
         self.key_index = 0
         self.key_cooldown_until = {}
         self.key_backoff = {}
@@ -910,6 +1018,15 @@ class UnifiedTranslator:
                         elif key_part.startswith("sk-or-") or key_part.startswith("sk-"):
                             model_part = "meta-llama/llama-3.3-70b-instruct:free"
                             prov = "OpenRouter (Cloud AI)"
+                        elif key_part.startswith("oc-") or key_part.startswith("opencode-"):
+                            model_part = "deepseek-v4-flash"
+                            prov = "OpenCode"
+                        elif key_part.startswith("cr_"):
+                            model_part = "zai/GLM-5.3-Flash"
+                            prov = "Crusoe Cloud"
+                        elif key_part.startswith("rp_"):
+                            model_part = "glm-5-3-flash"
+                            prov = "RunInfra"
                     mdl = model_part if model_part else get_default_model(prov)
                     base = get_base_url(prov)
                     self.mixed_pool.append({"provider": prov, "api_key": key_part, "model": mdl, "base_url": base})
@@ -937,7 +1054,7 @@ class UnifiedTranslator:
             prov = entry["provider"]
             if prov not in self.provider_instances:
                 base_url = entry.get("base_url", get_base_url(prov))
-                if custom_base_url and prov in ("Local LLM / Custom", "Ollama (Local / Free)"):
+                if custom_base_url and prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)"):
                     base_url = custom_base_url
                 self.provider_instances[prov] = get_provider_class(prov, base_url)
 
@@ -1019,7 +1136,11 @@ class UnifiedTranslator:
         if not self.mixed_pool:
             raise ValueError("No providers configured in mixed pool")
 
+        context = context if context else ""
+        truncated_context = context[:2000] if len(context) > 2000 else context
         user_content = f"Instructions: {self.prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
+        if truncated_context:
+            user_content += f"\n\nContext: {truncated_context}"
         BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
         max_attempts = len(BACKOFF_DELAYS) if not any(entry.get("provider") and "Ollama" in entry["provider"] for entry in self.mixed_pool) else 1
         res = None
@@ -1163,9 +1284,14 @@ class SNBTManager:
         self.cache.close()
 
     def count_translatable_strings(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool) -> int:
+        count = 0
         with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-        return self._count_translatable_in_content(content, t_titles, t_subs, t_desc)
+            for line in f:
+                strings = _find_all_snbt_strings(line)
+                for s in strings:
+                    if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
+                        count += 1
+        return count
 
     def _is_translatable_key(self, key: str, t_titles: bool, t_subs: bool, t_desc: bool) -> bool:
         if key is None:
@@ -1217,8 +1343,10 @@ class SNBTManager:
             target_name = f"{self.target_lang_code}.snbt"
             target_path = filepath.parent / target_name
 
+            content = ""
             async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
-                content = await f.read()
+                async for line in f:
+                    content += line
 
             if not is_overwrite:
                 target_content = ""
@@ -1242,8 +1370,10 @@ class SNBTManager:
             target_path = filepath
             bak_path = filepath.with_suffix('.snbt.bak')
 
+            disk_content = ""
             async with aiofiles.open(filepath, 'r', encoding='utf-8') as f:
-                disk_content = await f.read()
+                async for line in f:
+                    disk_content += line
 
             is_ru_file = bak_path.exists() and bak_path.stat().st_size > 0
             if is_ru_file and not is_overwrite:
@@ -1401,7 +1531,7 @@ class SNBTManager:
                     return
                 os.replace(tmp_path, target_path)
                 logger(f"Localization updated: {target_path.name}")
-            except Exception:
+            except BaseException:
                 tmp_path.unlink(missing_ok=True)
                 raise
 
@@ -1420,7 +1550,7 @@ class SNBTManager:
                     return
                 os.replace(tmp_path, filepath)
                 logger(f"In-place file updated: {filepath.name}")
-            except Exception:
+            except BaseException:
                 tmp_path.unlink(missing_ok=True)
                 raise
 
@@ -1548,6 +1678,7 @@ class JSONManager:
                 self.translator.modpack_root = self.modpack_root
                 self.translator.prompt += f" {build_mod_context(self.modpack_root)}"
 
+            source_data = {}
             with open(source_file, 'r', encoding='utf-8') as f:
                 source_data = json.load(f)
 

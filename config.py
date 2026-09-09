@@ -23,6 +23,7 @@ PROVIDER_ALIASES = {
     "nvidia": "NVIDIA NIM",
     "nim": "NVIDIA NIM",
     "sambanova": "Sambanova",
+    "opencode": "OpenCode",
     "mixed": "Mixed Providers",
     "mix": "Mixed Providers",
     "openai": "OpenAI",
@@ -30,8 +31,10 @@ PROVIDER_ALIASES = {
     "anthropic": "Anthropic (Claude)",
     "claude": "Anthropic (Claude)",
     "cohere": "Cohere",
-    "local": "Local LLM / Custom",
-    "custom": "Local LLM / Custom",
+    "local": "Custom (OpenAI-compatible)",
+    "custom": "Custom (OpenAI-compatible)",
+    "crusoe": "Crusoe Cloud",
+    "runinfra": "RunInfra",
 }
 
 PROVIDER_ENDPOINTS = {
@@ -45,7 +48,10 @@ PROVIDER_ENDPOINTS = {
     "Mistral AI": "https://api.mistral.ai/v1/models",
     "Anthropic (Claude)": "https://api.anthropic.com/v1/messages",
     "Cohere": "https://api.cohere.ai/v1/chat",
-    "Local LLM / Custom": "",
+    "OpenCode": "https://opencode.ai/zen/v1/models",
+    "Crusoe Cloud": "https://api.inference.crusoecloud.com/v1/models",
+    "RunInfra": "https://api.runinfra.ai/v1/models",
+    "Custom (OpenAI-compatible)": "",
 }
 
 LANG_ALIASES = {
@@ -73,7 +79,10 @@ ENV_KEY_MAP = {
     "Mistral AI": "MISTRAL_API_KEY",
     "Anthropic (Claude)": "ANTHROPIC_API_KEY",
     "Cohere": "COHERE_API_KEY",
-    "Local LLM / Custom": "",
+    "OpenCode": "OPENCODE_API_KEY",
+    "Crusoe Cloud": "CRUSOE_API_KEY",
+    "RunInfra": "RUNINFRA_GATEWAY_KEY",
+    "Custom (OpenAI-compatible)": "",
 }
 
 SETTINGS_KEY_MAP = {
@@ -86,7 +95,10 @@ SETTINGS_KEY_MAP = {
     "Mistral AI": "mistral_api_key",
     "Anthropic (Claude)": "anthropic_api_key",
     "Cohere": "cohere_api_key",
-    "Local LLM / Custom": "",
+    "OpenCode": "opencode_api_key",
+    "Crusoe Cloud": "crusoe_api_key",
+    "RunInfra": "runinfra_api_key",
+    "Custom (OpenAI-compatible)": "",
 }
 
 class ConfigManager:
@@ -100,9 +112,12 @@ class ConfigManager:
         "Mistral AI",
         "Anthropic (Claude)",
         "Cohere",
+        "OpenCode",
+        "Crusoe Cloud",
+        "RunInfra",
         "Google Translate (Free)",
         "Ollama (Local / Free)",
-        "Local LLM / Custom"
+        "Custom (OpenAI-compatible)"
     ]
 
     def __init__(self):
@@ -116,6 +131,7 @@ class ConfigManager:
         self.resource_pack_mode: bool = False
         self.api_keys_pool: Dict[str, List[str]] = {prov: [] for prov in PROVIDER_ALIASES.values()}
         self.custom_instances_paths: List[str] = []
+        self.custom_base_url: str = ""
         self.batch_size: int = 50
         self.min_batch_size: int = 1
         self.max_concurrent_requests: int = 10
@@ -146,6 +162,8 @@ class ConfigManager:
         raw = s.value("custom_instances_paths", "")
         if raw:
             self.custom_instances_paths = [p.strip() for p in str(raw).splitlines() if p.strip()]
+
+        self.custom_base_url = s.value("custom_base_url", "")
 
         self.batch_size = int(s.value("batch_size", 50))
         self.min_batch_size = int(s.value("min_batch_size", 1))
@@ -187,6 +205,8 @@ class ConfigManager:
 
         for prov, keys in self.api_keys_pool.items():
             s.setValue(f"api_keys_pool_{prov}", "\n".join(keys))
+
+        s.setValue("custom_base_url", self.custom_base_url)
 
         s.setValue("batch_size", self.batch_size)
         s.setValue("min_batch_size", self.min_batch_size)
@@ -313,14 +333,20 @@ class ConfigManager:
                 return key, model
             # Trailing backslash with no model - use key part for prefix detection
             entry = key
-        
+
         if entry.startswith("gsk_"):
             return entry, "llama-3.3-70b-versatile"
         if entry.startswith("nvapi-"):
             return entry, "nvidia/nemotron-3-ultra"
         if entry.startswith("sk-or-"):
             return entry, "meta-llama/llama-3.3-70b-instruct:free"
-        
+        if entry.startswith("oc-") or entry.startswith("opencode-"):
+            return entry, "deepseek-v4-flash"
+        if entry.startswith("cr_"):
+            return entry, "zai/GLM-5.3-Flash"
+        if entry.startswith("rp_"):
+            return entry, "glm-5-3-flash"
+
         raise ValueError(f"Unknown key format or provider prefix: {entry[:10]}...")
 
     def get_all_available_keys(self) -> list[tuple[str, str, str]]:

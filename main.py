@@ -16,6 +16,18 @@ except ImportError:
 
 SERVICE_MODEL_KEYWORDS = {"orpheus", "tts", "whisper", "embed", "moderation", "safety", "guard", "reward"}
 
+def has_kubejs_lang(instance_path: Path) -> bool:
+    for kubejs_dir in (instance_path / "kubejs", instance_path / "minecraft" / "kubejs"):
+        if not kubejs_dir.is_dir():
+            continue
+        try:
+            for lang_dir in kubejs_dir.rglob("lang"):
+                if lang_dir.is_dir() and (lang_dir / "en_us.json").is_file():
+                    return True
+        except (PermissionError, OSError):
+            continue
+    return False
+
 def find_all_quest_dirs(instance_path: Path) -> list[Path]:
     quest_dirs = []
     MAX_DEPTH = 3
@@ -49,6 +61,8 @@ def find_all_quest_dirs(instance_path: Path) -> list[Path]:
 
     scan(instance_path)
     if not quest_dirs and is_valid_custom_instance(instance_path):
+        quest_dirs.append(instance_path)
+    if not quest_dirs and has_kubejs_lang(instance_path):
         quest_dirs.append(instance_path)
     return quest_dirs
 
@@ -803,6 +817,8 @@ async def fetch_models(provider: str, api_key: str | None) -> list[str]:
                 data = resp.json()
                 if "Cohere" in provider:
                     models = [m["id"] for m in data.get("models", [])]
+                elif "OpenCode" in provider:
+                    models = [m["id"] for m in data.get("data", [])]
                 else:
                     models = [m["id"] for m in data.get("data", [])]
                 return [m for m in models if not any(kw in m.lower() for kw in SERVICE_MODEL_KEYWORDS)]

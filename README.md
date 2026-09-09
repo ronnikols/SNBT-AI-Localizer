@@ -112,19 +112,22 @@ This prevents charging for translations of:
 | Groq Cloud (Fast) | llama-3.3-70b-versatile | Yes | Low-latency inference |
 | NVIDIA NIM | nvidia/nemotron-4-340b-instruct | Yes | Enterprise-grade models |
 | OpenRouter (Cloud AI) | google/gemma-4-31b:free | Yes | 100+ free models |
-| Google Gemini (Free API) | models/gemini-3.1-flash-lite | Yes | Google's latest free model |
+| Google Gemini (Free API) | models/gemini-flash-lite-latest | Yes | Google's latest free model |
 | Sambanova | DeepSeek-V3.1 | No | High-performance inference |
 | OpenAI | gpt-4o-mini | No | Optimized for speed |
 | Mistral AI | mistral-large-latest | Yes | Open-source frontier models |
 | Anthropic (Claude) | claude-3-5-sonnet-20241022 | No | High-quality responses |
 | Cohere | command-r-plus | No | Production-ready |
+| OpenCode | deepseek-v4-flash | Yes | OpenCode Zen inference |
+| Crusoe Cloud | zai/GLM-5.3-Flash | Yes | OpenAI-compatible serverless inference, $5 free credits |
+| RunInfra | glm-5-3-flash | Yes | OpenAI-compatible inference for open models (`rp_` keys, env `RUNINFRA_GATEWAY_KEY`) |
 | Ollama (Local / Free) | qwen2.5:7b | Yes | Self-hosted, no API key |
 | Google Translate (Free) | N/A | Yes | Traditional MT, no API key |
-| Local LLM / Custom | (Custom) | Yes | Custom local models |
+| Custom (OpenAI-compatible) | (Custom) | Yes | Custom OpenAI-compatible endpoints |
 
 ## Feedback & Community
 For feedback, suggestions, and bug reports, please contact us via:
 - **Telegram**: [https://t.me/ronnikols](https://t.me/ronnikols)
 
 ## License
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License - see [LICENSE](LICENSE) for details. 

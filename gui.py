@@ -3,6 +3,7 @@ import sys
 import ctypes
 import re
 import asyncio
+import random
 import time
 import logging
 import weakref
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot, QUrl
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices
 import httpx
-from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path
+from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path, get_base_url, detect_provider, test_key_with_question, TEST_QUESTIONS
 from config import ConfigManager, APP_VERSION
 
 LOCALES = {
@@ -478,6 +479,18 @@ def get_locale():
     base.update(LOCALES.get(code, {}))
     return base
 
+def has_kubejs_lang(instance_path: Path) -> bool:
+    for kubejs_dir in (instance_path / "kubejs", instance_path / "minecraft" / "kubejs"):
+        if not kubejs_dir.is_dir():
+            continue
+        try:
+            for lang_dir in kubejs_dir.rglob("lang"):
+                if lang_dir.is_dir() and (lang_dir / "en_us.json").is_file():
+                    return True
+        except (PermissionError, OSError):
+            continue
+    return False
+
 def find_all_quest_dirs(instance_path: Path) -> list[Path]:
     quest_dirs = []
     MAX_DEPTH = 3
@@ -512,7 +525,20 @@ def find_all_quest_dirs(instance_path: Path) -> list[Path]:
     scan(instance_path)
     if not quest_dirs and is_valid_custom_instance(instance_path):
         quest_dirs.append(instance_path)
+    if not quest_dirs and has_kubejs_lang(instance_path):
+        quest_dirs.append(instance_path)
     return quest_dirs
+
+async def run_with_abort_watchdog(coro, is_aborted, log=None):
+    task = asyncio.create_task(coro)
+    while not task.done():
+        if is_aborted():
+            if log:
+                log("Stop requested: cancelling in-flight requests...")
+            task.cancel()
+            break
+        await asyncio.sleep(0.25)
+    return await task
 
 class QtLogSignaler(QObject):
     log_signal = pyqtSignal(str, int)
@@ -1340,26 +1366,51 @@ class ModelLoader(QThread):
                         models = [m["id"] for m in data.get("models", [])]
                     elif resp.status_code in (401, 403):
                         error_msg = f"Cohere API error {resp.status_code}: Invalid or missing API key"
+                elif "OpenCode" in self.provider:
+                    url = f"{get_base_url('OpenCode')}/models"
+                    headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+                    resp = await client.get(url, headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"OpenCode API error {resp.status_code}: Invalid or missing API key"
+                elif "Crusoe" in self.provider and self.api_key:
+                    headers = {"Authorization": f"Bearer {self.api_key}"}
+                    resp = await client.get(f"{get_base_url('Crusoe Cloud')}/models", headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"Crusoe API error {resp.status_code}: Invalid or missing API key"
+                elif "RunInfra" in self.provider and self.api_key:
+                    headers = {"Authorization": f"Bearer {self.api_key}"}
+                    resp = await client.get(f"{get_base_url('RunInfra')}/models", headers=headers, timeout=12.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                    elif resp.status_code in (401, 403):
+                        error_msg = f"RunInfra API error {resp.status_code}: Invalid or missing API key"
         except Exception as e:
             error_msg = f"Connection error: {str(e)}"
         self.loaded.emit(models, error_msg, self.loader_id, self.provider)
 
 class KeyVerifierWorker(QThread):
-    verification_complete = pyqtSignal(dict)
+    verification_complete = pyqtSignal(dict, dict, str)
 
-    def __init__(self, keys, provider, model, translator):
+    def __init__(self, specs):
         super().__init__()
-        self.keys = keys
-        self.provider = provider
-        self.model = model
-        self.translator = translator
+        self.specs = specs
 
     def run(self):
+        question = random.choice(TEST_QUESTIONS)
         results = {}
-        for key in self.keys:
-            status = asyncio.run(self.translator.ping_key(key, self.provider, self.model))
+        answers = {}
+        for key, provider, model in self.specs:
+            status, answer = asyncio.run(test_key_with_question(provider, key, model, question))
             results[key] = status
-        self.verification_complete.emit(results)
+            answers[key] = answer
+        self.verification_complete.emit(results, answers, question)
 
 class Worker(QThread):
     log = pyqtSignal(str)
@@ -1414,10 +1465,10 @@ class Worker(QThread):
                 self.log.emit("Starting Quest translation (SNBT)...")
                 original_files = self.files
                 self.files = snbt_files
-                asyncio.run(self.process())
+                asyncio.run(run_with_abort_watchdog(self.process(), lambda: self.is_aborted, self.log.emit))
                 self.files = original_files
 
-            if json_files:
+            if json_files and not self.is_aborted:
                 self.log.emit("Starting Language translation (JSON)...")
                 _, target_lang_code = parse_target_lang(self.target_lang)
                 processed_dirs = set()
@@ -1444,10 +1495,15 @@ class Worker(QThread):
                         batch_size=self.batch_size,
                         min_batch_size=self.min_batch_size
                     )
-                    asyncio.run(manager.process(
+                    asyncio.run(run_with_abort_watchdog(manager.process(
                         log_callback=self.log.emit,
                         check_status=self.check_status
-                    ))
+                    ), lambda: self.is_aborted, self.log.emit))
+        except asyncio.CancelledError:
+            self.log.emit("Translation process was aborted by user.")
+            logging.getLogger("snbt_localizer.gui").warning("Translation aborted: in-flight requests cancelled.")
+        except AbortException:
+            self.log.emit("Translation process was aborted by user.")
         except Exception as e:
             self.log.emit(f"Unexpected error: {e}")
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
@@ -1614,7 +1670,9 @@ class JSONWorker(QThread):
 
     def run(self):
         try:
-            asyncio.run(self.process())
+            asyncio.run(run_with_abort_watchdog(self.process(), lambda: self.is_aborted, self.log.emit))
+        except asyncio.CancelledError:
+            self.log.emit("Translation process was aborted by user.")
         except Exception as e:
             self.log.emit(f"Unexpected error: {e}")
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
@@ -1667,6 +1725,9 @@ class App(QMainWindow):
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self._perform_debounced_save)
+        self.model_reload_timer = QTimer(self)
+        self.model_reload_timer.setSingleShot(True)
+        self.model_reload_timer.timeout.connect(self.update_models)
         self._pending_save_provider = None
         self.custom_base_url = ""
         self.tabs = QTabWidget()
@@ -1694,10 +1755,13 @@ class App(QMainWindow):
             "NVIDIA NIM",
             "Sambanova",
             "OpenAI",
+            "OpenCode",
             "Mistral AI",
             "Anthropic (Claude)",
             "Cohere",
-            "Local LLM / Custom",
+            "Crusoe Cloud",
+            "RunInfra",
+            "Custom (OpenAI-compatible)",
             "Mixed Providers"
         ])
         self.provider_box.currentTextChanged.connect(self.on_provider_changed)
@@ -1752,6 +1816,7 @@ class App(QMainWindow):
         test_keys_layout.addStretch()
 
         self.lbl_key_status = QLabel("Pool Status: Unchecked")
+        self.lbl_key_status.setWordWrap(True)
 
         key_layout.addWidget(self.key_label)
         key_layout.addWidget(self.btn_toggle_keys)
@@ -1759,7 +1824,7 @@ class App(QMainWindow):
         key_layout.addLayout(test_keys_layout)
         key_layout.addWidget(self.lbl_key_status)
 
-        self.custom_url_label = QLabel("Custom API Base URL (for Local LLM):")
+        self.custom_url_label = QLabel("Custom API Base URL:")
         self.custom_base_url_edit = QLineEdit()
         self.custom_base_url_edit.setPlaceholderText("e.g. http://localhost:8080/v1")
         self.custom_base_url_edit.setVisible(False)
@@ -1990,6 +2055,12 @@ class App(QMainWindow):
         self.custom_base_url_edit.setText(self.settings.value("custom_base_url", ""))
         self.custom_base_url = self.custom_base_url_edit.text()
 
+        # Загружаем сохраненную модель для текущего провайдера
+        provider_model = self.settings.value(f"model_{provider}", "")
+        if provider_model and provider_model not in ["", "Loading live models...", "None (Free Engine)"]:
+            self.model_box.setCurrentText(provider_model)
+            self.config.model = provider_model
+
         self.settings_tab.concurrency_spin.setValue(self.config.concurrency)
         self.settings_tab.batch_spin.setValue(self.config.batch_size)
         self.settings_tab.min_batch_spin.setValue(self.config.min_batch_size)
@@ -2026,6 +2097,7 @@ class App(QMainWindow):
 
         self.custom_base_url = self.custom_base_url_edit.text()
         self.settings.setValue("custom_base_url", self.custom_base_url)
+        self.config.custom_base_url = self.custom_base_url
 
         if provider not in ("Google Translate (Free)", "Ollama (Local / Free)"):
             keys_text = self.key_pool_edit.toPlainText().strip()
@@ -2355,9 +2427,9 @@ class App(QMainWindow):
         keys_text = self.key_pool_edit.toPlainText().strip()
         keys = [k.strip() for k in keys_text.splitlines() if k.strip()]
 
-        if provider in ("Google Translate (Free)", "Ollama (Local / Free)", "Local LLM / Custom"):
+        if provider in ("Google Translate (Free)", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"):
             results = {k: "Active" for k in keys} if keys else {}
-            self.on_verification_complete(results)
+            self.on_verification_complete(results, {}, "")
             return
 
         if not keys:
@@ -2367,25 +2439,53 @@ class App(QMainWindow):
         self.lbl_key_status.setText("Pool Status: Verifying keys...")
         self.btn_test_keys.setEnabled(False)
 
-        custom_url = self.custom_base_url_edit.text() if provider in ("Local LLM / Custom", "Ollama (Local / Free)") else None
-        translator = UnifiedTranslator(keys, provider, model, custom_base_url=custom_url)
-        self.verifier = KeyVerifierWorker(keys, provider, model, translator)
+        model = self.model_box.currentText()
+        if provider == "Mixed Providers":
+            specs = []
+            for k in keys:
+                try:
+                    key_part, model_part = self.config.smart_parse_key(k)
+                    prov = detect_provider(key_part, model_part) or "OpenAI"
+                    specs.append((k, prov, model_part or PROVIDER_DEFAULTS.get(prov, "")))
+                except ValueError:
+                    specs.append((k, provider, model))
+        else:
+            if not model or model in ("Loading live models...", "Enter API Key to load models", "Defined per key in pool", "None (Free Engine)"):
+                model = PROVIDER_DEFAULTS.get(provider, "")
+            specs = [(k, provider, model) for k in keys]
+
+        self.verifier = KeyVerifierWorker(specs)
         self.verifier.verification_complete.connect(self.on_verification_complete)
         self.verifier.start()
 
-    def on_verification_complete(self, results):
+    def on_verification_complete(self, results, answers=None, question=""):
         self.btn_test_keys.setEnabled(True)
         active_count = sum(1 for status in results.values() if status == "Active")
         total = len(results)
         self._key_validation_cache.update(results)
-        self.lbl_key_status.setText(f"Pool Status: {active_count}/{total} active")
+        text = f"Pool Status: {active_count}/{total} active"
+        if answers:
+            parts = []
+            for i, key in enumerate(results.keys(), 1):
+                answer = answers.get(key, "")
+                if answer:
+                    parts.append(f"[{i}] {answer}")
+                else:
+                    status = results.get(key, "")
+                    parts.append(f"[{i}] ({status})" if status and status != "Active" else f"[{i}] —")
+            text += f'\nQ: "{question}" → ' + "  ".join(parts)
+        self.lbl_key_status.setText(text)
 
     def key_pool_changed(self):
         self.save_timer.start(500)
+        prov = self.provider_box.currentText()
+        if prov not in ("Google Translate (Free)", "Mixed Providers", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"):
+            self.model_reload_timer.start(600)
 
     def on_model_changed(self, text):
         if not self._is_updating_models:
             self.save_timer.start(500)
+        self.update_run_status()
 
     def on_provider_changed(self, new_provider: str):
         if new_provider == self.current_provider and not getattr(self, '_is_initializing', False):
@@ -2418,7 +2518,7 @@ class App(QMainWindow):
             self.btn_toggle_keys.setEnabled(False)
             self.custom_base_url_edit.setVisible(True)
             self.custom_url_label.setVisible(True)
-        elif new_provider == "Local LLM / Custom":
+        elif new_provider == "Custom (OpenAI-compatible)":
             self.key_pool_edit.setEnabled(True)
             self.key_pool_edit.setPlaceholderText("Enter up to 10 API keys, one per line")
             self.btn_toggle_keys.setEnabled(True)
@@ -2429,6 +2529,15 @@ class App(QMainWindow):
                 self.key_pool_edit.clear()
             self.custom_base_url_edit.setVisible(True)
             self.custom_url_label.setVisible(True)
+            # Загружаем сохраненные ключи из настроек, если их нет в config
+            if not saved_keys:
+                settings_keys = self.settings.value(f"api_keys_pool_{new_provider}", "")
+                if settings_keys:
+                    self.key_pool_edit.setPlainText(settings_keys)
+            # Загружаем сохраненную модель для кастомного провайдера
+            saved_model = self.settings.value(f"model_{new_provider}", "")
+            if saved_model and saved_model not in ["", "Loading live models...", "None (Free Engine)"]:
+                self.model_box.setCurrentText(saved_model)
         else:
             self.key_pool_edit.setEnabled(True)
             self.key_pool_edit.setPlaceholderText("Enter up to 10 API keys, one per line")
@@ -2469,11 +2578,16 @@ class App(QMainWindow):
         elif "Ollama" in provider:
             self.model_box.setEnabled(True)
             self._trigger_loader(provider, "")
-        elif provider == "Local LLM / Custom":
+        elif provider == "Custom (OpenAI-compatible)":
             self.model_box.setEnabled(True)
-            self.model_box.clear()
             self.model_box.setEditable(True)
+            self.model_box.clear()
+            self.model_box.setPlaceholderText("Enter custom model name (e.g. llama3.2:70b)")
             self.completer.setModel(QStringListModel([]))
+            # Загружаем сохраненную модель
+            saved_model = self.settings.value(f"model_{provider}", "")
+            if saved_model and saved_model not in ["", "Loading live models...", "None (Free Engine)"]:
+                self.model_box.setCurrentText(saved_model)
         else:
             self.model_box.setEnabled(True)
 
@@ -2644,7 +2758,7 @@ class App(QMainWindow):
             saved_keys_by_provider = {}
             saved_models_by_provider = {}
             default_models_by_provider = {}
-            for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI", "Anthropic (Claude)", "Cohere", "Google Translate (Free)", "Ollama (Local / Free)", "Local LLM / Custom"]:
+            for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI", "Anthropic (Claude)", "Cohere", "OpenCode", "Crusoe Cloud", "RunInfra", "Google Translate (Free)", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"]:
                 saved_keys_by_provider[p] = self.config.get_api_keys(p)
                 saved_models_by_provider[p] = self.settings.value(f"model_{p}", "")
                 default_models_by_provider[p] = PROVIDER_DEFAULTS.get(p, "")
@@ -2664,8 +2778,15 @@ class App(QMainWindow):
                 QMessageBox.warning(self, "Invalid API Key", "The first API key in your pool is known to be invalid. Please check your keys.")
                 return
 
-        if "Google Translate" not in prov and "Ollama" not in prov and not unique_keys:
-            logging.getLogger("snbt_localizer.gui").error("Error: Enter at least one API Key.")
+        # Validate model
+        if prov != "Google Translate (Free)":
+            if not self.is_model_valid():
+                QMessageBox.warning(self, "Validation Error", "Please select a valid model.")
+                return
+
+        # Validate API keys
+        if prov not in ("Google Translate (Free)", "Ollama (Local / Free)") and not unique_keys:
+            QMessageBox.warning(self, "Validation Error", "Please enter at least one API Key in the API Keys Pool section.")
             return
             
         self.btn_run.setEnabled(False)
@@ -2723,7 +2844,7 @@ class App(QMainWindow):
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
         concurrency = self.config.concurrency
         first_key = unique_keys[0] if unique_keys else ""
-        custom_url = self.custom_base_url_edit.text() if prov in ("Local LLM / Custom", "Ollama (Local / Free)") else None
+        custom_url = self.custom_base_url_edit.text() if prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
         m = SNBTManager(
             first_key, prov, model, custom_context, target_lang_name, target_lang_code,
             concurrency_limit=concurrency, mixed_pool=mixed_pool, modpack=modpack_name,
@@ -2758,7 +2879,8 @@ class App(QMainWindow):
         self.files_progress = {}
         logging.getLogger("snbt_localizer.gui").info(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
 
-        custom_url = self.custom_base_url_edit.text() if prov in ("Local LLM / Custom", "Ollama (Local / Free)") else None
+        custom_url = self.custom_base_url_edit.text() if prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
+        model = self.model_box.currentText() or ""
         translator = UnifiedTranslator(
             unique_keys,
             prov,

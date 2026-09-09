@@ -1,3 +1,7 @@
+import pytest
+pytestmark = pytest.mark.gui
+
+import asyncio
 import sys
 import pytest
 import tempfile
@@ -197,6 +201,42 @@ def test_model_placeholder_substring_protection():
     translator = UnifiedTranslator(["test_key"], "NVIDIA NIM", "none (free engine)")
     assert translator.model == PROVIDER_DEFAULTS["NVIDIA NIM"]
 
+def test_opencode_provider_support():
+    from core import get_base_url, get_provider_class, PROVIDER_DEFAULTS
+    from unittest.mock import patch, AsyncMock
+
+    # Test base URL
+    assert get_base_url("OpenCode") == "https://opencode.ai/zen/v1"
+
+    # Test default model
+    assert PROVIDER_DEFAULTS["OpenCode"] == "deepseek-v4-flash"
+
+    # Test provider class
+    provider = get_provider_class("OpenCode")
+    assert provider is not None
+
+    # Test actual request simulation
+    provider = get_provider_class("OpenCode")
+    with patch.object(provider, 'send_request', new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = ["translated text"]
+        async def test_request():
+            return await provider.send_request(
+                ["test text"],
+                "test_api_key",
+                "deepseek-v4-flash",
+                print,
+                None,
+                "",
+                "Translate to Russian"
+            )
+        result = asyncio.run(test_request())
+        assert result == ["translated text"]
+        mock_send.assert_called_once()
+        call_args = mock_send.call_args
+        assert call_args[0][0] == ["test text"]
+        assert call_args[0][1] == "test_api_key"
+        assert call_args[0][2] == "deepseek-v4-flash"
+
 def test_provider_specific_model_saving():
     with patch('config.QSettings') as mock_qsettings:
         mock_settings = mock_qsettings.return_value
@@ -305,7 +345,7 @@ def test_regular_wizard_mixed_redirect():
          patch('main.save_cli_setting') as mock_save, \
          patch('main.run_mix_setup_wizard', new_callable=AsyncMock) as mock_mix_wizard, \
          patch('main.fetch_models', new_callable=AsyncMock) as mock_fetch, \
-         patch('builtins.input', side_effect=["1", "8"]), \
+         patch('builtins.input', side_effect=["1", "9", "test_key"]), \
          patch('main.is_interactive', return_value=True):
 
         mock_mix_wizard.return_value = (Path("/tmp/test"), "Russian", "ru_ru")
@@ -584,16 +624,10 @@ def test_translation_memory_tab_clear_cache(qtbot):
 
 def test_tab_disabled_during_work(qtbot):
     from gui import App, ModelLoader
-    from unittest.mock import patch
+    from unittest.mock import patch, MagicMock
 
-    def fake_start(self):
-        qtbot.addWidget(self)
-        self.tabs.setTabEnabled(1, False)
-
-    def fake_run(self):
-        pass
-
-    with patch('gui.App.start', fake_start), patch('gui.ModelLoader.run', fake_run):
+    with patch('gui.Worker') as mock_worker, patch('gui.ModelLoader.run'):
+        mock_worker.return_value.start = MagicMock()
         app = App()
         qtbot.addWidget(app)
 
