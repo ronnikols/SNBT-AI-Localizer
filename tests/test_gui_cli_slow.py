@@ -426,12 +426,13 @@ def test_cli_mix_true_concurrency():
     test_files = [Path(f"/tmp/test/file{i}.snbt") for i in range(5)]
     mock_quests_dir = MagicMock(spec=Path)
     mock_quests_dir.rglob.return_value = test_files
-    mock_quests_dir.exists.return_value = True
-    mock_quests_dir.is_dir.return_value = True
-    mock_m.find_quests_dir.return_value = mock_quests_dir
+    mock_modpack_root = MagicMock()
+    mock_modpack_root.rglob.return_value = iter([])
     mock_m.translator = MagicMock()
 
     with patch('main.SNBTManager', return_value=mock_m), \
+         patch('main.find_quests_dir', return_value=mock_quests_dir) as mock_find, \
+         patch('main.find_modpack_root_from_quest_dir', return_value=mock_modpack_root), \
          patch('main.render_cli_progress'), \
          patch('main.sys') as mock_sys:
 
@@ -449,7 +450,7 @@ def test_cli_mix_true_concurrency():
         ))
 
         assert mock_m.process_file.call_count == 5
-        assert mock_m.find_quests_dir.called
+        assert mock_find.called
 
 def test_fuzzy_cache_exact_match():
     import tempfile
@@ -628,8 +629,20 @@ def test_tab_disabled_during_work(qtbot):
 
     with patch('gui.Worker') as mock_worker, patch('gui.ModelLoader.run'):
         mock_worker.return_value.start = MagicMock()
+        mock_worker.return_value.isRunning.return_value = False
         app = App()
         qtbot.addWidget(app)
+
+        # Background instance scan leaves "SCANNING" in dir_box; point the
+        # combo at a fake quest dir so the start handler passes validation
+        fake_instance = Path("/tmp/quest_instance")
+        app.instance_quest_dirs[fake_instance] = [fake_instance]
+        app._disconnect_dir_box()
+        app.dir_box.clear()
+        app.dir_box.addItem("Test Instance", str(fake_instance))
+        # The scan has not run yet, so the Run button is disabled; enable it
+        # manually - the assertion below targets the disable logic itself
+        app.btn_run.setEnabled(True)
 
         assert app.tabs.isTabEnabled(1) == True
 
@@ -766,10 +779,19 @@ def test_translation_memory_tab_save_changes(qtbot):
         tab = TranslationMemoryTab(cache)
         qtbot.addWidget(tab)
 
-        tab.table.item(0, 1).setText("new_apple")
-        tab._on_item_changed(tab.table.item(0, 1))
+        # created_at ties make the table order non-deterministic: locate
+        # rows by original text instead of assuming a fixed position
+        def find_row(orig):
+            for r in range(tab.table.rowCount()):
+                if tab.table.item(r, 0).text() == orig:
+                    return r
+            raise AssertionError(f"row with orig={orig!r} not found")
 
-        tab.table.selectRow(1)
+        apple_row = find_row("apple")
+        tab.table.item(apple_row, 1).setText("new_apple")
+        tab._on_item_changed(tab.table.item(apple_row, 1))
+
+        tab.table.selectRow(find_row("banana"))
         tab._on_delete_selected()
 
         tab.save_changes_btn.click()

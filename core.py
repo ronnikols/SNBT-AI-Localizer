@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 def get_resource_path(relative_path):
-    import sys
     import os
     from pathlib import Path
     if hasattr(sys, "_MEIPASS"):
@@ -131,9 +130,9 @@ PROVIDER_DEFAULTS = {
     "Google Translate (Free)": None,
     "Google Gemini (Free API)": "models/gemini-flash-lite-latest",
     "Ollama (Local / Free)": "qwen2.5:7b",
-    "Groq Cloud (Fast)": "llama-3.3-70b-versatile",
-    "OpenRouter (Cloud AI)": "google/gemma-4-31b:free",
-    "NVIDIA NIM": "nvidia/nemotron-4-340b-instruct",
+    "Groq Cloud (Fast)": "qwen/qwen3.8-27b",
+    "OpenRouter (Cloud AI)": "google/gemma-4-31b-it:free",
+    "NVIDIA NIM": "nvidia/nemotron-3-super-120b-a12b",
     "Sambanova": "DeepSeek-V3.1",
     "OpenAI": "gpt-4o-mini",
     "Mistral AI": "mistral-large-latest",
@@ -151,13 +150,43 @@ EXCLUDED_DIRS = {'waydroid', 'flatpak', '.steam', '.cache', 'Trash', 'trash', '.
 
 # Shared httpx clients per event loop: avoids a new TCP+TLS handshake per request.
 # Keyed by the running loop so a second asyncio.run() (new loop) gets a fresh client.
-_shared_httpx_clients = {}
+# WeakKeyDictionary: a dead loop's entry vanishes automatically, so entries never
+# accumulate across GUI phases.
+import weakref as _weakref
+_shared_httpx_clients = _weakref.WeakKeyDictionary()
+_shared_httpx_client_no_loop = None
 
-def get_shared_httpx_client(timeout: float = 180.0) -> httpx.AsyncClient:
+# Runtime-overridable LLM temperature (default 0.1 = deterministic-ish;
+# GUI/CLI can raise it for more "creative" translations).
+_TEMPERATURE = 0.1
+
+
+def set_temperature(value: float) -> None:
+    global _TEMPERATURE
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = 0.1
+    _TEMPERATURE = max(0.0, min(2.0, value))
+
+
+def get_temperature() -> float:
+    return _TEMPERATURE
+
+
+def get_shared_httpx_client(timeout: float = 60.0) -> httpx.AsyncClient:
+    global _shared_httpx_client_no_loop
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
+    if loop is None:
+        if _shared_httpx_client_no_loop is None or _shared_httpx_client_no_loop.is_closed:
+            _shared_httpx_client_no_loop = httpx.AsyncClient(
+                timeout=timeout,
+                limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0)
+            )
+        return _shared_httpx_client_no_loop
     client = _shared_httpx_clients.get(loop)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(
@@ -167,9 +196,29 @@ def get_shared_httpx_client(timeout: float = 180.0) -> httpx.AsyncClient:
         _shared_httpx_clients[loop] = client
     return client
 
+async def close_shared_httpx_clients():
+    """Close and drop the shared client bound to the current running loop.
+
+    Call at the end of each async phase (SNBT/JSON). Without this the client's
+    connection pool lingers until process exit.
+    """
+    global _shared_httpx_client_no_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        client, _shared_httpx_client_no_loop = _shared_httpx_client_no_loop, None
+    else:
+        client = _shared_httpx_clients.pop(loop, None)
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
 def build_user_content(prompt: str, texts: List[str], context: str) -> str:
     user_content = f"{prompt}\n\nJSON array to translate: {json.dumps(texts, ensure_ascii=False)}"
     if context:
+        # Cap file context so one long filename/extra cannot blow up the prompt
+        context = context[:2000]
         user_content += f"\n\nFile context: {context}"
     return user_content
 
@@ -224,10 +273,18 @@ class OpenAIProvider(BaseProvider):
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": user_content}],
-            "temperature": 0.1
+            "temperature": get_temperature()
         }
+        payload = apply_reasoning_effort(payload, model)
         client = get_shared_httpx_client()
         resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code == 400 and parse_model_effort(model)[1] is not None:
+            # Provider rejected the reasoning params (not all backends know
+            # reasoning_effort / chat_template_kwargs): retry once with a
+            # bare payload so the 'model/level' suffix never breaks a run.
+            bare = {k: v for k, v in payload.items() if k not in ("reasoning_effort", "chat_template_kwargs")}
+            logger(f"[{payload['model']}] Provider rejected reasoning params, retrying without them.")
+            resp = await client.post(url, headers=headers, json=bare)
         resp.raise_for_status()
         data = resp.json()
         content = data['choices'][0]['message']['content']
@@ -264,9 +321,11 @@ class AnthropicProvider(BaseProvider):
         payload = {
             "model": model,
             "max_tokens": 8192,
+            "temperature": get_temperature(),
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_content}]
         }
+        payload = apply_reasoning_effort(payload, model, provider="Anthropic (Claude)")
         client = get_shared_httpx_client()
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
@@ -305,8 +364,10 @@ class CohereProvider(BaseProvider):
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": user_content}],
+            "temperature": get_temperature(),
             "preamble": system_prompt
         }
+        payload = apply_reasoning_effort(payload, model, provider="Cohere")
         client = get_shared_httpx_client()
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
@@ -348,8 +409,9 @@ class OpenCodeProvider(BaseProvider):
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": user_content}],
-            "temperature": 0.1
+            "temperature": get_temperature()
         }
+        payload = apply_reasoning_effort(payload, model)
         client = get_shared_httpx_client()
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
@@ -386,8 +448,9 @@ class OllamaProvider(BaseProvider):
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": user_content}],
-            "temperature": 0.1
+            "temperature": get_temperature()
         }
+        payload = apply_reasoning_effort(payload, model)
         client = get_shared_httpx_client()
         resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
@@ -410,7 +473,8 @@ class OllamaProvider(BaseProvider):
 
 class GoogleProvider(BaseProvider):
     async def send_request(self, texts: List[str], api_key: str, model: str, logger, check_status, context: str, prompt: str = None) -> List[str]:
-        return await GoogleFreeTranslator().translate(texts, "ru_ru")
+        target = getattr(self, "target_lang_code", "") or "ru_ru"
+        return await GoogleFreeTranslator().translate(texts, target)
 
     async def ping_key(self, api_key: str, model: str) -> str:
         return "Active"
@@ -475,6 +539,15 @@ async def test_key_with_question(provider: str, api_key: str, model: str, questi
             return "Invalid", ""
         if code == 429:
             return "Rate Limited", ""
+        # Provider up but the specific model is paused/unavailable server-side
+        try:
+            err = e.response.json()
+            err_code = (err.get("error") or {}).get("code", "")
+            err_msg = (err.get("error") or {}).get("message", "")
+        except Exception:
+            err_code, err_msg = "", ""
+        if err_code == "hosted_model_paused" or "paused" in err_msg.lower():
+            return "Model Paused", err_msg[:120]
         return "Unreachable", ""
     except ValueError:
         return "Active", ""
@@ -483,10 +556,110 @@ async def test_key_with_question(provider: str, api_key: str, model: str, questi
     except Exception:
         return "Unreachable", ""
 
+
+async def fetch_provider_balance(provider: str, api_key: str, timeout: float = 15.0) -> Optional[str]:
+    """Fetch the account balance for providers that expose it via API.
+
+    Returns a short human-readable string like "$1.00 available" or None when
+    the provider has no public balance endpoint (most don't).
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    # Providers that expose no balance endpoint on their public API: the
+    # account balance lives only in the web console. Say so instead of
+    # silently showing nothing.
+    console_only = {
+        "Crusoe Cloud": "console.crusoecloud.com",
+        "Groq Cloud (Fast)": "console.groq.com/settings/limits",
+        "OpenAI": "platform.openai.com/usage",
+        "Anthropic (Claude)": "console.anthropic.com/settings/usage",
+        "Cohere": "dashboard.cohere.com",
+        "Mistral AI": "console.mistral.ai/usage",
+        "Sambanova": "cloud.sambanova.ai",
+        "NVIDIA NIM": "build.nvidia.com",
+    }
+    if provider in console_only:
+        return f"{console_only[provider]} (balance in web console)"
+    try:
+        if provider == "RunInfra":
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get("https://api.runinfra.ai/v1/credits", headers=headers)
+                if r.status_code != 200:
+                    return None
+                data = r.json()
+                avail = data.get("available_cents")
+                held = data.get("held_cents") or 0
+                spent = (data.get("period") or {}).get("spent_cents") or 0
+                plan = data.get("plan_tier") or ""
+                if avail is None:
+                    return None
+                txt = f"${avail / 100:.2f} available"
+                if held:
+                    txt += f" (${held / 100:.2f} held)"
+                txt += f", ${spent / 100:.2f} spent this period"
+                if plan:
+                    txt += f", plan: {plan}"
+                return txt
+        elif provider == "OpenRouter (Cloud AI)":
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get("https://openrouter.ai/api/v1/credits", headers=headers)
+                if r.status_code != 200:
+                    return None
+                data = (r.json() or {}).get("data") or {}
+                total = data.get("total_credits")
+                usage = data.get("total_usage")
+                try:
+                    total_f = float(total) if total is not None else None
+                    usage_f = float(usage) if usage is not None else None
+                except (TypeError, ValueError):
+                    return None
+                if total_f is None:
+                    return None
+                txt = f"${total_f:.2f} total credits"
+                if usage_f is not None:
+                    txt += f", ${usage_f:.2f} used"
+                    txt += f" (${max(total_f - usage_f, 0.0):.2f} left)"
+                return txt
+        elif provider == "OpenCode":
+            # Zen usage endpoint: plan-window percentages (no monetary amounts).
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.get("https://opencode.ai/zen/go/v1/usage", headers=headers)
+                if r.status_code == 200:
+                    data = r.json() or {}
+                    parts = []
+                    for name in ("requests", "tokens", "context"):
+                        entry = data.get(name) or {}
+                        used = entry.get("used")
+                        limit = entry.get("limit")
+                        if used is not None and limit:
+                            parts.append(f"{name}: {used}/{limit}")
+                    if parts:
+                        return ", ".join(parts)
+                    return "opencode.ai/zen (usage window: no details exposed)"
+                if r.status_code == 401:
+                    return "invalid key"
+            except Exception:
+                pass
+            return "opencode.ai/zen (balance in web console)"
+        return None
+    except Exception:
+        return None
+
 def is_valid_custom_instance(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
     try:
+        # Fast path: standard FTB Quests locations - direct, non-recursive
+        # glob instead of walking the whole instance tree (mods/, saves/, ...)
+        for standard in (
+            path / "config" / "ftbquests" / "quests",
+            path / "minecraft" / "config" / "ftbquests" / "quests",
+        ):
+            if standard.is_dir() and any(standard.glob("*.snbt")):
+                return True
+            chapters = standard / "chapters"
+            if chapters.is_dir() and any(chapters.glob("*.snbt")):
+                return True
         # any() with early exit - no reason to materialize the full file list
         for p in path.rglob("*.snbt"):
             if not any(x in p.parts for x in EXCLUDED_DIRS):
@@ -543,6 +716,83 @@ def extract_json_array(content: str):
 
 def has_cyrillic(text: str) -> bool:
     return bool(re.search('[а-яА-Я]', text))
+
+# --- Script-sanity helpers for the cache Auto-Fix healer ---
+# Detects cached "translations" that are garbage: replacement/zero-width
+# chars, CJK symbols leaked into non-CJK languages, single words mixing two
+# alphabets (e.g. "Лимитite"), and translations where >=90% of the words are
+# not in the target language's script (i.e. the text was never translated).
+ZERO_WIDTH_GARBAGE = re.compile('[\ufffd\u200b\u200c\u200d\ufeff\u2060]')
+CJK_CHARS = re.compile('[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff01-\uff5e\uff66-\uff9f\u3000-\u303f]')
+HANGUL_CHARS = re.compile('[\uac00-\ud7af]')
+CYRILLIC_CHARS = re.compile('[а-яёА-ЯЁ]')
+LATIN_CHARS = re.compile('[A-Za-z\u00C0-\u024F]')
+MC_CODE = re.compile('[&\u00a7][0-9a-ik-orx]', re.IGNORECASE)
+ALPHA_WORD = re.compile(r'[^\W\d_]+')
+
+TARGET_SCRIPT_BY_LANG = {
+    'ru_ru': 'cyrillic', 'uk_ua': 'cyrillic',
+    'de_de': 'latin', 'es_es': 'latin', 'fr_fr': 'latin', 'pt_br': 'latin',
+    'zh_cn': 'cjk', 'zh_tw': 'cjk', 'ja_jp': 'cjk', 'ko_kr': 'hangul',
+}
+
+def get_target_script(lang_code: str) -> str:
+    return TARGET_SCRIPT_BY_LANG.get((lang_code or '').lower().strip(), 'latin')
+
+def script_violation_reason(trans, target_script: str):
+    """Return a reason string for garbage translations, None when clean.
+
+    Checks (in order): replacement/zero-width chars, CJK symbols for
+    non-CJK targets, words mixing 2+ alphabets, and >=90% of words outside
+    the target script (skipped for latin targets - the source is latin too).
+
+    Mixed-script words: single latin letters bookending a cyrillic word are
+    legit design artifacts from obfuscated MC codes (e.g. '&k&4l&r&0&lVoid'
+    keeps literal 'l'/'I' letters around the translated word), so a
+    symmetric single-letter latin bookend pair is ignored; latin letters
+    inside the core still flag the word.
+    """
+    if not isinstance(trans, str) or not trans:
+        return None
+    if ZERO_WIDTH_GARBAGE.search(trans):
+        return 'garbage_chars'
+    if target_script not in ('cjk', 'hangul') and CJK_CHARS.search(trans):
+        return 'cjk_symbols'
+    stripped = MC_CODE.sub('', trans)
+    for word in ALPHA_WORD.findall(stripped):
+        if len(word) < 2:
+            continue
+        core = word
+        # Ignore symmetric single-latin bookends: 'IВизераI', 'lПустотаl'
+        if (len(word) >= 4 and LATIN_CHARS.match(word[0]) and LATIN_CHARS.match(word[-1])
+                and not LATIN_CHARS.match(word[1]) and not LATIN_CHARS.match(word[-2])):
+            core = word[1:-1]
+        scripts = set()
+        if CYRILLIC_CHARS.search(core):
+            scripts.add('cyr')
+        if LATIN_CHARS.search(core):
+            scripts.add('lat')
+        if CJK_CHARS.search(core):
+            scripts.add('cjk')
+        if len(scripts) >= 2:
+            return 'mixed_script'
+    if target_script in ('cyrillic', 'cjk', 'hangul'):
+        words = [w for w in ALPHA_WORD.findall(stripped) if len(w) >= 2]
+        if target_script == 'cyrillic':
+            # 1-letter cyrillic prepositions (в, и, с, о, к, у, я) are real
+            # target-language words: count them in so 'FE в Create?' passes
+            words += [w for w in ALPHA_WORD.findall(stripped)
+                      if len(w) == 1 and CYRILLIC_CHARS.search(w)]
+        if len(words) >= 2:
+            if target_script == 'cyrillic':
+                good = sum(1 for w in words if CYRILLIC_CHARS.search(w))
+            elif target_script == 'hangul':
+                good = sum(1 for w in words if HANGUL_CHARS.search(w))
+            else:
+                good = sum(1 for w in words if CJK_CHARS.search(w))
+            if good / len(words) <= 0.10:
+                return 'not_target_lang'
+    return None
 
 def parse_target_lang(lang_str):
     lang_str = lang_str.strip()
@@ -736,8 +986,11 @@ class TranslationCache:
             cursor = self.conn.cursor()
             cursor.execute(f"SELECT trans FROM {self.table_name} WHERE orig=?", (text,))
             res = cursor.fetchone()
-            if res:
+            if res and res[0] != text:
                 return res[0]
+            # Identity records (trans == orig) are legacy junk from the old
+            # fallback code: fall through to fuzzy search instead of
+            # returning the untranslated original as a "hit".
 
             max_diff = max(3, int(len(text_without_tail) * 0.15))
             cursor.execute(
@@ -757,7 +1010,12 @@ class TranslationCache:
                 ratio = difflib.SequenceMatcher(None, text_without_tail, orig_without_tail).ratio()
                 if ratio >= 0.90:
                     cleaned_trans = re.sub(TAIL_PATTERN, '', trans)
-                    return cleaned_trans + tail_input
+                    candidate = cleaned_trans + tail_input
+                    # Skip identity junk: a fuzzy match that "translates" to
+                    # the original is worse than no hit at all.
+                    if candidate != text:
+                        return candidate
+                    # keep scanning the remaining candidates
 
             return None
 
@@ -864,6 +1122,75 @@ class TranslationCache:
                 self.conn.execute(query, batch)
             self.conn.commit()
 
+    # Auto-Fix Cache: machine translators occasionally break placeholders,
+    # macros and markdown links with stray spaces. These patterns only match
+    # broken technical syntax, never natural prose.
+    AUTOFIX_PATTERNS = (
+        (re.compile(r'%\s+([sdn])'), r'%\1'),
+        (re.compile(r'__\s*TAG\s*_\s*(\d+)\s*__'), r'__TAG_\1__'),
+        (re.compile(r'\$\s*\(\s*([#a-zA-Z])'), r'$(\1'),
+        (re.compile(r'\]\s*\(\s*(https?://[^\s)]+)\s*\)'), r'](\1)'),
+    )
+
+    def find_script_violations(self, target_script: str):
+        """Scan the cache for garbage translations (wrong-language text,
+        CJK leaks, zero-width chars, mixed-alphabet words).
+
+        Returns a list of (orig, trans, reason, modpack) tuples. Purely
+        read-only; the caller decides what to do with the records.
+        """
+        script = target_script or 'latin'
+        out = []
+        with self.lock:
+            try:
+                rows = self.conn.execute(
+                    f"SELECT orig, trans, modpack FROM {self.table_name}"
+                ).fetchall()
+            except sqlite3.Error:
+                return out
+        for orig, trans, modpack in rows:
+            if not isinstance(trans, str):
+                continue
+            if orig == trans:
+                continue  # identity junk is handled by the purge path
+            reason = script_violation_reason(trans, script)
+            if reason:
+                out.append((orig, trans, reason, modpack))
+        return out
+
+    def autofix_records(self, log=None) -> int:
+        """Repair broken placeholders/macros/links in cached translations.
+
+        Returns the number of fixed rows. Safe to run repeatedly - patterns
+        are idempotent and only touch clearly-broken technical syntax.
+        """
+        fixed = 0
+        with self.lock:
+            try:
+                rows = self.conn.execute(f"SELECT orig, trans FROM {self.table_name}").fetchall()
+                updates = []
+                for orig, trans in rows:
+                    if not isinstance(trans, str) or not trans:
+                        continue
+                    new_trans = trans
+                    for pattern, repl in self.AUTOFIX_PATTERNS:
+                        new_trans = pattern.sub(repl, new_trans)
+                    if new_trans != trans:
+                        updates.append((new_trans, orig))
+                if updates:
+                    self.conn.executemany(
+                        f"UPDATE {self.table_name} SET trans = ? WHERE orig = ?",
+                        updates
+                    )
+                    self.conn.commit()
+                    fixed = len(updates)
+            except sqlite3.Error as e:
+                logging.getLogger("snbt_localizer.core").error(f"Auto-fix cache failed: {e}")
+                return 0
+        if fixed and log:
+            log(f"Auto-Fix Cache: repaired {fixed} cached translation(s).")
+        return fixed
+
     def close(self):
         self.conn.close()
 
@@ -920,6 +1247,76 @@ def get_default_model(provider: str) -> str:
     if not provider or not isinstance(provider, str):
         return "gpt-4o-mini"
     return PROVIDER_DEFAULTS.get(provider, "gpt-4o-mini")
+
+# Reasoning-effort levels accepted in the "model/level" suffix syntax.
+# "off"/"none"/"disable" disable thinking, "default" sends no params,
+# anything else is passed through as reasoning_effort (provider-specific).
+REASONING_EFFORT_LEVELS = ["off", "none", "disable", "minimal", "low", "medium", "high", "xhigh", "default"]
+
+# Reasoning budget for Anthropic models when a level is requested:
+# the Anthropic API needs budget_tokens, not effort levels.
+_ANTHROPIC_BUDGETS = {
+    "minimal": 1024,
+    "low": 2048,
+    "medium": 4096,
+    "high": 8192,
+    "xhigh": 16384,
+}
+
+def parse_model_effort(model_text: str):
+    """Split 'zai-org/GLM-5.3/low' -> ('zai-org/GLM-5.3', 'low').
+
+    Model ids themselves contain '/' (e.g. 'zai-org/GLM-5.3'), so only the
+    segment after the LAST '/' is treated as an effort level, and only when
+    it is a known level. Anything else returns the text unchanged.
+    """
+    if not model_text or "/" not in model_text:
+        return model_text, None
+    base, _, tail = model_text.rpartition("/")
+    tail_l = tail.strip().lower()
+    if base.strip() and tail_l in REASONING_EFFORT_LEVELS:
+        return base.strip(), tail_l
+    return model_text, None
+
+def apply_reasoning_effort(payload: dict, model_text: str, provider: str = "") -> dict:
+    """Apply the opt-in 'model/level' reasoning suffix to a chat payload.
+
+    Works for ALL providers: OpenAI-compatible ones (OpenAI, Groq, Gemini,
+    NIM, Sambanova, OpenRouter, Mistral, Crusoe, RunInfra, Ollama, Custom)
+    get "reasoning_effort" / "chat_template_kwargs", Anthropic gets its
+    native "thinking" object, Cohere and Google Translate ignore the suffix.
+    Without a suffix the payload is returned untouched.
+    """
+    model, effort = parse_model_effort(model_text)
+    if effort is None:
+        return payload
+    payload = dict(payload)
+    payload["model"] = model
+    if effort == "default":
+        return payload
+    prov = provider or ""
+    if "Anthropic" in prov:
+        if effort in ("off", "none", "disable"):
+            return payload
+        payload["thinking"] = {"type": "enabled", "budget_tokens": _ANTHROPIC_BUDGETS.get(effort, 4096)}
+        return payload
+    if "Cohere" in prov:
+        # Cohere v2 chat has no reasoning-effort parameter: passing one
+        # would 400 the request, so strip the suffix and use the bare model
+        return payload
+    # OpenAI-compatible family
+    if effort in ("off", "none", "disable"):
+        # vLLM-style switch works for Qwen and most models, but GLM models
+        # on some backends mix reasoning into content with it (breaks JSON
+        # parsing); for GLM reasoning_effort=low reliably yields 0 thinking
+        # tokens instead.
+        if "glm" in (payload.get("model") or "").lower():
+            payload["reasoning_effort"] = "low"
+        else:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        payload["reasoning_effort"] = effort
+    return payload
 
 def get_base_url(provider: str) -> str:
     if not provider or not isinstance(provider, str):
@@ -1100,6 +1497,9 @@ class UnifiedTranslator:
                 if custom_base_url and prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)"):
                     base_url = custom_base_url
                 self.provider_instances[prov] = get_provider_class(prov, base_url)
+        google_instance = self.provider_instances.get("Google Translate (Free)")
+        if google_instance is not None:
+            google_instance.target_lang_code = self.target_lang_code
 
     def _ensure_loop_primitives(self):
         """Recreate loop-bound asyncio primitives when the running loop changes.
@@ -1197,9 +1597,11 @@ class UnifiedTranslator:
 
     async def _do_raw_translation(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
         if not self.mixed_pool:
-            raise ValueError("No providers configured in mixed pool")
+            raise AbortException("No providers configured in mixed pool")
 
-        BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+        # Lighter retry curve: quick first retries for transient errors, capped
+        # hard so one bad chunk can no longer stall the run for minutes.
+        BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0]
         max_attempts = len(BACKOFF_DELAYS)
         res = None
 
@@ -1251,11 +1653,11 @@ class UnifiedTranslator:
                     break
                 except httpx.TimeoutException:
                     api_key = str(entry["api_key"])
-                    # fresh timestamp: after a 180s request the pre-request
+                    # fresh timestamp: after a 60s request the pre-request
                     # `now` is already in the past and the cooldown never applies
-                    self.key_cooldown_until[api_key] = time.time() + 150.0
+                    self.key_cooldown_until[api_key] = time.time() + 30.0
                     key_suffix = api_key[-4:] if len(api_key) > 4 else api_key
-                    logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 150s (Attempt {attempt+1}/{max_attempts}).")
+                    logging.getLogger("snbt_localizer.core").error(f"[{context}] Timeout on key ending ...{key_suffix}. Cooldown 30s (Attempt {attempt+1}/{max_attempts}).")
                     tried += 1
                     continue
                 except httpx.HTTPStatusError as e:
@@ -1321,6 +1723,10 @@ class UnifiedTranslator:
                         if remaining > 0 and (min_cooldown is None or remaining < min_cooldown):
                             min_cooldown = remaining
                 wait = max(min_cooldown or 2.0, 2.0)
+                # Cap the inter-attempt stall: with the 30s cooldown a full
+                # wait on exhausted keys used to freeze the pipeline far
+                # longer than any retry actually needs.
+                wait = min(wait, 10.0)
                 logging.getLogger("snbt_localizer.core").warning(f"All keys exhausted or in cooldown. Sleeping for {int(wait)}s...")
                 await asyncio.sleep(wait)
 
@@ -1343,6 +1749,7 @@ def find_quests_dir(start_path: Path) -> Path:
 class SNBTManager:
     def __init__(self, api_key: str, provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", concurrency_limit: int = 3, mixed_pool: List[dict] = None, translator: 'UnifiedTranslator' = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, modpack: str = None, custom_base_url: Optional[str] = None, modpack_root: Optional[Path] = None):
         self.cache = TranslationCache(target_lang_code=target_lang_code)
+        self.dictionary = load_translation_dictionary()
         self.target_lang_code = target_lang_code
         self.provider = provider
         self.skip_mode = (api_key == "SKIP")
@@ -1534,37 +1941,44 @@ class SNBTManager:
         if is_overwrite:
             to_trans = texts
             mapping.clear()
+            translated_ok = 0
         else:
             # Single cache pass: collect hits and misses together instead of
             # calling the expensive fuzzy cache.get() twice per string
             to_trans = []
+            cache_hits = 0
             for t in texts:
                 c = self.cache.get(t)
                 if c:
                     mapping[t] = c
+                    cache_hits += 1
                 else:
                     to_trans.append(t)
+            if cache_hits:
+                logger(f"Cache: {cache_hits} string(s) from cache")
+            translated_ok = len(texts) - len(to_trans)
 
         try:
             chunk_size = 5 if "Ollama" in self.provider else self.batch_size
             total_chunks = (len(to_trans) + chunk_size - 1) // chunk_size if to_trans else 0
             for i in range(0, len(to_trans), chunk_size):
                 if progress_callback:
-                    progress_callback(i // chunk_size, total_chunks)
+                    progress_callback(i // chunk_size, total_chunks, translated_ok, len(to_trans))
                 if check_status: await check_status()
                 chunk = to_trans[i:i+chunk_size]
-                
+
                 chunk_to_send = [t for t in chunk if t not in mapping]
                 if not chunk_to_send:
+                    translated_ok += len(chunk)
                     continue
-                
+
                 if progress_callback:
-                    progress_callback(i // chunk_size, total_chunks, min(i + chunk_size, len(to_trans)), len(to_trans))
+                    progress_callback(i // chunk_size, total_chunks, translated_ok, len(to_trans))
                 try:
                     res = await self.translator.translate(chunk_to_send, logger, check_status, context=filepath.name)
                     new_map = {}
                     for orig, trans in zip(chunk_to_send, res):
-                        new_map[orig] = sanitize_with_original(orig, trans)
+                        new_map[orig] = apply_dictionary(sanitize_with_original(orig, trans), self.dictionary)
                 except (AbortException, ValueError):
                     raise
                 except Exception as e:
@@ -1575,17 +1989,18 @@ class SNBTManager:
                         if check_status: await check_status()
                         try:
                             res_single = await self.translator.translate([item], logger, check_status, context=filepath.name)
-                            new_map[item] = res_single[0]
+                            new_map[item] = apply_dictionary(sanitize_with_original(item, res_single[0]), self.dictionary)
                         except (AbortException, ValueError):
                             raise
                         except Exception:
                             new_map[item] = item
                             
                 mapping.update(new_map)
-                self.cache.save_batch(new_map, modpack=self.modpack)
-                
+                self.cache.save_batch({o: t for o, t in new_map.items() if o != t}, modpack=self.modpack)
+                translated_ok += sum(1 for orig, trans in new_map.items() if orig != trans)
+
                 if progress_callback:
-                    progress_callback((i + chunk_size) // chunk_size, total_chunks, min(i + chunk_size, len(to_trans)), len(to_trans))
+                    progress_callback((i + chunk_size) // chunk_size, total_chunks, translated_ok, len(to_trans))
 
                 for orig, trans in new_map.items():
                     if orig != trans:
@@ -1594,22 +2009,23 @@ class SNBTManager:
                         if self.translator.mixed_pool:
                             provider_name = "Mixed"
                             model_name = "Multiple"
-                        orig_str = str(orig)[:40]
-                        trans_str = str(trans)[:40]
-                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig_str}...\" -> \"{trans_str}...\"")
+                        orig_str = str(orig)
+                        trans_str = str(trans)
+                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig_str}\" -> \"{trans_str}\"")
                 
                 if "Ollama" not in self.provider and "Google Translate" not in self.provider:
                     next_chunk = to_trans[i+chunk_size:i+chunk_size*2]
                     next_to_send = [t for t in next_chunk if t not in mapping]
                     if next_to_send:
                         # With several keys in the pool round-robin rotation spreads
-                        # the load; the fixed 3s throttle is only needed for small pools
+                        # the load; the fixed throttle is only needed for small pools
                         pool_len = max(1, len(getattr(self.translator, 'mixed_pool', []) or []))
                         if pool_len < 4:
-                            await countdown_sleep(3, "Delay between chunks", logger, check_status)
-        except AbortException:
-            logger(f"Aborted processing of {filepath.name}.")
-            logging.getLogger("snbt_localizer.core").warning(f"Aborted processing of {filepath.name}.")
+                            await countdown_sleep(1, "Delay between chunks", logger, check_status)
+        except AbortException as e:
+            reason = f" ({e})" if str(e) else ""
+            logger(f"Aborted processing of {filepath.name}{reason}.")
+            logging.getLogger("snbt_localizer.core").warning(f"Aborted processing of {filepath.name}{reason}.")
             raise
 
         final_content = apply_mapping_to_content(content)
@@ -1647,7 +2063,7 @@ class SNBTManager:
                 tmp_path.unlink(missing_ok=True)
                 raise
 
-        return len(texts)
+        return translated_ok
 
 class JSONManager:
     def __init__(
@@ -1666,6 +2082,7 @@ class JSONManager:
     ):
         self.base_dir = Path(base_dir).resolve()
         self.target_lang_code = target_lang_code
+        self.dictionary = load_translation_dictionary()
         self.translator = translator
         self.cache = cache
         self.modpack = modpack
@@ -1711,6 +2128,8 @@ class JSONManager:
             left_trans, right_trans = await asyncio.gather(left_task, right_task)
 
             return left_trans + right_trans
+        except AbortException:
+            raise
         except Exception as e:
             log_callback(f"Unexpected translation error: {e}")
             return texts
@@ -1720,7 +2139,23 @@ class JSONManager:
         for lang_dir in self.base_dir.rglob("lang"):
             if lang_dir.is_dir() and (lang_dir / "en_us.json").exists():
                 lang_dirs.add(lang_dir)
+            # FTB Quests 26.x: lang/en_us/ is a DIRECTORY of .json5 files
+            # (chapter.json5, chapters/*.json5, ...), values may be str or [str]
+            if lang_dir.is_dir() and (lang_dir / "en_us").is_dir() and any((lang_dir / "en_us").glob("*.json5")):
+                lang_dirs.add(lang_dir)
         return sorted(lang_dirs)
+
+    @staticmethod
+    def _load_json5(path: Path):
+        """Parse a JSON5 lang file (quoted keys + trailing commas are OK)."""
+        import re as _re
+        raw = path.read_text(encoding="utf-8")
+        return json.loads(_re.sub(r',(\s*[}\]])', r'\1', raw))
+
+    @staticmethod
+    def _dump_json5(data) -> str:
+        """Serialize back as strict JSON — valid JSON5, de.marhali.json5 reads it."""
+        return json.dumps(data, indent=2, ensure_ascii=False)
 
     def _is_translatable(self, text: str) -> bool:
         return len(text) > 1 and not ID_PATTERN.match(text) and not UUID_PATTERN.match(text)
@@ -1734,161 +2169,235 @@ class JSONManager:
         total_translated = 0
         total_strings = 0
 
-        for lang_dir in lang_dirs:
-            source_file = lang_dir / "en_us.json"
-            target_lang = self.target_lang_code.lower().replace("-", "_")
-            if self.resource_pack_mode:
-                modpack_root = self.base_dir
-                found_root = False
-                while len(modpack_root.parts) > 1:
-                    if (modpack_root / "mods").is_dir() or (modpack_root / "config").is_dir() or (modpack_root / "kubejs").is_dir():
-                        found_root = True
-                        break
-                    modpack_root = modpack_root.parent
-                if not found_root:
-                    # Never mkdir resourcepacks on an arbitrary ancestor (could
-                    # hit the filesystem root); fall back to the instance dir
-                    log_callback(f"Modpack root not found for resource pack mode, using {self.base_dir}")
-                    modpack_root = self.modpack_root or self.base_dir
-                pack_dir = modpack_root / "resourcepacks" / f"Modpack_Local_{target_lang}"
-                pack_mcmeta_path = pack_dir / "pack.mcmeta"
-                if not pack_mcmeta_path.exists():
-                    pack_dir.mkdir(parents=True, exist_ok=True)
-                    pack_mcmeta_path.write_text(json.dumps({
-                        "pack": {
-                            "pack_format": 15,
-                            "description": f"SNBT AI Localizer compiled translations"
-                        }
-                    }, indent=2), encoding="utf-8")
-                logo_path = get_resource_path("resources/logo.png")
-                if logo_path.exists():
-                    try:
-                        (pack_dir / "pack.png").write_bytes(logo_path.read_bytes())
-                    except Exception:
-                        pass
-                rel_path = lang_dir.relative_to(self.base_dir)
-                target_lang_dir = pack_dir / rel_path
-                target_lang_dir.mkdir(parents=True, exist_ok=True)
-                target_file = target_lang_dir / f"{target_lang}.json"
-            else:
-                target_file = lang_dir / f"{target_lang}.json"
-
-            # Update translator with modpack_root if not already set
-            if self.translator.modpack_root is None and self.modpack_root is not None:
-                self.translator.modpack_root = self.modpack_root
-                self.translator.prompt += f" {build_mod_context(self.modpack_root)}"
-
-            source_data = {}
-            try:
-                with open(source_file, 'r', encoding='utf-8') as f:
-                    source_data = json.load(f)
-            except Exception as e:
-                # One broken en_us.json must not kill the whole JSON phase
-                log_callback(f"Failed to read {source_file}: {e}. Skipping directory.")
-                continue
-
-            target_data = {}
-            policy_normalized = self.policy.lower().split('(')[0].strip()
-            if target_file.exists() and policy_normalized == "complement":
-                try:
-                    with open(target_file, 'r', encoding='utf-8') as f:
-                        target_data = json.load(f)
-                except Exception:
-                    pass
-
-            strings_to_translate = {}
-            for key, value in source_data.items():
-                if not isinstance(value, str):
-                    continue
-                if not self._is_translatable(value):
-                    continue
-                if policy_normalized == "complement" and key in target_data and target_data[key] and target_data[key] != value:
-                    continue
-                strings_to_translate[key] = value
-
-            if not strings_to_translate:
-                continue
-
-            all_keys = list(strings_to_translate.keys())
-            all_values = list(strings_to_translate.values())
-            total_strings += len(all_values)
-
-            batch_size = self.batch_size
-            processed_strings = 0
-            for i in range(0, len(all_values), batch_size):
-                if check_status:
-                    await check_status()
-                batch_values = all_values[i:i + batch_size]
-                batch_keys = all_keys[i:i + batch_size]
-
-                cache_hits = {}
-                cache_misses = []
-                for key, value in zip(batch_keys, batch_values):
-                    cached = self.cache.get(value)
-                    if cached:
-                        cache_hits[key] = clean_and_unpack_string(cached)
-                    else:
-                        cache_misses.append((key, value))
-
-                if cache_misses:
-                    texts_to_translate = [value for _, value in cache_misses]
-                    translations = await self._translate_with_recovery(
-                        texts_to_translate,
-                        log_callback,
-                        check_status,
-                        "JSON"
-                    )
-
-                    for (key, original_value), translation in zip(cache_misses, translations):
-                        cache_hits[key] = sanitize_with_original(original_value, clean_and_unpack_string(translation))
-
-                    self.cache.save_batch(
-                        {value: translation for value, translation in zip(texts_to_translate, translations)},
-                        modpack=self.modpack
-                    )
-
-                for key in batch_keys:
-                    if key in cache_hits:
-                        strings_to_translate[key] = cache_hits[key]
-                        total_translated += 1
-
-                processed_strings += len(batch_values)
-                log_callback(f"Translating JSON: {processed_strings}/{total_strings} strings ({(processed_strings / total_strings) * 100:.1f}%)")
-                if self.progress_callback:
-                    self.progress_callback(processed_strings, total_strings)
-
-            result_data = {}
-            for key, value in source_data.items():
-                if isinstance(value, str) and key in strings_to_translate:
-                    result_data[key] = strings_to_translate[key]
-                elif policy_normalized == "complement" and key in target_data and target_data[key]:
-                    result_data[key] = target_data[key]
+        try:
+            for lang_dir in lang_dirs:
+                target_lang = self.target_lang_code.lower().replace("-", "_")
+                if self.resource_pack_mode:
+                    modpack_root = self.base_dir
+                    found_root = False
+                    while len(modpack_root.parts) > 1:
+                        if (modpack_root / "mods").is_dir() or (modpack_root / "config").is_dir() or (modpack_root / "kubejs").is_dir():
+                            found_root = True
+                            break
+                        modpack_root = modpack_root.parent
+                    if not found_root:
+                        log_callback(f"Modpack root not found for resource pack mode, using {self.base_dir}")
+                        modpack_root = self.modpack_root or self.base_dir
+                    pack_dir = modpack_root / "resourcepacks" / f"Modpack_Local_{target_lang}"
+                    pack_mcmeta_path = pack_dir / "pack.mcmeta"
+                    if not pack_mcmeta_path.exists():
+                        pack_dir.mkdir(parents=True, exist_ok=True)
+                        pack_mcmeta_path.write_text(json.dumps({
+                            "pack": {
+                                "pack_format": 15,
+                                "supported_formats": {"min_format": 15, "max_format": 99},
+                                "description": f"SNBT AI Localizer compiled translations"
+                            }
+                        }, indent=2), encoding="utf-8")
+                        logo_path = get_resource_path("resources/logo.png")
+                        if logo_path.exists():
+                            try:
+                                (pack_dir / "pack.png").write_bytes(logo_path.read_bytes())
+                            except Exception:
+                                pass
+                    rel_path = lang_dir.relative_to(self.base_dir)
+                    target_lang_dir = pack_dir / rel_path
+                    target_lang_dir.mkdir(parents=True, exist_ok=True)
                 else:
-                    result_data[key] = value
+                    target_lang_dir = lang_dir
 
-            target_file.parent.mkdir(parents=True, exist_ok=True)
-            backup_file = target_file.with_suffix('.json.bak')
-            if target_file.exists():
-                try:
-                    import shutil
-                    shutil.copy2(target_file, backup_file)
-                except Exception:
-                    pass
+                # Each lang dir yields one or more (source, target, is_json5) jobs:
+                # - classic:        lang/en_us.json     -> lang/<locale>.json
+                # - FTB Quests 26.x: lang/en_us/*.json5 -> lang/<locale>/*.json5
+                en_us_dir = lang_dir / "en_us"
+                file_jobs = []
+                if en_us_dir.is_dir() and any(en_us_dir.rglob("*.json5")):
+                    for src5 in sorted(en_us_dir.rglob("*.json5")):
+                        rel = src5.relative_to(en_us_dir)
+                        file_jobs.append((src5, target_lang_dir / target_lang / rel, True))
+                    log_callback(f"FTB Quests 26.x lang directory detected: {len(file_jobs)} .json5 file(s) in {en_us_dir}")
+                else:
+                    file_jobs.append((lang_dir / "en_us.json", target_lang_dir / f"{target_lang}.json", False))
 
-            tmp_target = target_file.with_name(target_file.name + ".tmp")
-            try:
-                with open(tmp_target, 'w', encoding='utf-8') as f:
-                    json.dump(result_data, f, ensure_ascii=False, indent=4)
-                os.replace(tmp_target, target_file)
-            except BaseException:
-                tmp_target.unlink(missing_ok=True)
-                raise
+                # Update translator with modpack_root if not already set
+                if self.translator.modpack_root is None and self.modpack_root is not None:
+                    self.translator.modpack_root = self.modpack_root
+                    self.translator.prompt += f" {build_mod_context(self.modpack_root)}"
+
+                for source_file, target_file, is_json5 in file_jobs:
+                    source_data = {}
+                    try:
+                        if is_json5:
+                            source_data = self._load_json5(source_file)
+                        else:
+                            async with aiofiles.open(source_file, 'r', encoding='utf-8') as f:
+                                source_data = json.loads(await f.read())
+                    except Exception as e:
+                        # One broken source file must not kill the whole JSON phase
+                        log_callback(f"Failed to read {source_file}: {e}. Skipping file.")
+                        continue
+
+                    target_data = {}
+                    policy_normalized = self.policy.lower().split('(')[0].strip()
+                    if target_file.exists() and policy_normalized == "complement":
+                        try:
+                            if is_json5:
+                                target_data = self._load_json5(target_file)
+                            else:
+                                async with aiofiles.open(target_file, 'r', encoding='utf-8') as f:
+                                    target_data = json.loads(await f.read())
+                        except Exception:
+                            pass
+
+                    # Collect translatable strings. In json5 lang files a value
+                    # may be a plain string OR a list of strings (FTB Quests 26.x
+                    # quest_desc = ["para1", "para2", ...]); each list element is
+                    # translated independently, keyed by "key[N]".
+                    strings_to_translate = {}
+                    for key, value in source_data.items():
+                        if isinstance(value, str):
+                            if not self._is_translatable(value):
+                                continue
+                            if policy_normalized == "complement" and key in target_data and target_data[key] and target_data[key] != value:
+                                continue
+                            strings_to_translate[key] = value
+                        elif isinstance(value, list) and value and all(isinstance(x, str) for x in value):
+                            for idx, item in enumerate(value):
+                                if not self._is_translatable(item):
+                                    continue
+                                flat_key = f"{key}[{idx}]"
+                                if policy_normalized == "complement":
+                                    tgt_list = target_data.get(key) if isinstance(target_data.get(key), list) else None
+                                    if tgt_list and idx < len(tgt_list) and tgt_list[idx] and tgt_list[idx] != item:
+                                        continue
+                                strings_to_translate[flat_key] = item
+
+                    if not strings_to_translate:
+                        continue
+
+                    all_keys = list(strings_to_translate.keys())
+                    all_values = list(strings_to_translate.values())
+                    total_strings += len(all_values)
+
+                    batch_size = self.batch_size
+                    processed_strings = 0
+                    for i in range(0, len(all_values), batch_size):
+                        if check_status:
+                            await check_status()
+                        batch_values = all_values[i:i + batch_size]
+                        batch_keys = all_keys[i:i + batch_size]
+
+                        cache_hits = {}
+                        cache_misses = []
+                        skip_cache = (policy_normalized == "overwrite")
+                        for key, value in zip(batch_keys, batch_values):
+                            cached = None if skip_cache else self.cache.get(value)
+                            if cached:
+                                cache_hits[key] = clean_and_unpack_string(cached)
+                            else:
+                                cache_misses.append((key, value))
+                        if cache_hits:
+                            log_callback(f"Cache: {len(cache_hits)} string(s) from cache")
+
+                        if cache_misses:
+                            texts_to_translate = [value for _, value in cache_misses]
+                            translations = await self._translate_with_recovery(
+                                texts_to_translate,
+                                log_callback,
+                                check_status,
+                                "JSON"
+                            )
+
+                            sanitized = {}
+                            for (key, original_value), translation in zip(cache_misses, translations):
+                                cleaned = clean_and_unpack_string(translation)
+                                sanitized[key] = apply_dictionary(sanitize_with_original(original_value, cleaned), self.dictionary)
+                                cache_hits[key] = sanitized[key]
+
+                            provider_name = self.translator.provider
+                            model_name = self.translator.model
+                            if self.translator.mixed_pool:
+                                provider_name = "Mixed"
+                                model_name = "Multiple"
+                            for (key, original_value) in cache_misses:
+                                trans_value = sanitized.get(key)
+                                if trans_value and trans_value != original_value:
+                                    orig_str = str(original_value)
+                                    trans_str = str(trans_value)
+                                    log_callback(f"Translated [{provider_name} / {model_name}]: \"{orig_str}\" -> \"{trans_str}\"")
+
+                            self.cache.save_batch(
+                                {value: sanitized[key] for (key, value) in cache_misses if value != sanitized[key]},
+                                modpack=self.modpack
+                            )
+
+                        for key in batch_keys:
+                            if key in cache_hits:
+                                strings_to_translate[key] = cache_hits[key]
+                                if cache_hits[key] != source_data.get(key):
+                                    total_translated += 1
+
+                        processed_strings += len(batch_values)
+                        log_callback(f"Translating JSON: {processed_strings}/{total_strings} strings ({(processed_strings / total_strings) * 100:.1f}%)")
+                        if self.progress_callback:
+                            self.progress_callback(processed_strings, total_strings)
+
+                    # Reassemble result: plain strings come straight from
+                    # strings_to_translate; json5 list values are rebuilt from
+                    # their per-element "key[N]" translations.
+                    result_data = {}
+                    for key, value in source_data.items():
+                        if isinstance(value, str) and key in strings_to_translate:
+                            result_data[key] = strings_to_translate[key]
+                        elif isinstance(value, list):
+                            new_list = []
+                            for idx, item in enumerate(value):
+                                flat = f"{key}[{idx}]"
+                                if flat in strings_to_translate:
+                                    new_list.append(strings_to_translate[flat])
+                                else:
+                                    tgt_list = target_data.get(key) if isinstance(target_data.get(key), list) else None
+                                    if policy_normalized == "complement" and tgt_list and idx < len(tgt_list) and tgt_list[idx]:
+                                        new_list.append(tgt_list[idx])
+                                    else:
+                                        new_list.append(item)
+                            result_data[key] = new_list
+                        elif policy_normalized == "complement" and key in target_data and target_data[key]:
+                            result_data[key] = target_data[key]
+                        else:
+                            result_data[key] = value
+
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    backup_file = target_file.with_suffix('.json5.bak' if is_json5 else '.json.bak')
+                    if target_file.exists():
+                        try:
+                            import shutil
+                            shutil.copy2(target_file, backup_file)
+                        except Exception:
+                            pass
+
+                    tmp_target = target_file.with_name(target_file.name + ".tmp")
+                    try:
+                        if is_json5:
+                            async with aiofiles.open(tmp_target, 'w', encoding='utf-8') as f:
+                                await f.write(self._dump_json5(result_data))
+                        else:
+                            async with aiofiles.open(tmp_target, 'w', encoding='utf-8') as f:
+                                await f.write(json.dumps(result_data, ensure_ascii=False, indent=4))
+                        os.replace(tmp_target, target_file)
+                    except BaseException:
+                        tmp_target.unlink(missing_ok=True)
+                        raise
+
+        finally:
+            await close_shared_httpx_clients()
 
         if self.progress_callback:
             self.progress_callback(total_translated, total_strings)
 
         log_callback(f"JSON translation completed. Translated {total_translated} strings.")
         return total_translated
+
 
 def find_modpack_root(path: Path) -> Optional[Path]:
     """
@@ -2005,5 +2514,56 @@ def build_mod_context(modpack_root: Optional[Path]) -> str:
     except Exception as e:
         logger.warning(f"Failed to build mod context: {e}")
         return ""
+
+_DICTIONARY_PATTERN_CACHE = {}
+
+def load_translation_dictionary() -> Dict[str, str]:
+    """Load the user term dictionary.
+
+    ~/.snbt-tr/dictionary.json takes priority over the bundled
+    resources/dictionary.json, so user terms survive app updates.
+    """
+    candidates = [
+        Path.home() / ".snbt-tr" / "dictionary.json",
+        get_resource_path("resources/dictionary.json"),
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    result = {str(k).strip(): str(v).strip() for k, v in data.items()}
+                    result = {k: v for k, v in result.items() if k and v}
+                    if result:
+                        logger.info(f"Loaded translation dictionary with {len(result)} terms from {path}")
+                    return result
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            logger.warning(f"Failed to load dictionary from {path}: {e}")
+    return {}
+
+def apply_dictionary(text: str, dictionary: Dict[str, str]) -> str:
+    """Replace dictionary terms in a translation, preserving basic casing."""
+    if not text or not dictionary:
+        return text
+    for term, translation in dictionary.items():
+        pattern = _DICTIONARY_PATTERN_CACHE.get(term)
+        if pattern is None:
+            try:
+                pattern = re.compile(r'\b' + re.escape(term) + r'\b', re.IGNORECASE)
+            except re.error:
+                continue
+            _DICTIONARY_PATTERN_CACHE[term] = pattern
+
+        def _sub(match, translation=translation):
+            src = match.group(0)
+            if src.isupper():
+                return translation.upper()
+            if src[:1].isupper():
+                return translation[:1].upper() + translation[1:]
+            return translation
+
+        text = pattern.sub(_sub, text)
+    return text
 
 KubeJSManager = JSONManager

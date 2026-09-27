@@ -93,6 +93,17 @@ def test_tab_disabled_during_work(qtbot):
         app = App()
         qtbot.addWidget(app)
 
+        # Background instance scan leaves "SCANNING" in dir_box; point the
+        # combo at a fake quest dir so the start handler passes validation
+        fake_instance = Path("/tmp/quest_instance")
+        app.instance_quest_dirs[fake_instance] = [fake_instance]
+        app._disconnect_dir_box()
+        app.dir_box.clear()
+        app.dir_box.addItem("Test Instance", str(fake_instance))
+        # The scan has not run yet, so the Run button is disabled; enable it
+        # manually - the assertion below targets the disable logic itself
+        app.btn_run.setEnabled(True)
+
         assert app.tabs.isTabEnabled(1) == True
 
         with qtbot.capture_exceptions():

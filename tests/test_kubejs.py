@@ -97,6 +97,7 @@ def test_kubejs_manager_complement(tmp_path, mock_translator, mock_cache):
     assert result["key1"] == "Привет"
     assert result["key2"] == "Translated"
 
+@pytest.mark.gui
 def test_kubejs_worker_execution(tmp_path, qtbot):
     from gui import JSONWorker
 

@@ -7,14 +7,14 @@ def test_smart_parse_key_gsk_trailing_backslash():
     config = ConfigManager()
     key, model = config.smart_parse_key("gsk_123\\")
     assert key == "gsk_123"
-    assert model == "llama-3.3-70b-versatile"
+    assert model == "qwen/qwen3.8-27b"
 
 
 def test_smart_parse_key_nvapi_no_backslash():
     config = ConfigManager()
     key, model = config.smart_parse_key("nvapi-456")
     assert key == "nvapi-456"
-    assert model == "nvidia/nemotron-3-ultra"
+    assert model == "nvidia/nemotron-3-super-120b-a12b"
 
 
 def test_smart_parse_key_sk_or_with_model():

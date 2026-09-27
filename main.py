@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict
 from logging.handlers import RotatingFileHandler
-from core import SNBTManager, EXCLUDED_DIRS, parse_target_lang, TranslationCache, UnifiedTranslator, AbortException, get_base_url, detect_provider, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, find_quests_dir
+from core import SNBTManager, EXCLUDED_DIRS, TranslationCache, UnifiedTranslator, AbortException, get_base_url, is_valid_custom_instance, PROVIDER_DEFAULTS, JSONManager, find_quests_dir
 from config import ConfigManager, PROVIDER_ALIASES, PROVIDER_ENDPOINTS, LANG_ALIASES, ENV_KEY_MAP, SETTINGS_KEY_MAP
 try:
     from PyQt6.QtCore import QSettings
@@ -426,8 +426,7 @@ async def run_setup_wizard(config: ConfigManager, parsed=None) -> tuple[Path, st
                 if "gemini-3.1-flash-lite" in models[i] and not models[i].endswith(" [RECOMMENDED]"):
                     models[i] = models[i] + " [RECOMMENDED]"
         last_model = load_cli_setting(f"cli_last_model_{provider}", "")
-        default_model = PROVIDER_DEFAULTS.get(provider)
-        
+
         def sort_key(m):
             base = m.replace(" [RECOMMENDED]", "")
             if base == last_model:
@@ -1011,6 +1010,8 @@ def find_modpack_root_from_quest_dir(qd: Path) -> Path:
     return Path(qd).resolve()
 
 async def run_translation(config: ConfigManager, provider: str, model: str | None, api_keys: List[str], lang_name: str, lang_code: str, quest_dirs: list[Path], concurrency: Optional[int] = None, resource_pack_mode: bool = False) -> int:
+    from core import set_temperature
+    set_temperature(getattr(config, "temperature", 0.1))
     logging.getLogger("snbt_localizer.cli").info(f"Provider: {provider}")
     if model:
         logging.getLogger("snbt_localizer.cli").info(f"Model: {model}")
@@ -1026,7 +1027,6 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     else:
         logging.getLogger("snbt_localizer.cli").info("API Keys: Not Set")
 
-    limit = concurrency if concurrency is not None else config.concurrency
     mixed_pool = []
     if provider == "Mixed Providers":
         pairs = parse_key_model_pairs(api_keys)
@@ -1112,6 +1112,10 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         f"Starting localization. Active Provider: {provider}, Active Model: {model or 'N/A'}, Keys in Pool: {len(api_keys)}"
     )
     logging.getLogger("snbt_localizer.cli").info(f"Found {total_files} files")
+    from core import TranslationCache
+    _af_cache = TranslationCache(target_lang_code=lang_code)
+    _af_cache.autofix_records(log=lambda m: logging.getLogger("snbt_localizer.cli").info(m))
+    _af_cache.close()
     policy = resolve_policy(config.policy)
     file_progress = {idx: 0.0 for idx in range(total_files)}
 
@@ -1180,6 +1184,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     try:
         await asyncio.gather(*tasks)
     except (AbortException, ValueError):
+        from core import close_shared_httpx_clients
+        await close_shared_httpx_clients()
         logging.getLogger("snbt_localizer.cli").error("Критическая ошибка: все ключи невалидны. Перевод прерван.")
         return 1
     sys.stdout.write('\n')
@@ -1204,6 +1210,7 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
             custom_base_url=config.custom_base_url or None
         )
         cache = TranslationCache(target_lang_code=lang_code)
+        cache.autofix_records(log=lambda m: logging.getLogger("snbt_localizer.cli").info(m))
         for base_dir in json_lang_dirs:
             logging.getLogger("snbt_localizer.cli").info(f"JSON translation mode detected. Processing lang files in {base_dir}...")
             manager = JSONManager(
@@ -1251,6 +1258,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
             "ВНИМАНИЕ: Флаг -r / --resource-pack передан, но в модпаке не найдена папка KubeJS (kubejs/assets/). Ресурс-пак не был создан."
         )
 
+    from core import close_shared_httpx_clients
+    await close_shared_httpx_clients()
     return 0
 
 async def main_async() -> int:
@@ -1263,7 +1272,6 @@ async def main_async() -> int:
         from gui import main as gui_main
         gui_main()
         return 0
-    cli_logger = logging.getLogger("snbt_localizer.cli")
 
     if getattr(parsed, 'list_models', False):
         return await cmd_list_models(config.provider)
@@ -1348,7 +1356,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.getLogger("snbt_localizer.cli").error("[SIGINT] Получен сигнал прерывания. Безопасная остановка (Graceful Shutdown)...")
         sys.exit(130)
-    except Exception as e:
+    except Exception:
         logging.getLogger("snbt_localizer.cli").exception("Unexpected error")
         sys.exit(1)
 

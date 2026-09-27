@@ -1,4 +1,3 @@
-import os
 import sys
 import argparse
 import logging
@@ -11,7 +10,7 @@ try:
 except ImportError:
     QSettings = None
 
-APP_VERSION = "1.1.28"
+APP_VERSION = "1.1.30"
 
 PROVIDER_ALIASES = {
     "google": "Google Translate (Free)",
@@ -56,6 +55,7 @@ PROVIDER_ENDPOINTS = {
 
 LANG_ALIASES = {
     "ru": ("Russian", "ru_ru"),
+    "uk": ("Ukrainian", "uk_ua"),
     "en": ("English", "en_us"),
     "es": ("Spanish", "es_es"),
     "zh": ("Chinese Simplified", "zh_cn"),
@@ -135,6 +135,7 @@ class ConfigManager:
         self.batch_size: int = 50
         self.min_batch_size: int = 1
         self.max_concurrent_requests: int = 10
+        self.temperature: float = 0.1
 
         self.load_from_settings()
 
@@ -189,6 +190,11 @@ class ConfigManager:
 
         self.batch_size = self._int_setting(s, "batch_size", 50)
         self.min_batch_size = self._int_setting(s, "min_batch_size", 1)
+        try:
+            self.temperature = float(s.value("temperature", 0.1))
+        except (TypeError, ValueError):
+            self.temperature = 0.1
+        self.temperature = max(0.0, min(2.0, self.temperature))
         self.max_concurrent_requests = self._int_setting(s, "max_concurrent_requests", 10)
         self.resource_pack_mode = s.value("resource_pack_mode", self.resource_pack_mode)
         if isinstance(self.resource_pack_mode, str):
@@ -232,6 +238,7 @@ class ConfigManager:
 
         s.setValue("batch_size", self.batch_size)
         s.setValue("min_batch_size", self.min_batch_size)
+        s.setValue("temperature", self.temperature)
         s.setValue("max_concurrent_requests", self.max_concurrent_requests)
         s.setValue("resource_pack_mode", self.resource_pack_mode)
         s.setValue("quest_dir", str(self.quest_dir) if self.quest_dir else "")
@@ -262,6 +269,8 @@ class ConfigManager:
                             help="Minimum batch size before failing (default: saved setting)")
         parser.add_argument("--max-concurrent-requests", type=int, default=None,
                             help="Max concurrent API requests (default: saved setting)")
+        parser.add_argument("--temperature", type=float, default=None,
+                            help="LLM sampling temperature 0.0-2.0 (default: 0.1)")
         parser.add_argument("--resource-pack", "-r", action="store_true", help="Enable Resource Pack Mode for JSON translation")
 
         parsed = parser.parse_args(args)
@@ -311,6 +320,8 @@ class ConfigManager:
         if parsed.concurrency:
             self.concurrency = max(1, min(parsed.concurrency, 10))
 
+        if parsed.temperature is not None:
+            self.temperature = max(0.0, min(2.0, float(parsed.temperature)))
         if parsed.batch_size:
             self.batch_size = max(1, parsed.batch_size)
         if parsed.min_batch_size:

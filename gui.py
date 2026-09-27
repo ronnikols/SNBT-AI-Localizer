@@ -7,19 +7,17 @@ import random
 import time
 import logging
 import weakref
-import tempfile
-import subprocess
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QFileDialog, QLineEdit, 
                              QTextEdit, QLabel, QComboBox, QListView, QCheckBox, 
                              QCompleter, QStyleFactory, QProgressBar, QMessageBox,
-                             QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
-                             QTabWidget, QHeaderView, QFrame, QProgressDialog)
-from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, pyqtSlot, QUrl
-from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices
+                             QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
+                             QTabWidget, QHeaderView, QFrame)
+from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, QUrl
+from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices, QPainter
 import httpx
-from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, detect_kubejs_mode, JSONManager, get_resource_path, get_base_url, detect_provider, test_key_with_question, TEST_QUESTIONS
+from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, JSONManager, get_resource_path, get_base_url, detect_provider, test_key_with_question, fetch_provider_balance, TEST_QUESTIONS, REASONING_EFFORT_LEVELS, parse_model_effort, set_temperature
 from config import ConfigManager, APP_VERSION
 
 LOCALES = {
@@ -84,7 +82,8 @@ LOCALES = {
         "lang_fr_fr": "French (fr_fr)",
         "lang_pt_br": "Portuguese (pt_br)",
         "lang_ja_jp": "Japanese (ja_jp)",
-        "lang_ko_kr": "Korean (ko_kr)"
+        "lang_ko_kr": "Korean (ko_kr)",
+        "lang_uk_ua": "Ukrainian (uk_ua)"
     },
     "ru": {
         "window_title": "SNBT AI Локализатор",
@@ -147,7 +146,8 @@ LOCALES = {
         "lang_fr_fr": "Французский (fr_fr)",
         "lang_pt_br": "Португальский (pt_br)",
         "lang_ja_jp": "Японский (ja_jp)",
-        "lang_ko_kr": "Корейский (ko_kr)"
+        "lang_ko_kr": "Корейский (ko_kr)",
+        "lang_uk_ua": "Украинский (uk_ua)"
     },
     "es": {
         "window_title": "Localizador de IA SNBT",
@@ -210,7 +210,8 @@ LOCALES = {
         "lang_fr_fr": "Francés (fr_fr)",
         "lang_pt_br": "Portugués (pt_br)",
         "lang_ja_jp": "Japonés (ja_jp)",
-        "lang_ko_kr": "Coreano (ko_kr)"
+        "lang_ko_kr": "Coreano (ko_kr)",
+        "lang_uk_ua": "Ucraniano (uk_ua)"
     },
     "de": {
         "window_title": "SNBT KI-Lokalisierer",
@@ -273,7 +274,8 @@ LOCALES = {
         "lang_fr_fr": "Französisch (fr_fr)",
         "lang_pt_br": "Portugiesisch (BR) (pt_br)",
         "lang_ja_jp": "Japanisch (ja_jp)",
-        "lang_ko_kr": "Koreanisch (ko_kr)"
+        "lang_ko_kr": "Koreanisch (ko_kr)",
+        "lang_uk_ua": "Ukrainisch (uk_ua)"
     },
     "fr": {
         "window_title": "Localisateur IA SNBT",
@@ -336,7 +338,8 @@ LOCALES = {
         "lang_fr_fr": "Français (fr_fr)",
         "lang_pt_br": "Portugais (BR) (pt_br)",
         "lang_ja_jp": "Japonais (ja_jp)",
-        "lang_ko_kr": "Coréen (ko_kr)"
+        "lang_ko_kr": "Coréen (ko_kr)",
+        "lang_uk_ua": "Ukrainien (uk_ua)"
     },
     "pt_br": {
         "window_title": "Localizador de IA SNBT",
@@ -399,7 +402,8 @@ LOCALES = {
         "lang_fr_fr": "Francês (fr_fr)",
         "lang_pt_br": "Português (BR) (pt_br)",
         "lang_ja_jp": "Japonês (ja_jp)",
-        "lang_ko_kr": "Coreano (ko_kr)"
+        "lang_ko_kr": "Coreano (ko_kr)",
+        "lang_uk_ua": "Ucraniano (uk_ua)"
     },
     "zh_cn": {
         "window_title": "SNBT AI 本地化工具",
@@ -462,7 +466,8 @@ LOCALES = {
         "lang_fr_fr": "法语 (fr_fr)",
         "lang_pt_br": "巴西葡萄牙语 (pt_br)",
         "lang_ja_jp": "日语 (ja_jp)",
-        "lang_ko_kr": "韩语 (ko_kr)"
+        "lang_ko_kr": "韩语 (ko_kr)",
+        "lang_uk_ua": "乌克兰语 (uk_ua)"
     }
 }
 
@@ -540,19 +545,43 @@ async def run_with_abort_watchdog(coro, is_aborted, log=None):
         await asyncio.sleep(0.25)
     return await task
 
+_ACTIVE_QTHREADS = set()
+
+def _track_qthread(thread):
+    """Keep a strong reference to a running QThread until it finishes.
+
+    Without this, a QThread whose Python wrapper gets garbage-collected while
+    the C++ thread is still running aborts the whole process
+    ("QThread: Destroyed while thread is still running").
+    """
+    _ACTIVE_QTHREADS.add(thread)
+    try:
+        thread.finished.connect(lambda t=thread: _ACTIVE_QTHREADS.discard(t))
+    except RuntimeError:
+        _ACTIVE_QTHREADS.discard(thread)
+    return thread
+
 class QtLogSignaler(QObject):
     log_signal = pyqtSignal(str, int)
 
 class QtLoggingHandler(logging.Handler):
-    def __init__(self, text_edit):
+    def __init__(self, text_edit, full_log_sink=None):
         super().__init__()
         self.signaler = QtLogSignaler()
         self.text_edit_ref = weakref.ref(text_edit)
+        self.full_log_sink = full_log_sink
         self.signaler.log_signal.connect(self._append_to_text_edit)
         self.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"))
 
     def _append_to_text_edit(self, msg, level):
         text_edit = self.text_edit_ref()
+        # Keep the shadow buffer complete even when the on-screen view trims
+        if self.full_log_sink is not None:
+            try:
+                self.full_log_sink(msg)
+                return
+            except Exception:
+                pass
         if text_edit is not None and not text_edit.signalsBlocked():
             try:
                 text_edit.append(msg)
@@ -745,7 +774,6 @@ def detect_instances() -> tuple[dict, dict]:
     detected = {}
     quest_dirs_mapping = {}
     home = Path.home()
-    MAX_DEPTH = 3
 
     paths = []
     if sys.platform == "win32":
@@ -829,6 +857,17 @@ def detect_instances() -> tuple[dict, dict]:
                 except Exception:
                     pass
     return detected, quest_dirs_mapping
+
+class InstanceScanner(QThread):
+    """Background scan of launcher instances - keeps the GUI thread free."""
+    instances_scanned = pyqtSignal(object, object)
+
+    def run(self):
+        try:
+            detected, quest_dirs_mapping = detect_instances()
+            self.instances_scanned.emit(detected, quest_dirs_mapping)
+        except Exception:
+            self.instances_scanned.emit({}, {})
 
 class UpdateChecker(QThread):
     update_available = pyqtSignal(str, str)
@@ -1006,6 +1045,17 @@ class SettingsTab(QWidget):
         max_requests_layout.addWidget(self.max_requests_spin)
         settings_row.addLayout(max_requests_layout)
 
+        temp_layout = QVBoxLayout()
+        self.temperature_label = QLabel("Temperature:")
+        self.temperature_spin = QDoubleSpinBox()
+        self.temperature_spin.setRange(0.0, 2.0)
+        self.temperature_spin.setSingleStep(0.1)
+        self.temperature_spin.setDecimals(2)
+        self.temperature_spin.setValue(0.1)
+        temp_layout.addWidget(self.temperature_label)
+        temp_layout.addWidget(self.temperature_spin)
+        settings_row.addLayout(temp_layout)
+
         settings_row.addStretch()
         settings_layout.addLayout(settings_row)
         self.layout.addWidget(settings_frame)
@@ -1071,6 +1121,89 @@ class SettingsTab(QWidget):
         self.config.resource_pack_mode = checked
         self.config.save_to_settings()
 
+class CacheHealerWorker(QThread):
+    """Auto-Fix healer: re-translates garbage cache entries (wrong-language
+    text, CJK leaks, mixed-alphabet words) with the ACTIVE provider/model."""
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # done, total
+    finished_heal = pyqtSignal(int, int, list)  # healed, failed, reasons
+
+    def __init__(self, violations, provider, model, keys, custom_context, target_lang_name, target_lang_code, custom_base_url=None, temperature=0.1, batch_size=50, modpack=None, parent=None):
+        super().__init__(parent)
+        self.violations = violations  # list of (orig, trans, reason, modpack)
+        self.provider = provider
+        self.model = model
+        self.keys = keys
+        self.custom_context = custom_context
+        self.target_lang_name = target_lang_name
+        self.target_lang_code = target_lang_code
+        self.custom_base_url = custom_base_url
+        self.temperature = temperature
+        self.batch_size = batch_size
+        self.modpack = modpack
+        self.cache = TranslationCache(target_lang_code=target_lang_code)
+        self.is_aborted = False
+
+    def run(self):
+        healed, failed = 0, 0
+        reasons_seen = []
+        try:
+            from core import set_temperature, get_target_script, script_violation_reason, UnifiedTranslator
+            set_temperature(self.temperature)
+            script = get_target_script(self.target_lang_code)
+            translator = UnifiedTranslator(
+                self.keys, self.provider, self.model,
+                self.custom_context, self.target_lang_name,
+                self.target_lang_code, batch_size=self.batch_size,
+                custom_base_url=self.custom_base_url,
+            )
+            total = len(self.violations)
+            done = 0
+            for i in range(0, total, self.batch_size):
+                if self.is_aborted:
+                    break
+                chunk = self.violations[i:i + self.batch_size]
+                texts = [v[0] for v in chunk]
+                try:
+                    results = asyncio.run(translator.translate(
+                        texts, self.log.emit, None, self.custom_context))
+                except Exception as e:
+                    self.log.emit(f"Auto-Fix heal: batch failed: {e}")
+                    results = None
+                if results is None or len(results) != len(chunk):
+                    failed += len(chunk)
+                    done += len(chunk)
+                    self.progress.emit(done, total)
+                    continue
+                updates = {}
+                for (orig, bad_trans, reason, mp), new_trans in zip(chunk, results):
+                    if not isinstance(new_trans, str) or not new_trans:
+                        failed += 1
+                        continue
+                    if new_trans == orig and reason != 'not_target_lang':
+                        # LLM returned the source unchanged: keep the old
+                        # translation rather than poisoning with identity
+                        failed += 1
+                        continue
+                    if script_violation_reason(new_trans, script):
+                        # LLM produced garbage again - keep the old value
+                        failed += 1
+                        reasons_seen.append(reason)
+                        continue
+                    updates[orig] = new_trans
+                    healed += 1
+                if updates:
+                    self.cache.update_records(updates)
+                done += len(chunk)
+                self.progress.emit(done, total)
+        except Exception as e:
+            self.log.emit(f"Auto-Fix heal error: {e}")
+        finally:
+            self.cache.close()
+            self.finished_heal.emit(healed, failed, reasons_seen)
+
+
 class TranslationMemoryTab(QWidget):
     language_changed = pyqtSignal(str)
 
@@ -1103,7 +1236,8 @@ class TranslationMemoryTab(QWidget):
         self.lang_filter.addItems([
             "Russian (ru_ru)", "Spanish (es_es)", "Chinese Simplified (zh_cn)",
             "Chinese Traditional (zh_tw)", "German (de_de)", "French (fr_fr)",
-            "Portuguese (pt_br)", "Japanese (ja_jp)", "Korean (ko_kr)"
+            "Portuguese (pt_br)", "Japanese (ja_jp)", "Korean (ko_kr)",
+            "Ukrainian (uk_ua)"
         ])
         self.lang_filter.currentTextChanged.connect(self._on_lang_filter_changed)
         search_layout.addWidget(self.lang_filter)
@@ -1147,6 +1281,10 @@ class TranslationMemoryTab(QWidget):
         self.clear_cache_btn = QPushButton("Clear Cache")
         self.clear_cache_btn.clicked.connect(self._on_clear_cache)
         button_layout.addWidget(self.clear_cache_btn)
+
+        self.autofix_btn = QPushButton("Auto-Fix")
+        self.autofix_btn.clicked.connect(self._on_autofix_cache)
+        button_layout.addWidget(self.autofix_btn)
 
         layout.addLayout(button_layout)
         self.setLayout(layout)
@@ -1251,6 +1389,111 @@ class TranslationMemoryTab(QWidget):
                 self.refresh_modpack_filter()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Cache clear error: {e}")
+
+    def _on_autofix_cache(self):
+        # Stage 1: repair broken technical syntax (placeholders/macros/links)
+        try:
+            fixed = self.cache.autofix_records()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Auto-fix error: {e}")
+            return
+
+        # Stage 2: find garbage translations (wrong language / CJK leaks /
+        # mixed-alphabet words) and offer to re-translate them with the
+        # ACTIVE provider/model from the workspace tab
+        try:
+            from core import get_target_script
+            lang_text = self.lang_filter.currentText()
+            _, lang_code = parse_target_lang(lang_text)
+            script = get_target_script(lang_code)
+            violations = self.cache.find_script_violations(script)
+        except Exception as e:
+            logging.getLogger("snbt_localizer.gui").error(f"Auto-fix scan failed: {repr(e)}")
+            violations = []
+
+        if not violations:
+            self.offset = 0
+            self.pending_updates.clear()
+            self.pending_deletions.clear()
+            self._load_data()
+            if fixed:
+                QMessageBox.information(self, "Auto-Fix", f"Repaired {fixed} cached translation(s). Cache is clean - no wrong-language garbage found.")
+            else:
+                QMessageBox.information(self, "Auto-Fix", "Cache is clean - no broken placeholders, no wrong-language garbage found.")
+            return
+
+        reason_names = {
+            'garbage_chars': 'replacement/zero-width characters',
+            'cjk_symbols': 'CJK symbols leaked into non-CJK text',
+            'mixed_script': 'words mixing two alphabets (e.g. "Лимитite")',
+            'not_target_lang': 'text is >=90% not in the target language',
+        }
+        summary_lines = [f"  {reason_names.get(r, r)}: {sum(1 for v in violations if v[2] == r)}" for r in dict.fromkeys(v[2] for v in violations)]
+        total = len(violations)
+
+        reply = QMessageBox.question(
+            self,
+            "Auto-Fix: garbage translations found",
+            (f"Found {total} cached translation(s) that look like garbage:\n\n"
+             + "\n".join(summary_lines)
+             + f"\n\nRe-translate all {total} with your ACTIVE provider/model?"
+                "\n(The old values will be replaced only when the new translation is clean.)"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        mw = getattr(self, 'main_window', None)
+        if mw is None:
+            QMessageBox.warning(self, "Auto-Fix", "Main window is not available - cannot heal the cache.")
+            return
+
+        prov = mw.config.provider
+        model = mw.model_box.currentText() or ""
+        custom_context = mw.settings_tab.context_in.text().strip()
+        custom_url = mw.custom_base_url_edit.text() if prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
+        temperature = mw.settings_tab.temperature_spin.value()
+        batch_size = mw.settings_tab.batch_spin.value()
+        keys = [k.strip() for k in mw.key_pool_edit.toPlainText().strip().splitlines() if k.strip()]
+
+        if prov not in ("Google Translate (Free)", "Ollama (Local / Free)") and not keys:
+            QMessageBox.warning(self, "Auto-Fix", "No API keys in the pool. Add keys on the Workspace tab first.")
+            return
+        if prov != "Google Translate (Free)" and not mw.is_model_valid():
+            QMessageBox.warning(self, "Auto-Fix", "Please select a valid model on the Workspace tab first.")
+            return
+
+        lang_name, lang_code = parse_target_lang(self.lang_filter.currentText())
+
+        self.autofix_btn.setEnabled(False)
+        self.healer = _track_qthread(CacheHealerWorker(
+            violations, prov, model, keys, custom_context,
+            lang_name, lang_code, custom_base_url=custom_url,
+            temperature=temperature, batch_size=batch_size,
+        ))
+        self.healer.log.connect(self._append_heal_log)
+        self.healer.progress.connect(self._on_heal_progress)
+        self.healer.finished_heal.connect(self._on_heal_finished)
+        self.healer.start()
+
+    def _append_heal_log(self, msg):
+        logging.getLogger("snbt_localizer.gui").info(msg)
+
+    def _on_heal_progress(self, done, total):
+        self.autofix_btn.setText(f"Healing {done}/{total}...")
+
+    def _on_heal_finished(self, healed, failed, reasons):
+        self.autofix_btn.setEnabled(True)
+        self.autofix_btn.setText("Auto-Fix")
+        self.offset = 0
+        self.pending_updates.clear()
+        self.pending_deletions.clear()
+        self._load_data()
+        if failed:
+            QMessageBox.warning(self, "Auto-Fix",
+                                f"Healed {healed} translation(s); {failed} could not be healed (LLM returned the same garbage or empty text - those entries keep their old values).")
+        else:
+            QMessageBox.information(self, "Auto-Fix", f"Healed {healed} translation(s).")
 
     def _on_lang_filter_changed(self, lang_text):
         lang_name, lang_code = parse_target_lang(lang_text)
@@ -1402,10 +1645,11 @@ class ModelLoader(QThread):
 class KeyVerifierWorker(QThread):
     verification_complete = pyqtSignal(dict, dict, str)
 
-    def __init__(self, specs):
+    def __init__(self, specs, show_provider=False):
         super().__init__()
         self.specs = specs
         self.cancelled = False
+        self.show_provider = show_provider
 
     def run(self):
         question = random.choice(TEST_QUESTIONS)
@@ -1416,6 +1660,15 @@ class KeyVerifierWorker(QThread):
                 if self.cancelled:
                     break
                 status, answer = asyncio.run(test_key_with_question(provider, key, model, question))
+                if status == "Model Paused":
+                    # answer carries the provider's pause message; keep it short
+                    answer = (answer or "model paused on provider side")[:80]
+                if self.show_provider and provider != "Mixed Providers":
+                    answer = f"[{provider}] {answer}" if answer else f"[{provider}]"
+                if status == "Active":
+                    balance = asyncio.run(fetch_provider_balance(provider, key))
+                    if balance:
+                        answer = f"{answer} | Balance: {balance}" if answer else f"Balance: {balance}"
                 results[key] = status
                 answers[key] = answer
         except Exception as e:
@@ -1432,7 +1685,7 @@ class Worker(QThread):
     lines_translated = pyqtSignal(int, int)
     progress_state = pyqtSignal(int, int, str, int, int, float)
 
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, modpack=None, custom_base_url=None, translator=None, cache=None, resource_pack_mode=False):
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, temperature=0.1, modpack=None, custom_base_url=None, translator=None, cache=None, resource_pack_mode=False):
         super().__init__()
         self.files = files
         self.keys = keys
@@ -1449,6 +1702,7 @@ class Worker(QThread):
         self.batch_size = batch_size
         self.min_batch_size = min_batch_size
         self.max_concurrent_requests = max_concurrent_requests
+        self.temperature = temperature
         self.modpack = modpack
         self.custom_base_url = custom_base_url
         self.translator = translator
@@ -1465,13 +1719,18 @@ class Worker(QThread):
     def run(self):
         try:
             from pathlib import Path
-            from core import JSONManager, parse_target_lang
+            from core import JSONManager, parse_target_lang, set_temperature
 
-            snbt_files = [f for f in self.files if str(f).endswith('.snbt')]
+            # Apply the GUI temperature setting to every provider payload.
+            set_temperature(self.temperature)
+
+            snbt_files = [f for f in self.files if str(f).endswith('.snbt') and not Path(f).is_dir()]
             json_files = [f for f in self.files if str(f).endswith('en_us.json')]
+            # FTB Quests 26.x sentinel: directories named lang/en_us with .json5
+            json5_dirs = [f for f in self.files if Path(f).is_dir() and Path(f).name == "en_us"]
 
             self.is_snbt_mode = bool(snbt_files)
-            self.is_json_mode = bool(json_files)
+            self.is_json_mode = bool(json_files or json5_dirs)
 
             if snbt_files:
                 self.log.emit("Starting Quest translation (SNBT)...")
@@ -1484,14 +1743,14 @@ class Worker(QThread):
             # be sent to a "SKIP"-keyed translator either (it would 401 and
             # poison files with untranslated text)
             skip_mode = any(k == "SKIP" for k in (self.keys or []))
-            if json_files and not self.is_aborted and not skip_mode:
+            json_targets = [(Path(f).parent.parent, "JSON") for f in json_files]
+            # lang/en_us directory → JSONManager scans it as a lang dir itself
+            json_targets += [(Path(f).parent.parent, "JSON5") for f in json5_dirs]
+            if json_targets and not self.is_aborted and not skip_mode:
                 self.log.emit("Starting Language translation (JSON)...")
                 _, target_lang_code = parse_target_lang(self.target_lang)
                 processed_dirs = set()
-                for json_file in json_files:
-                    json_path = Path(json_file)
-                    lang_dir = json_path.parent
-                    base_dir = lang_dir.parent
+                for base_dir, kind in json_targets:
                     if base_dir in processed_dirs:
                         continue
                     processed_dirs.add(base_dir)
@@ -1518,8 +1777,8 @@ class Worker(QThread):
         except asyncio.CancelledError:
             self.log.emit("Translation process was aborted by user.")
             logging.getLogger("snbt_localizer.gui").warning("Translation aborted: in-flight requests cancelled.")
-        except AbortException:
-            self.log.emit("Translation process was aborted by user.")
+        except AbortException as e:
+            self.log.emit(str(e) if str(e) else "Translation process was aborted by user.")
         except Exception as e:
             self.log.emit(f"Unexpected error: {e}")
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
@@ -1608,7 +1867,7 @@ class Worker(QThread):
                 file_start = time.time()
                 self._files_last_time[idx] = time.time()
                 self._files_last_strings[idx] = 0
-                lines_processed = await m.process_file(
+                await m.process_file(
                     f, self.t_titles, self.t_subs, self.t_desc,
                     lambda x: self.log.emit(str(x)),
                     self.check_status,
@@ -1641,8 +1900,8 @@ class Worker(QThread):
                 self.log.emit(f"Batch completed in {mins}m {secs}s.")
             else:
                 self.log.emit(f"Batch completed in {secs}s.")
-        except AbortException:
-            self.log.emit("Translation process was aborted by user.")
+        except AbortException as e:
+            self.log.emit(str(e) if str(e) else "Translation process was aborted by user.")
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1652,6 +1911,11 @@ class Worker(QThread):
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
+            from core import close_shared_httpx_clients
+            try:
+                await close_shared_httpx_clients()
+            except Exception:
+                pass
             m.close()
 
 class JSONWorker(QThread):
@@ -1686,6 +1950,8 @@ class JSONWorker(QThread):
             asyncio.run(run_with_abort_watchdog(self.process(), lambda: self.is_aborted, self.log.emit))
         except asyncio.CancelledError:
             self.log.emit("Translation process was aborted by user.")
+        except AbortException as e:
+            self.log.emit(str(e) if str(e) else "Translation process was aborted by user.")
         except Exception as e:
             self.log.emit(f"Unexpected error: {e}")
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
@@ -1693,7 +1959,6 @@ class JSONWorker(QThread):
             self.done.emit()
 
     async def process(self):
-        from core import JSONManager
         manager = JSONManager(
             self.base_dir,
             self.target_lang_code,
@@ -1710,6 +1975,42 @@ class JSONWorker(QThread):
             log_callback=self.log.emit,
             check_status=self.check_status
         )
+
+class GhostSuffixLineEdit(QLineEdit):
+    """Editable combo line edit that paints a translucent suffix hint.
+
+    When the typed model id has no reasoning-effort suffix yet, a
+    semi-transparent "/low" is painted right after the text — an IDE-style
+    ghost suggesting the optional "model/level" syntax.
+    """
+    GHOST = "/low"
+
+    def _ghost_visible(self) -> bool:
+        text = self.text().strip()
+        if not text or text in ("Loading live models...", "None (Free Engine)", "Defined per key in pool"):
+            return False
+        base, _, tail = text.rpartition("/")
+        if base.strip() and tail.strip().lower() in REASONING_EFFORT_LEVELS:
+            return False  # suffix already typed
+        return True
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._ghost_visible():
+            return
+        fm = self.fontMetrics()
+        text_w = fm.horizontalAdvance(self.displayText())
+        margins = self.textMargins()
+        x = margins.left() + 8 + text_w
+        ghost_w = fm.horizontalAdvance(self.GHOST)
+        if x + ghost_w > self.width() - margins.right() - 6:
+            return  # not enough room left in the field
+        p = QPainter(self)
+        p.setPen(QColor(160, 165, 180, 110))
+        p.setFont(self.font())
+        y = (self.height() - fm.height()) // 2 + fm.ascent()
+        p.drawText(int(x), int(y), self.GHOST)
+
 
 class App(QMainWindow):
     def __init__(self):
@@ -1783,11 +2084,16 @@ class App(QMainWindow):
         selectors_layout.addLayout(provider_layout)
 
         model_layout = QVBoxLayout()
-        model_label = QLabel("AI Model (Live Auto-suggest)")
+        model_label = QLabel('AI Model — after the model you can type "/" for a reasoning level (e.g. gpt-5/low)')
+        model_label.setToolTip('Type "/" after a model id to pick a reasoning level:\n'
+                               '/off /minimal /low /medium /high /xhigh /default\n'
+                               'Controls how much the model "thinks" before answering —\n'
+                               'lower levels are faster and cheaper.')
         self.model_box = QComboBox()
         self.model_box.setView(QListView())
         self.model_box.setEditable(True)
         self.model_box.currentTextChanged.connect(self.on_model_changed)
+        self.model_box.setToolTip(model_label.toolTip())
         self.loader = None
 
         self.completer = QCompleter(self)
@@ -1795,7 +2101,16 @@ class App(QMainWindow):
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.completer.popup().setStyleSheet(STYLE_SHEET)
+        # Reasoning-effort hints: when the user types '/' after a model id,
+        # offer the supported levels (e.g. "zai-org/GLM-5.3/low").
+        self._all_models = []
+        self._orig_completer_model = None
+        # IDE-style translucent "/low" ghost painted inside the model field
+        # until a reasoning suffix is typed. setLineEdit first: the combo's
+        # setCompleter binds to the current line edit.
+        self.model_box.setLineEdit(GhostSuffixLineEdit())
         self.model_box.setCompleter(self.completer)
+        self.model_box.lineEdit().textEdited.connect(self._on_model_text_edited)
 
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.model_box)
@@ -1862,7 +2177,8 @@ class App(QMainWindow):
             "French (fr_fr)",
             "Portuguese (pt_br)",
             "Japanese (ja_jp)",
-            "Korean (ko_kr)"
+            "Korean (ko_kr)",
+            "Ukrainian (uk_ua)"
         ])
         self.lang_box.setCurrentText(self.settings.value("target_lang", "Russian (ru_ru)"))
         self.lang_box.currentTextChanged.connect(self.on_lang_box_changed)
@@ -1907,6 +2223,9 @@ class App(QMainWindow):
         self.out = QTextEdit(readOnly=True)
         # Unbounded log growth slows the widget down and leaks memory on long runs
         self.out.document().setMaximumBlockCount(5000)
+        # Shadow buffer with the FULL untruncated text of every log line:
+        # the on-screen view stays compact, but Ctrl+Shift+C copies this, complete
+        self._full_log = []
         workspace_layout.addWidget(self.out)
 
         control_layout = QHBoxLayout()
@@ -1925,7 +2244,7 @@ class App(QMainWindow):
         self.btn_stop.setEnabled(False)
 
         self.btn_clear = QPushButton("Clear Log")
-        self.btn_clear.clicked.connect(self.out.clear)
+        self.btn_clear.clicked.connect(self._clear_log)
 
         control_layout.addWidget(self.btn_run)
         control_layout.addWidget(self.btn_pause)
@@ -1940,6 +2259,8 @@ class App(QMainWindow):
         lang_name, lang_code = parse_target_lang(saved_lang)
         self.translation_memory_tab = TranslationMemoryTab(TranslationCache(target_lang_code=lang_code))
         self.translation_memory_tab.language_changed.connect(self.on_tm_language_changed)
+        # Let the Auto-Fix healer pick up the active provider/model/keys
+        self.translation_memory_tab.main_window = self
         self.tabs.addTab(self.translation_memory_tab, "Translation Memory")
 
         self.settings_tab = SettingsTab(self.config, parent=self)
@@ -1955,7 +2276,7 @@ class App(QMainWindow):
             self.restoreGeometry(saved_geometry)
         self._has_files = False
         self.load_saved_settings()
-        self.populate_instances()
+        self._start_instance_scan()
         self.current_provider = "INIT_STATE"
         self._is_initializing = False
         self.on_provider_changed(self.provider_box.currentText())
@@ -1968,7 +2289,7 @@ class App(QMainWindow):
         gui_logger.setLevel(logging.DEBUG)
         # Do NOT clear handlers here: main() attached the RotatingFileHandler
         # (app.log) - clearing it kills file logging for the whole session
-        gui_handler = QtLoggingHandler(self.out)
+        gui_handler = QtLoggingHandler(self.out, full_log_sink=self._append_log)
         gui_handler.setLevel(logging.INFO)
         gui_logger.addHandler(gui_handler)
         gui_logger.propagate = False
@@ -1976,7 +2297,7 @@ class App(QMainWindow):
 
         if (not os.environ.get('SNBT_TR_SKIP_UPDATE_CHECK', '').lower() in ('1', 'true', 'yes') and
             os.environ.get('QT_QPA_PLATFORM', '') != 'offscreen'):
-            self.update_checker = UpdateChecker()
+            self.update_checker = _track_qthread(UpdateChecker())
             self.update_checker.update_available.connect(self.on_update_available)
             self.update_checker.start()
 
@@ -2088,6 +2409,8 @@ class App(QMainWindow):
         self.settings_tab.batch_spin.setValue(self.config.batch_size)
         self.settings_tab.min_batch_spin.setValue(self.config.min_batch_size)
         self.settings_tab.max_requests_spin.setValue(self.config.max_concurrent_requests)
+        if getattr(self.config, "temperature", None) is not None:
+            self.settings_tab.temperature_spin.setValue(float(self.config.temperature))
 
         self.provider_box.blockSignals(False)
         self.dir_box.blockSignals(False)
@@ -2130,12 +2453,42 @@ class App(QMainWindow):
         self.config.batch_size = self.settings_tab.batch_spin.value()
         self.config.min_batch_size = self.settings_tab.min_batch_spin.value()
         self.config.max_concurrent_requests = self.settings_tab.max_requests_spin.value()
+        self.config.temperature = self.settings_tab.temperature_spin.value()
+        self.settings.setValue("temperature", self.settings_tab.temperature_spin.value())
         self.config.save_to_settings()
 
-    def populate_instances(self):
-        self.dir_box.currentIndexChanged.disconnect()
+    def _disconnect_dir_box(self):
+        """Safe disconnect: no TypeError when the signal is not connected."""
+        try:
+            self.dir_box.currentIndexChanged.disconnect()
+        except TypeError:
+            pass
 
-        self.detected_instances, self.instance_quest_dirs = detect_instances()
+    def _start_instance_scan(self):
+        """Scan launcher instances off the GUI thread, then populate the combo."""
+        self._disconnect_dir_box()
+        self.dir_box.clear()
+        self.dir_box.addItem("Scanning for instances...", "SCANNING")
+        self.instance_scanner = _track_qthread(InstanceScanner())
+        # Bound method: Qt auto-disconnects when this QObject is destroyed,
+        # so a scan finishing after teardown cannot touch a deleted App
+        self.instance_scanner.instances_scanned.connect(self._on_instances_scanned)
+        self.instance_scanner.start()
+
+    def _on_instances_scanned(self, detected_instances, quest_dirs_mapping):
+        try:
+            self.populate_instances(detected_instances, quest_dirs_mapping)
+        except RuntimeError:
+            # C++ side of the App is gone (test teardown / re-entrant close)
+            pass
+
+    def populate_instances(self, detected_instances=None, quest_dirs_mapping=None):
+        self._disconnect_dir_box()
+
+        if detected_instances is None:
+            detected_instances, quest_dirs_mapping = detect_instances()
+        self.detected_instances = detected_instances
+        self.instance_quest_dirs = quest_dirs_mapping
         self.dir_box.clear()
 
         for custom_path in self.config.custom_instances_paths:
@@ -2253,24 +2606,24 @@ class App(QMainWindow):
 
             snbt_files = [p for p in path.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
             json_files = [p for p in path.rglob("**/lang/en_us.json") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+            # FTB Quests 26.x: lang/en_us/ is a directory of .json5 lang files
+            json5_dirs = [p for p in path.rglob("lang/en_us") if p.is_dir() and any(p.glob("*.json5")) and not any(x in p.parts for x in EXCLUDED_DIRS)]
 
             snbt_count = len(snbt_files)
             json_count = len(json_files)
+            json5_count = len(json5_dirs)
 
-            if snbt_count > 0 and json_count > 0:
-                self.lbl_file_count.setText(f"Modpack: {modpack_name} | Detected: {snbt_count} quest files (.snbt) & {json_count} JSON lang files")
+            if snbt_count > 0 or json_count > 0 or json5_count > 0:
+                parts = []
+                if snbt_count > 0:
+                    parts.append(f"{snbt_count} quest files (.snbt)")
+                if json_count > 0:
+                    parts.append(f"{json_count} JSON lang files")
+                if json5_count > 0:
+                    parts.append(f"{json5_count} FTB Quests 26.x lang directories (.json5)")
                 has_files = True
-                self.pb_batch.setRange(0, snbt_count + json_count)
-                self.pb_batch.setValue(0)
-            elif snbt_count > 0:
-                self.lbl_file_count.setText(f"Modpack: {modpack_name} | Detected: {snbt_count} quest files (.snbt)")
-                has_files = True
-                self.pb_batch.setRange(0, snbt_count)
-                self.pb_batch.setValue(0)
-            elif json_count > 0:
-                self.lbl_file_count.setText(f"Modpack: {modpack_name} | JSON Translation Mode Active")
-                has_files = True
-                self.pb_batch.setRange(0, json_count)
+                self.lbl_file_count.setText(f"Modpack: {modpack_name} | Detected: {' & '.join(parts)}")
+                self.pb_batch.setRange(0, snbt_count + json_count + json5_count)
                 self.pb_batch.setValue(0)
             else:
                 self.lbl_file_count.setText(f"Modpack: {modpack_name} | ⚠ Warning: No quest files (.snbt) or JSON lang files found")
@@ -2328,9 +2681,23 @@ class App(QMainWindow):
         self._pending_save_provider = None
         self.save_current_settings(provider_to_save=provider)
 
+    def _append_log(self, msg):
+        """Store the full line in the shadow buffer; show a compact view on screen."""
+        self._full_log.append(msg)
+        # Visual truncation only: long translated strings would flood the widget
+        if len(msg) > 160:
+            self.out.append(msg[:157] + "...")
+        else:
+            self.out.append(msg)
+
+    def _clear_log(self):
+        self._full_log.clear()
+        self.out.clear()
+
     def copy_logs(self):
         clipboard = QApplication.clipboard()
-        clipboard.setText(self.out.toPlainText())
+        # Full untruncated log: on-screen lines are visually trimmed, the buffer never is
+        clipboard.setText("\n".join(self._full_log))
         logging.getLogger("snbt_localizer.gui").info("--- Log content copied to clipboard ---")
 
     def _resolve_instance_root(self, path: Path) -> tuple[Path, str]:
@@ -2387,7 +2754,8 @@ class App(QMainWindow):
             locale["lang_fr_fr"],
             locale["lang_pt_br"],
             locale["lang_ja_jp"],
-            locale["lang_ko_kr"]
+            locale["lang_ko_kr"],
+            locale["lang_uk_ua"]
         ])
         if saved_lang:
             # Keep the user's selection: clear+addItems resets currentIndex to 0
@@ -2463,9 +2831,22 @@ class App(QMainWindow):
             self.on_verification_complete(results, {}, "")
             return
 
-        if not keys:
+        if not keys and provider != "Mixed Providers":
             self.lbl_key_status.setText("Pool Status: No keys to verify")
             return
+
+        # Mixed mode with an empty manual pool: resolve saved provider keys so
+        # the Test Keys button still works (a real run collects them the same way)
+        if provider == "Mixed Providers" and not keys:
+            has_saved = any(self.config.get_api_keys(p) for p in [
+                "Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova",
+                "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI", "Anthropic (Claude)",
+                "Cohere", "OpenCode", "Crusoe Cloud", "RunInfra",
+                "Google Translate (Free)", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"
+            ])
+            if not has_saved:
+                self.lbl_key_status.setText("Pool Status: No keys to verify")
+                return
 
         self.lbl_key_status.setText("Pool Status: Verifying keys...")
         self.btn_test_keys.setEnabled(False)
@@ -2476,23 +2857,48 @@ class App(QMainWindow):
 
         model = self.model_box.currentText()
         if provider == "Mixed Providers":
-            specs = []
-            for k in keys:
-                try:
-                    key_part, model_part = self.config.smart_parse_key(k)
-                    prov = detect_provider(key_part, model_part) or "OpenAI"
-                    specs.append((k, prov, model_part or PROVIDER_DEFAULTS.get(prov, "")))
-                except ValueError:
-                    # Unrecognized format: detect by prefix instead of testing
-                    # against the "Mixed Providers" pseudo-provider (guaranteed 401)
-                    prov = detect_provider(k) or "OpenAI"
-                    specs.append((k, prov, PROVIDER_DEFAULTS.get(prov, "")))
+            # Resolve the pool exactly like a real run would: manual entries
+            # (key or key\model) first, then all keys saved under each provider.
+            # This way prefix-less keys (e.g. Crusoe 82-char keys) map to the
+            # provider they are saved under instead of falling back to OpenAI.
+            pairs = []
+            for entry in keys:
+                if "\\" in entry:
+                    parts = entry.split("\\", 1)
+                    pairs.append({"key": parts[0].strip(), "model": parts[1].strip() if parts[1].strip() else None})
+                else:
+                    pairs.append({"key": entry, "model": None})
+            saved_keys_by_provider = {}
+            saved_models_by_provider = {}
+            default_models_by_provider = {}
+            for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI", "Anthropic (Claude)", "Cohere", "OpenCode", "Crusoe Cloud", "RunInfra", "Google Translate (Free)", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"]:
+                saved_keys_by_provider[p] = self.config.get_api_keys(p)
+                saved_models_by_provider[p] = self.settings.value(f"model_{p}", "")
+                default_models_by_provider[p] = PROVIDER_DEFAULTS.get(p, "")
+            from core import resolve_mixed_pool
+            mixed_pool = resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, default_models_by_provider)
+            specs = [(item["api_key"], item["provider"], item["model"]) for item in mixed_pool]
+            # Manual entries that no provider claims (unknown prefix AND not
+            # saved under any provider) would be silently dropped by
+            # resolve_mixed_pool - show them as Invalid instead so the user sees
+            # something is wrong with the format.
+            if pairs:
+                resolved_keys = {item["api_key"] for item in mixed_pool}
+                saved_all = {k for ks in saved_keys_by_provider.values() for k in ks}
+                for pair in pairs:
+                    k = pair["key"]
+                    if k and k not in resolved_keys and k not in saved_all and not detect_provider(k):
+                        specs.append((k, "Mixed Providers", "Unknown format"))
         else:
             if not model or model in ("Loading live models...", "Enter API Key to load models", "Defined per key in pool", "None (Free Engine)"):
                 model = PROVIDER_DEFAULTS.get(provider, "")
             specs = [(k, provider, model) for k in keys]
 
-        self.verifier = KeyVerifierWorker(specs)
+        if not specs:
+            self.lbl_key_status.setText("Pool Status: No keys to verify")
+            return
+
+        self.verifier = _track_qthread(KeyVerifierWorker(specs, show_provider=(provider == "Mixed Providers")))
         self.verifier.verification_complete.connect(self.on_verification_complete)
         self.verifier.start()
 
@@ -2519,6 +2925,27 @@ class App(QMainWindow):
         prov = self.provider_box.currentText()
         if prov not in ("Google Translate (Free)", "Mixed Providers", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"):
             self.model_reload_timer.start(600)
+
+    def _on_model_text_edited(self, text):
+        """Live hint for the reasoning-effort suffix.
+
+        Typing "model/" (the last segment being an effort level or a prefix
+        of one) swaps the completer to level suggestions like
+        "model/low", "model/medium"... Any other text restores the normal
+        model list.
+        """
+        base, _, tail = text.rpartition("/")
+        tail_l = tail.strip().lower()
+        is_level_typing = bool(base.strip()) and (tail_l == "" or any(l.startswith(tail_l) for l in REASONING_EFFORT_LEVELS))
+        if is_level_typing:
+            if self._orig_completer_model is None:
+                self._orig_completer_model = self.completer.model()
+            self.completer.setModel(QStringListModel([f"{base.strip()}/{l}" for l in REASONING_EFFORT_LEVELS]))
+            self.completer.setCompletionPrefix(text)
+            self.completer.complete()
+        elif self._orig_completer_model is not None:
+            self.completer.setModel(self._orig_completer_model)
+            self._orig_completer_model = None
 
     def on_model_changed(self, text):
         if not self._is_updating_models:
@@ -2666,7 +3093,7 @@ class App(QMainWindow):
         self.current_loader_id += 1
         loader_id = self.current_loader_id
 
-        loader = ModelLoader(provider, key, loader_id, custom_base_url)
+        loader = _track_qthread(ModelLoader(provider, key, loader_id, custom_base_url))
         self.loader = loader
         loader.loaded.connect(self.on_models_loaded)
         loader.finished.connect(lambda l=loader: self._cleanup_loader(l))
@@ -2696,9 +3123,11 @@ class App(QMainWindow):
         if filtered_models:
             self.model_box.addItems(filtered_models)
             self.completer.setModel(QStringListModel(filtered_models))
+            self._all_models = filtered_models
+            self._orig_completer_model = None
         else:
             if "Groq" in provider:
-                fallbacks = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "mixtral-8x7b-32768"]
+                fallbacks = ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "allam-2-7b"]
             elif "Gemini" in provider:
                 fallbacks = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "gemini-2.5-flash"]
             elif "Ollama" in provider:
@@ -2734,6 +3163,8 @@ class App(QMainWindow):
                 ]
             self.model_box.addItems(fallbacks)
             self.completer.setModel(QStringListModel(fallbacks))
+            self._all_models = fallbacks
+            self._orig_completer_model = None
 
         if error_msg:
             logging.getLogger("snbt_localizer.gui").error(f"Error: {error_msg}")
@@ -2744,8 +3175,18 @@ class App(QMainWindow):
             if index >= 0:
                 self.model_box.setCurrentIndex(index)
             else:
-                self.model_box.setCurrentIndex(0)
-                self.settings.setValue(f"model_{provider}", self.model_box.currentText())
+                # Saved value may carry a reasoning-effort suffix
+                # ("zai-org/GLM-5.3/low") that has no combobox entry: set
+                # it as edit text as long as the base model exists.
+                base, effort = parse_model_effort(saved_model)
+                base_index = self.model_box.findText(base) if effort else -1
+                if base_index >= 0:
+                    self.model_box.setCurrentIndex(base_index)
+                    self.model_box.setEditText(saved_model)
+                    self.config.model = saved_model
+                else:
+                    self.model_box.setCurrentIndex(0)
+                    self.settings.setValue(f"model_{provider}", self.model_box.currentText())
             self.config.model = self.model_box.currentText()
 
         self.update_run_status()
@@ -2885,8 +3326,12 @@ class App(QMainWindow):
         for qd in quest_dirs:
             snbt_files = [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]
             json_files = [p for p in qd.rglob("**/lang/en_us.json") if not any(x in p.parts for x in EXCLUDED_DIRS)]
+            # FTB Quests 26.x: lang/en_us/ directory of .json5 files — pass a
+            # sentinel path so the JSON phase runs over these dirs too
+            json5_dirs = [p for p in qd.rglob("lang/en_us") if p.is_dir() and any(p.glob("*.json5")) and not any(x in p.parts for x in EXCLUDED_DIRS)]
             all_files.extend(snbt_files)
             all_files.extend(json_files)
+            all_files.extend(json5_dirs)
 
 
         target_lang_name, target_lang_code = parse_target_lang(target_lang)
@@ -2920,8 +3365,6 @@ class App(QMainWindow):
         self.files_progress = {}
         logging.getLogger("snbt_localizer.gui").info(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
 
-        custom_url = self.custom_base_url_edit.text() if prov in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
-        model = self.model_box.currentText() or ""
         translator = UnifiedTranslator(
             unique_keys,
             prov,
@@ -2936,10 +3379,11 @@ class App(QMainWindow):
             custom_base_url=custom_url
         )
         cache = TranslationCache(target_lang_code=target_lang_code)
-        self.w = Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.settings_tab.batch_spin.value(), self.settings_tab.min_batch_spin.value(), self.settings_tab.max_requests_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache, resource_pack_mode=self.config.resource_pack_mode)
+        cache.autofix_records()
+        self.w = _track_qthread(Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.settings_tab.batch_spin.value(), self.settings_tab.min_batch_spin.value(), self.settings_tab.max_requests_spin.value(), temperature=self.settings_tab.temperature_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache, resource_pack_mode=self.config.resource_pack_mode))
         self.w.is_aborted = False
         self.w.is_paused = False
-        self.w.log.connect(self.out.append)
+        self.w.log.connect(self._append_log)
         self.w.progress_batch.connect(self.update_batch_progress)
         self.w.chunk_progress.connect(self.update_chunk_progress)
         self.w.lines_translated.connect(self.update_lines_progress)
@@ -2976,9 +3420,9 @@ class App(QMainWindow):
         self.translation_memory_tab.refresh_modpack_filter()
         self.translation_memory_tab._load_data()
         if getattr(self.w, 'is_snbt_mode', False) and getattr(self.w, 'is_json_mode', False):
-            self.out.append("Quest and JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
+            self._append_log("Quest and JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
         elif getattr(self.w, 'is_json_mode', False):
-            self.out.append("JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
+            self._append_log("JSON translation completed. In Minecraft, run '/ftbquests reload' or restart the game to apply changes.")
         if getattr(self, '_close_pending', False):
             # Defer close: the worker thread may still be finishing its last
             # instructions and isRunning() would trigger a second dialog
@@ -2986,24 +3430,38 @@ class App(QMainWindow):
             QTimer.singleShot(200, self.close)
 
     def closeEvent(self, event):
-        if hasattr(self, 'w') and self.w.isRunning() and not getattr(self, '_close_pending', False):
-            reply = QMessageBox.question(self, "Выход", "Идет перевод. Прервать и выйти?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        # isinstance guard: a mocked/replaced worker must not be treated as a
+        # running translation (QThread API missing on mocks); headless runs
+        # cannot answer a modal dialog, so auto-abort there.
+        worker_running = (
+            isinstance(getattr(self, 'w', None), QThread) and self.w.isRunning()
+        )
+        if worker_running and not getattr(self, '_close_pending', False):
+            if os.environ.get('QT_QPA_PLATFORM', '') == 'offscreen':
+                reply = QMessageBox.StandardButton.Yes
+            else:
+                reply = QMessageBox.question(self, "Выход", "Идет перевод. Прервать и выйти?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 self._close_pending = True
                 self.w.is_aborted = True
                 self.w.is_paused = False
+                self._cancel_helper_threads()
             event.ignore()
         else:
-            # Cooperatively stop helper threads so they don't get destroyed mid-request
-            for loader in list(self.running_loaders):
-                loader.cancelled = True
-            if getattr(self, 'verifier', None) is not None:
-                self.verifier.cancelled = True
-            for loader in list(self.running_loaders):
-                loader.wait(1500)
+            self._cancel_helper_threads()
             self.save_current_settings(force=True)
             self.settings.setValue("geometry", self.saveGeometry())
             event.accept()
+
+    def _cancel_helper_threads(self):
+        # Cooperatively stop helper threads so they don't get destroyed mid-request
+        for loader in list(self.running_loaders):
+            loader.cancelled = True
+        verifier = getattr(self, 'verifier', None)
+        if verifier is not None:
+            verifier.cancelled = True
+        for loader in list(self.running_loaders):
+            loader.wait(2000)
 
 def main():
     import os

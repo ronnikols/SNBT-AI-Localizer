@@ -62,5 +62,32 @@ def clean_loggers():
     gc.collect()
 
 
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch):
+    """Safety net: no test may perform real network I/O.
+
+    ModelLoader/UpdateChecker/KeyVerifierWorker run in QThreads; a real
+    request outliving the test leads to destruction of a running QThread
+    during GC, which aborts the interpreter ("QThread: Destroyed while
+    thread is still running", SIGABRT/exit 134). Tests that exercise the
+    real call chain patch it themselves - their monkeypatch applies later
+    and therefore wins over this one."""
+    import gui
+
+    async def _silent_fetch(self):
+        return None
+
+    async def _silent_check(self):
+        return None
+
+    async def _silent_key_test(*args, **kwargs):
+        return ("Unreachable", "")
+
+    monkeypatch.setattr(gui.ModelLoader, "fetch", _silent_fetch)
+    monkeypatch.setattr(gui.UpdateChecker, "_check_updates", _silent_check)
+    monkeypatch.setattr(gui, "test_key_with_question", _silent_key_test)
+    yield
+
+
 def pytest_configure(config):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
