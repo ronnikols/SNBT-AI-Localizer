@@ -4,7 +4,7 @@
 
 English | [Русский](README_RU.md)
 
-Advanced asynchronous translator for Minecraft FTB Quests files (`.snbt`) with support for multiple local and cloud translation engines, featuring a 4-tab GUI and intelligent SQLite caching system.
+Advanced asynchronous translator for Minecraft FTB Quests files (`.snbt` and the new FTB Quests 26.x `.json5` lang format) with support for multiple local and cloud translation engines, featuring a 4-tab GUI and intelligent SQLite caching system.
 
 ## Installation
 
@@ -51,6 +51,7 @@ snbt-tr --fastdir
   - 4-column QTableWidget (Original, Translation, Modpack, Added) with auto-stretch column width layout
   - Inline editing of translations directly in the table
   - Bulk operations: Load More (pagination), Delete Selected, Save Changes, Clear Cache
+  - **Auto-Fix button**: two-stage cache healer — repairs broken technical syntax (`% s` → `%s`, `__TAG _12__` → `__TAG_12__`, markdown links), then scans the whole cache for garbage translations (≥90% wrong-language text, CJK symbol leaks, mixed-alphabet hybrid words like "Лимитite") and re-translates them with your **active provider/model**, validating every LLM answer before writing
 - **Settings Tab**: Configuration management for providers, models, API keys, and application settings
 - **Credits Tab**: Displays project credits and acknowledgments
 
@@ -77,6 +78,14 @@ snbt-tr --fastdir
 - Thread-safe operations with locking
 - Real-time persistence between chunks
 - Defensive sanitization: Automatic cleanup of nested dictionaries in SNBT and protection against malformed JSON in responses
+- Cache poisoning protection: identity records (translation = original) never count as cache hits
+- Cache hits are logged (`Cache: N string(s) from cache`); `overwrite` policy bypasses the cache entirely so every string is re-translated
+
+### FTB Quests 26.x (.json5) Support
+- Automatic detection of the new `lang/en_us/*.json5` directory format (FTB Quests 26.x / MC 26.x)
+- Per-file translation jobs writing to `lang/ru_ru/<file>.json5`, with `.json5.bak` backups
+- List values (quest descriptions) flattened as `key[idx]` and re-assembled after translation
+- Complement and overwrite strategies, same as SNBT
 
 ### 🛡️ Pluralization Guard
 **Prevents redundant API calls for highly similar strings with a 90% similarity threshold**
@@ -109,7 +118,7 @@ This prevents charging for translations of:
 
 | Provider | Default Model | Free Tier | Notes |
 |----------|----------------|-----------|-------|
-| Groq Cloud (Fast) | llama-3.3-70b-versatile | Yes | Low-latency inference |
+| Groq Cloud (Fast) | qwen/qwen3.8-27b | Yes | Low-latency inference |
 | NVIDIA NIM | nvidia/nemotron-4-340b-instruct | Yes | Enterprise-grade models |
 | OpenRouter (Cloud AI) | google/gemma-4-31b:free | Yes | 100+ free models |
 | Google Gemini (Free API) | models/gemini-flash-lite-latest | Yes | Google's latest free model |
@@ -124,6 +133,13 @@ This prevents charging for translations of:
 | Ollama (Local / Free) | qwen2.5:7b | Yes | Self-hosted, no API key |
 | Google Translate (Free) | N/A | Yes | Traditional MT, no API key |
 | Custom (OpenAI-compatible) | (Custom) | Yes | Custom OpenAI-compatible endpoints |
+
+### Key Tester Features
+- One-click key verification with a live test question; active keys also show their **account balance** when the provider exposes an API (RunInfra, OpenRouter, OpenCode) or a console hint (Crusoe, Groq, OpenAI, Anthropic, Cohere, Mistral, Sambanova, NVIDIA)
+- "Model Paused" status for provider-side model pauses (HTTP 503 `hosted_model_paused`)
+- Mixed Providers mode: auto-detects provider from key prefix; unknown-format keys are explicitly marked Invalid instead of being misrouted
+- Reasoning effort suffix support: `model/level` syntax (e.g. `zai-org/GLM-5.3-Flash/low`) with per-provider mapping
+- Global temperature setting: spinbox in GUI, `--temperature` CLI flag, applied to all LLM providers
 
 ## Feedback & Community
 For feedback, suggestions, and bug reports, please contact us via:
