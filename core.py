@@ -1549,7 +1549,14 @@ class UnifiedTranslator:
         if "Google Translate" in self.provider:
             res = await self.free_google.translate(shielded_texts, self.target_lang_code)
         else:
-            res = await self._translate_with_binary_split(shielded_texts, logger, check_status, context)
+            glossary_suffix = build_glossary_context(shielded_texts, load_vanilla_glossary())
+            saved_prompt = self.prompt
+            if glossary_suffix:
+                self.prompt = self.prompt + glossary_suffix
+            try:
+                res = await self._translate_with_binary_split(shielded_texts, logger, check_status, context)
+            finally:
+                self.prompt = saved_prompt
 
         restored_res = []
         for trans, placeholders in zip(res, restoration_maps):
@@ -1810,6 +1817,9 @@ class SNBTManager:
         return find_quests_dir(start_path)
 
     async def process_file(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool, logger=print, check_status=None, policy="complement", progress_callback=None) -> int:
+        policy_banner = policy.lower().split('(')[0].strip()
+        logger(f"Strategy: {policy_banner.upper()}"
+               f"{' — cache BYPASSED (all strings re-translated)' if policy_banner == 'overwrite' else ''}")
         if self.skip_mode:
             logger(f"[SKIP MODE] Skipping file: {filepath.name}")
             logging.getLogger("snbt_localizer.core").info(f"[SKIP MODE] Skipping file: {filepath.name}")
@@ -2161,6 +2171,8 @@ class JSONManager:
         return len(text) > 1 and not ID_PATTERN.match(text) and not UUID_PATTERN.match(text)
 
     async def process(self, log_callback=print, check_status=None) -> int:
+        log_callback(f"Strategy: {self.policy.upper()}"
+                     f"{' — cache BYPASSED (all strings re-translated)' if self.policy == 'overwrite' else ''}")
         lang_dirs = self._find_lang_dirs()
         if not lang_dirs:
             log_callback(f"No lang directories with en_us.json found in {self.base_dir}")
@@ -2541,6 +2553,55 @@ def load_translation_dictionary() -> Dict[str, str]:
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             logger.warning(f"Failed to load dictionary from {path}: {e}")
     return {}
+
+_VANILLA_GLOSSARY_CACHE: Optional[Dict[str, str]] = None
+
+def load_vanilla_glossary() -> Dict[str, str]:
+    """Official Minecraft en→ru terms (extracted from the vanilla 1.21.1 lang files).
+
+    Used to force 1-to-1 official Mojang terminology: 'Ender Pearl' → 'Эндер-жемчуг',
+    'The End' → 'Энд', 'Crafting Table' → 'Верстак', etc.
+    """
+    global _VANILLA_GLOSSARY_CACHE
+    if _VANILLA_GLOSSARY_CACHE is not None:
+        return _VANILLA_GLOSSARY_CACHE
+    path = get_resource_path("resources/vanilla_ru.json")
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        _VANILLA_GLOSSARY_CACHE = {str(k).strip(): str(v).strip() for k, v in data.items()}
+        _VANILLA_GLOSSARY_CACHE = {k: v for k, v in _VANILLA_GLOSSARY_CACHE.items() if k and v}
+        logger.info(f"Loaded vanilla Minecraft glossary with {len(_VANILLA_GLOSSARY_CACHE)} terms")
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        logger.warning(f"Failed to load vanilla glossary: {e}")
+        _VANILLA_GLOSSARY_CACHE = {}
+    return _VANILLA_GLOSSARY_CACHE
+
+def build_glossary_context(texts: List[str], glossary: Dict[str, str], limit: int = 40) -> str:
+    """Collect official Minecraft terms actually present in the batch strings.
+
+    Returns a prompt suffix like:
+    'Official Minecraft terms (use EXACTLY these translations): ...'
+    with at most `limit` longest terms first (longest match wins over substrings).
+    """
+    if not texts or not glossary:
+        return ""
+    joined = "\n".join(texts)
+    hits = []
+    for term_en, term_ru in glossary.items():
+        if len(term_en) < 3:
+            continue
+        if re.search(r'(?<![A-Za-z])' + re.escape(term_en) + r'(?![A-Za-z])', joined):
+            hits.append((term_en, term_ru))
+    if not hits:
+        return ""
+    # longest English terms first: 'Nether Gold Ore' before 'Gold Ore'
+    hits.sort(key=lambda p: len(p[0]), reverse=True)
+    hits = hits[:limit]
+    pairs = "; ".join(f"{e}={r}" for e, r in hits)
+    return (
+        f" Official Minecraft terminology (translate these terms EXACTLY as specified): {pairs}."
+    )
 
 def apply_dictionary(text: str, dictionary: Dict[str, str]) -> str:
     """Replace dictionary terms in a translation, preserving basic casing."""
