@@ -1117,7 +1117,102 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     _af_cache.autofix_records(log=lambda m: logging.getLogger("snbt_localizer.cli").info(m))
     _af_cache.close()
     policy = resolve_policy(config.policy)
+    from core import reset_request_timeout
+    reset_request_timeout()
     file_progress = {idx: 0.0 for idx in range(total_files)}
+    _mp_glossary_terms = None  # pinned by the pre-scan, carried into the JSON5 phase
+
+    # --- QA phase params (CLI) ---------------------------------------
+    # Mirrors the GUI: dedicated QA provider > utility > main; dedicated QA
+    # model (may carry a "/effort" suffix) > utility model > main model;
+    # keys from the QA provider pool with main-pool fallback.
+    qa_params = None
+    try:
+        if getattr(config, "qa_enabled", False):
+            qa_provider = (getattr(config, "qa_provider", "") or
+                            getattr(config, "utility_provider", "") or provider)
+            qa_keys = api_keys
+            if qa_provider and qa_provider != "Mixed Providers":
+                pool_keys = config.get_api_keys(qa_provider)
+                if pool_keys:
+                    qa_keys = pool_keys
+            qa_model = getattr(config, "qa_model", "") or getattr(config, "utility_model", "") or model or ""
+            qa_params = {
+                "keys": qa_keys,
+                "provider": qa_provider,
+                "model": qa_model,
+                "custom_base_url": (config.custom_base_url or None) if qa_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None,
+                "update_glossary": bool(getattr(config, "qa_update_glossary", True)),
+                "batch_size": int(getattr(config, "qa_batch_size", 40) or 40),
+                "temperature": float(getattr(config, "qa_temperature", 0.0) or 0.0),
+                "modpack_root": find_modpack_root_from_quest_dir(quest_dirs[0]) if quest_dirs else None,
+                "lang_name": lang_name,
+            }
+    except Exception as e:
+        logging.getLogger("snbt_localizer.cli").warning(f"QA phase setup skipped: {e}")
+        qa_params = None
+    # ------------------------------------------------------------------
+
+    # --- Modpack glossary pre-scan (CLI) -----------------------------
+    # Same flow as the GUI: extract recurring mod terms, translate the new
+    # ones with the utility model (default: main provider/model), pin them
+    # for the whole run. Best-effort: never aborts the translation.
+    try:
+        from core import ensure_modpack_glossary, find_modpack_root, _find_all_snbt_strings
+        prescan_texts = []
+        for f in all_files:
+            try:
+                content = f.read_text(encoding='utf-8')
+            except OSError:
+                continue
+            for s in _find_all_snbt_strings(content):
+                k = s['key']
+                if k == 'title' or k.endswith('.title') or k == 'subtitle' or k.endswith('.quest_subtitle'):
+                    v = s['value']
+                    if v and len(v) < 250:
+                        prescan_texts.append(v)
+        utility_provider = getattr(config, "utility_provider", "") or provider
+        utility_model = getattr(config, "utility_model", "") or model
+        utility_keys = api_keys
+        utility_mixed = mixed_pool
+        if getattr(config, "utility_provider", "") and config.utility_provider != "Mixed Providers":
+            pool_keys = config.get_api_keys(config.utility_provider)
+            if pool_keys:
+                from core import get_base_url as _gbu
+                utility_keys = pool_keys
+                utility_mixed = [
+                    {"provider": config.utility_provider, "api_key": k,
+                     "model": utility_model or "", "base_url": _gbu(config.utility_provider)}
+                    for k in pool_keys
+                ]
+            else:
+                logging.getLogger("snbt_localizer.cli").info(
+                    f"Glossary pre-scan: utility provider '{config.utility_provider}' has no keys — using the main provider."
+                )
+        if utility_provider not in ("Google Translate (Free)", "Ollama (Local / Free)") and prescan_texts:
+            first_root = find_modpack_root(quest_dirs[0]) if quest_dirs else None
+            if first_root:
+                logging.getLogger("snbt_localizer.cli").info("Glossary pre-scan: extracting recurring mod terms...")
+                glossary = await ensure_modpack_glossary(
+                    prescan_texts,
+                    first_root,
+                    utility_keys,
+                    utility_provider,
+                    utility_model,
+                    lang_name,
+                    mixed_pool=utility_mixed,
+                    custom_base_url=config.custom_base_url or None,
+                    logger=lambda m: logging.getLogger("snbt_localizer.cli").info(m),
+                    force_refresh=resolve_policy(config.policy).lower().split('(')[0].strip() == "overwrite",
+                )
+                if glossary.terms:
+                    translator.modpack_glossary_terms = glossary.terms
+                    _mp_glossary_terms = glossary.terms
+                    logging.getLogger("snbt_localizer.cli").info(f"Modpack glossary active: {len(glossary.terms)} terms pinned.")
+    except Exception as e:
+        logging.getLogger("snbt_localizer.cli").warning(f"Glossary pre-scan skipped: {e}")
+    # ------------------------------------------------------------------
+
 
     def log_with_bar(msg):
         nonlocal first_file
@@ -1154,7 +1249,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                     lang_name,
                     lang_code,
                     concurrency_limit=1,
-                    translator=translator
+                    translator=translator,
+                    qa_params=qa_params
                 )
                 try:
                     log_with_bar(f"Processing: {f.name}")
@@ -1209,6 +1305,9 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
             max_concurrent_requests=config.max_concurrent_requests,
             custom_base_url=config.custom_base_url or None
         )
+        # carry the pinned modpack glossary into the JSON5 phase translator
+        if _mp_glossary_terms:
+            translator.modpack_glossary_terms = _mp_glossary_terms
         cache = TranslationCache(target_lang_code=lang_code)
         cache.autofix_records(log=lambda m: logging.getLogger("snbt_localizer.cli").info(m))
         for base_dir in json_lang_dirs:
@@ -1220,7 +1319,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 cache,
                 modpack=base_dir.name,
                 policy=resolve_policy(config.policy),
-                resource_pack_mode=resource_pack_mode
+                resource_pack_mode=resource_pack_mode,
+                qa_params=qa_params
             )
             try:
                 translated_count = await manager.process(

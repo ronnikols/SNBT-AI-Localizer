@@ -136,6 +136,16 @@ class ConfigManager:
         self.min_batch_size: int = 1
         self.max_concurrent_requests: int = 10
         self.temperature: float = 0.1
+        # Utility model for the glossary pre-scan; BOTH empty = same as main
+        self.utility_provider: str = ""
+        self.utility_model: str = ""
+        # QA audit phase (post-translation scan); model empty = same as utility
+        self.qa_enabled: bool = False
+        self.qa_provider: str = ""
+        self.qa_model: str = ""
+        self.qa_update_glossary: bool = True
+        self.qa_batch_size: int = 40
+        self.qa_temperature: float = 0.0
 
         self.load_from_settings()
 
@@ -216,6 +226,35 @@ class ConfigManager:
             if prov not in self.api_keys_pool:
                 self.api_keys_pool[prov] = []
 
+        # Utility model (glossary pre-scan); empty = same as the main provider
+        self.utility_provider = s.value("utility_provider", "") or ""
+        self.utility_model = s.value("utility_model", "") or ""
+        # QA audit phase; model empty = same as utility
+        self.qa_enabled = (s.value("qa_enabled", False) in (True, "true"))
+        self.qa_provider = s.value("qa_provider", "") or ""
+        self.qa_model = s.value("qa_model", "") or ""
+        self.qa_update_glossary = (s.value("qa_update_glossary", True) in (True, "true"))
+        try:
+            self.qa_batch_size = max(10, min(200, int(s.value("qa_batch_size", 40))))
+        except (TypeError, ValueError):
+            self.qa_batch_size = 40
+        try:
+            self.qa_temperature = max(0.0, min(2.0, float(s.value("qa_temperature", 0.0))))
+        except (TypeError, ValueError):
+            self.qa_temperature = 0.0
+        if self.qa_provider and self.qa_provider not in self.AVAILABLE_PROVIDERS and self.qa_provider != "Mixed Providers":
+            logging.getLogger("snbt_localizer.cli").warning(
+                f"Unknown saved QA provider '{self.qa_provider}', ignoring it"
+            )
+            self.qa_provider = ""
+            self.qa_model = ""
+        if self.utility_provider and self.utility_provider not in self.AVAILABLE_PROVIDERS and self.utility_provider != "Mixed Providers":
+            logging.getLogger("snbt_localizer.cli").warning(
+                f"Unknown saved utility provider '{self.utility_provider}', ignoring it"
+            )
+            self.utility_provider = ""
+            self.utility_model = ""
+
     def save_to_settings(self):
         s = self._settings()
         if s is None:
@@ -240,6 +279,14 @@ class ConfigManager:
         s.setValue("min_batch_size", self.min_batch_size)
         s.setValue("temperature", self.temperature)
         s.setValue("max_concurrent_requests", self.max_concurrent_requests)
+        s.setValue("utility_provider", self.utility_provider or "")
+        s.setValue("utility_model", self.utility_model or "")
+        s.setValue("qa_enabled", self.qa_enabled)
+        s.setValue("qa_provider", self.qa_provider or "")
+        s.setValue("qa_model", self.qa_model or "")
+        s.setValue("qa_update_glossary", self.qa_update_glossary)
+        s.setValue("qa_batch_size", self.qa_batch_size)
+        s.setValue("qa_temperature", self.qa_temperature)
         s.setValue("resource_pack_mode", self.resource_pack_mode)
         s.setValue("quest_dir", str(self.quest_dir) if self.quest_dir else "")
         s.sync()
@@ -271,6 +318,10 @@ class ConfigManager:
                             help="Max concurrent API requests (default: saved setting)")
         parser.add_argument("--temperature", type=float, default=None,
                             help="LLM sampling temperature 0.0-2.0 (default: 0.1)")
+        parser.add_argument("--utility-provider", default=None,
+                            help="Provider for the glossary pre-scan utility model (default: same as main)")
+        parser.add_argument("--utility-model", default=None,
+                            help="Model for the glossary pre-scan utility model (default: same as main)")
         parser.add_argument("--resource-pack", "-r", action="store_true", help="Enable Resource Pack Mode for JSON translation")
 
         parsed = parser.parse_args(args)
@@ -322,6 +373,26 @@ class ConfigManager:
 
         if parsed.temperature is not None:
             self.temperature = max(0.0, min(2.0, float(parsed.temperature)))
+
+        if parsed.utility_provider:
+            alias = parsed.utility_provider.lower()
+            if alias in PROVIDER_ALIASES:
+                self.utility_provider = PROVIDER_ALIASES[alias]
+            elif parsed.utility_provider in self.AVAILABLE_PROVIDERS or parsed.utility_provider == "Mixed Providers":
+                self.utility_provider = parsed.utility_provider
+            else:
+                logging.getLogger("snbt_localizer.cli").error(f"Unknown utility provider alias: {parsed.utility_provider}")
+                sys.exit(1)
+            # provider switched without an explicit model: do not keep a
+            # model saved for a different provider
+            if not parsed.utility_model:
+                self.utility_model = ""
+        if parsed.utility_model is not None:
+            self.utility_model = parsed.utility_model
+            if self.utility_model and not self.utility_provider:
+                # model without provider: apply to the main provider
+                self.utility_provider = self.provider
+
         if parsed.batch_size:
             self.batch_size = max(1, parsed.batch_size)
         if parsed.min_batch_size:

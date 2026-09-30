@@ -105,7 +105,7 @@ def test_gui_provider_key_isolation(qtbot, monkeypatch):
     assert app.key_pool_edit.toPlainText() == "nvidia_nim_key_456"
 
 def test_cli_mixed_pool_backslash_parsing():
-    from main import parse_key_model_pairs
+    from cli import parse_key_model_pairs
     pairs = parse_key_model_pairs(["gsk_123\\llama-model", "nvapi-456"])
     assert len(pairs) == 2
     assert pairs[0]["key"] == "gsk_123"
@@ -276,12 +276,12 @@ def test_cli_mix_wizard_enter_fallback():
     assert pool[1]["model"] == "nemotron"
 
 def test_cli_mix_concurrency_escalation():
-    from main import main_async
+    from cli import main_async
     from unittest.mock import patch, AsyncMock
     import asyncio
     from pathlib import Path
 
-    with patch('main.ConfigManager') as mock_config_manager:
+    with patch('cli.ConfigManager') as mock_config_manager:
         mock_config = mock_config_manager.return_value
         mock_config.concurrency = 2
         mock_parsed = type('obj', (object,), {'mix': True, 'debug': False, 'clear_cache': False, 'fastdir': False, 'dir': None, 'gui': False, 'resource_pack': False})()
@@ -294,10 +294,10 @@ def test_cli_mix_concurrency_escalation():
         mock_config.get_api_keys.return_value = ["key1", "key2", "key3"]
         mock_config.resolve_language.return_value = ("Russian", "ru_ru")
 
-        with patch('main.run_mix_setup_wizard', new_callable=AsyncMock) as mock_wizard:
+        with patch('cli.run_mix_setup_wizard', new_callable=AsyncMock) as mock_wizard:
             mock_wizard.return_value = (Path("/tmp/test"), "Russian", "ru_ru")
 
-            with patch('main.run_translation', new_callable=AsyncMock) as mock_translate:
+            with patch('cli.run_translation', new_callable=AsyncMock) as mock_translate:
                 from PyQt6.QtCore import QSettings
                 mock_translate.side_effect = lambda *args, **kwargs: QSettings("MineAI-Test", "SNBT-Localizer-Test").sync()
                 mock_translate.return_value = 0
@@ -315,11 +315,11 @@ def test_provider_specific_cli_model_state():
     import asyncio
     from config import ConfigManager
 
-    with patch('main.load_cli_setting') as mock_load, \
-         patch('main.save_cli_setting') as mock_save, \
-         patch('main.fetch_models', new_callable=AsyncMock) as mock_fetch, \
+    with patch('cli.load_cli_setting') as mock_load, \
+         patch('cli.save_cli_setting') as mock_save, \
+         patch('cli.fetch_models', new_callable=AsyncMock) as mock_fetch, \
          patch('builtins.input', side_effect=["1", "4", "groq_key", "1", "1"]), \
-         patch('main.is_interactive', return_value=True):
+         patch('cli.is_interactive', return_value=True):
 
         mock_fetch.return_value = ["model1", "model2"]
 
@@ -330,7 +330,7 @@ def test_provider_specific_cli_model_state():
         from PyQt6.QtCore import QSettings
         mock_save.side_effect = lambda key, value: QSettings("MineAI-Test", "SNBT-Localizer-Test").setValue(key, value)
 
-        from main import run_setup_wizard
+        from cli import run_setup_wizard
         config = ConfigManager()
         asyncio.run(run_setup_wizard(config))
 
@@ -341,12 +341,12 @@ def test_regular_wizard_mixed_redirect():
     from pathlib import Path
     import asyncio
 
-    with patch('main.load_cli_setting') as mock_load, \
-         patch('main.save_cli_setting') as mock_save, \
-         patch('main.run_mix_setup_wizard', new_callable=AsyncMock) as mock_mix_wizard, \
-         patch('main.fetch_models', new_callable=AsyncMock) as mock_fetch, \
+    with patch('cli.load_cli_setting') as mock_load, \
+         patch('cli.save_cli_setting') as mock_save, \
+         patch('cli.run_mix_setup_wizard', new_callable=AsyncMock) as mock_mix_wizard, \
+         patch('cli.fetch_models', new_callable=AsyncMock) as mock_fetch, \
          patch('builtins.input', side_effect=["1", "9", "test_key"]), \
-         patch('main.is_interactive', return_value=True):
+         patch('cli.is_interactive', return_value=True):
 
         mock_mix_wizard.return_value = (Path("/tmp/test"), "Russian", "ru_ru")
         mock_fetch.return_value = ["model1", "model2"]
@@ -356,7 +356,7 @@ def test_regular_wizard_mixed_redirect():
             "cli_last_lang": "ru_ru"
         }.get(key, default)
 
-        from main import run_setup_wizard
+        from cli import run_setup_wizard
         from config import ConfigManager
         config = ConfigManager()
 
@@ -369,7 +369,7 @@ def test_regular_wizard_mixed_redirect():
         assert any(call[0][0] == "cli_last_provider" for call in mock_save.call_args_list)
 
 def test_cli_settings_persistence_before_translation():
-    from main import main_async
+    from cli import main_async
     from unittest.mock import patch, AsyncMock
     import asyncio
 
@@ -383,7 +383,7 @@ def test_cli_settings_persistence_before_translation():
         cfg.save_to_settings()
         return (Path("/tmp/test"), "Groq Cloud (Fast)", "test_key", "test_model", "Russian", "ru_ru")
 
-    with patch('main.ConfigManager') as mock_config_manager:
+    with patch('cli.ConfigManager') as mock_config_manager:
         mock_config = mock_config_manager.return_value
         mock_config.concurrency = 2
         mock_parsed = type('obj', (object,), {'mix': False, 'debug': False, 'clear_cache': False, 'fastdir': False, 'dir': None, 'gui': False, 'resource_pack': False})()
@@ -395,10 +395,10 @@ def test_cli_settings_persistence_before_translation():
         mock_config.custom_context = ""
         mock_config.policy = ""
 
-        with patch('main.run_setup_wizard', new_callable=AsyncMock) as mock_wizard:
+        with patch('cli.run_setup_wizard', new_callable=AsyncMock) as mock_wizard:
             mock_wizard.side_effect = mock_wizard_side_effect
 
-            with patch('main.run_translation', new_callable=AsyncMock) as mock_translate:
+            with patch('cli.run_translation', new_callable=AsyncMock) as mock_translate:
                 mock_translate.return_value = 0
 
                 asyncio.run(main_async())
@@ -407,7 +407,7 @@ def test_cli_settings_persistence_before_translation():
                 assert mock_wizard.called
 
 def test_cli_mix_true_concurrency():
-    from main import run_translation
+    from cli import run_translation
     from unittest.mock import patch, AsyncMock, MagicMock
     from pathlib import Path
     import asyncio
@@ -430,11 +430,11 @@ def test_cli_mix_true_concurrency():
     mock_modpack_root.rglob.return_value = iter([])
     mock_m.translator = MagicMock()
 
-    with patch('main.SNBTManager', return_value=mock_m), \
-         patch('main.find_quests_dir', return_value=mock_quests_dir) as mock_find, \
-         patch('main.find_modpack_root_from_quest_dir', return_value=mock_modpack_root), \
-         patch('main.render_cli_progress'), \
-         patch('main.sys') as mock_sys:
+    with patch('cli.SNBTManager', return_value=mock_m), \
+         patch('cli.find_quests_dir', return_value=mock_quests_dir) as mock_find, \
+         patch('cli.find_modpack_root_from_quest_dir', return_value=mock_modpack_root), \
+         patch('cli.render_cli_progress'), \
+         patch('cli.sys') as mock_sys:
 
         mock_sys.stdout = MagicMock()
 

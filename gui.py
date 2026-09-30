@@ -2,6 +2,7 @@ import os
 import sys
 import ctypes
 import re
+import json
 import asyncio
 import random
 import time
@@ -17,7 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, QUrl
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices, QPainter
 import httpx
-from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, JSONManager, get_resource_path, get_base_url, detect_provider, test_key_with_question, fetch_provider_balance, TEST_QUESTIONS, REASONING_EFFORT_LEVELS, parse_model_effort, set_temperature
+from core import SNBTManager, EXCLUDED_DIRS, AbortException, parse_target_lang, TranslationCache, UnifiedTranslator, is_valid_custom_instance, PROVIDER_DEFAULTS, JSONManager, get_resource_path, get_base_url, detect_provider, test_key_with_question, fetch_provider_balance, TEST_QUESTIONS, REASONING_EFFORT_LEVELS, parse_model_effort, set_temperature, reset_request_timeout
 from config import ConfigManager, APP_VERSION
 
 LOCALES = {
@@ -985,6 +986,26 @@ class SettingsTab(QWidget):
         self.cb_titles.setChecked(self.settings.value("cb_titles", "true") == "true")
         self.cb_subs.setChecked(self.settings.value("cb_subs", "true") == "true")
         self.cb_desc.setChecked(self.settings.value("cb_desc", "true") == "true")
+        # Utility model (glossary pre-scan): empty = same as main
+        saved_up = self.settings.value("utility_provider", "") or ""
+        idx = self.utility_provider_combo.findData(saved_up)
+        self.utility_provider_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._utility_saved_model = self.settings.value("utility_model", "") or ""
+        # _on_utility_provider_changed fires via setCurrentIndex above when a
+        # non-default provider was saved; the model text is restored after
+        # the list loads (see _on_utility_models_loaded).
+        # QA audit phase: restore the saved provider WITHOUT blocking signals.
+        # setCurrentIndex fires _on_qa_provider_changed, which mirrors the
+        # utility flow: with QA on it starts the model loader (the saved
+        # qa_model text is restored in _on_qa_models_loaded); with QA off
+        # the handler only greys the model box and starts nothing. Blocking
+        # the signal here left the model box permanently empty/disabled after
+        # a restart even with QA on and a provider selected.
+        saved_qap = self.settings.value("qa_provider", "") or ""
+        idx_qap = self.qa_provider_combo.findData(saved_qap)
+        if idx_qap < 0:
+            idx_qap = 0
+        self.qa_provider_combo.setCurrentIndex(idx_qap)
 
     def setup_ui(self):
         self.layout = QVBoxLayout()
@@ -1060,6 +1081,223 @@ class SettingsTab(QWidget):
         settings_layout.addLayout(settings_row)
         self.layout.addWidget(settings_frame)
 
+        # Utility model for the modpack glossary pre-scan. Both fields empty
+        # (default) = use the main provider/model; the pre-scan sends 1-2
+        # tiny batches of recurring mod terms and pins their translations
+        # for the main run (Curio → артефакт, Solidifier → Затвердитель).
+        utility_frame = QFrame(self)
+        utility_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+        utility_layout = QVBoxLayout(utility_frame)
+        utility_layout.setContentsMargins(12, 12, 12, 12)
+        utility_layout.setSpacing(8)
+
+        utility_label = QLabel("Glossary Utility Model (empty = same as main):")
+        utility_label.setStyleSheet("color: #cccccc; font-size: 12px;")
+        utility_layout.addWidget(utility_label)
+
+        utility_row = QHBoxLayout()
+        utility_row.setSpacing(12)
+        self.utility_provider_combo = QComboBox()
+        self.utility_provider_combo.setView(QListView())
+        self.utility_provider_combo.setEditable(False)
+        self.utility_provider_combo.addItem("Same as main (default)", "")
+        from config import ConfigManager
+        for p in ConfigManager.AVAILABLE_PROVIDERS:
+            self.utility_provider_combo.addItem(p, p)
+        self.utility_provider_combo.setToolTip(
+            "Provider used ONLY for the glossary pre-scan (translating recurring mod terms).\n"
+            "Keys are taken from this provider's pool on the main screen.\n"
+            "If the pool is empty, falls back to the main provider."
+        )
+        self.utility_provider_combo.currentIndexChanged.connect(self._on_utility_provider_changed)
+        utility_row.addWidget(self.utility_provider_combo)
+
+        # Utility model: same UX as the main model box — editable combo with
+        # a live-loaded model list, a completion popup and the "/level" hint.
+        self.utility_model_box = QComboBox()
+        self.utility_model_box.setView(QListView())
+        self.utility_model_box.setEditable(True)
+        self.utility_model_box.setEnabled(False)
+        self.utility_model_box.setToolTip(
+            "Model for the glossary pre-scan. A fast/cheap model is enough.\n"
+            'Type "/" after a model id for a reasoning level (e.g. zai-org/GLM-5.3-Flash/low).'
+        )
+        self.utility_completer = QCompleter(self)
+        self.utility_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.utility_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.utility_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.utility_completer.popup().setStyleSheet(STYLE_SHEET)
+        self.utility_model_box.setLineEdit(GhostSuffixLineEdit())
+        self.utility_model_box.setCompleter(self.utility_completer)
+        # Hard dark styling for every state (enabled/disabled/placeholder):
+        # without this the Fusion palette can render black text.
+        self.utility_model_box.setStyleSheet(
+            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
+            " border-radius: 6px; padding: 6px 10px; color: #f2f4f8; }"
+            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
+            "QComboBox QLineEdit { background-color: transparent; color: #f2f4f8; border: none; padding: 0; }"
+            "QLineEdit:disabled { background-color: transparent; color: #4b5263; border: none; }"
+        )
+        self.utility_provider_combo.setStyleSheet(
+            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
+            " border-radius: 6px; padding: 6px 10px; color: #f2f4f8; }"
+            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
+            "QComboBox QAbstractItemView { background-color: #171920; color: #f2f4f8;"
+            " selection-background-color: #306fcb; selection-color: #ffffff; }"
+        )
+        self.utility_model_box.lineEdit().textEdited.connect(self._on_utility_model_text_edited)
+        self._utility_orig_completer_model = None
+        utility_row.addWidget(self.utility_model_box, 1)
+        utility_layout.addLayout(utility_row)
+        utility_hint = QLabel('After the model you can type "/" for a reasoning level (e.g. gpt-5/low)')
+        utility_hint.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 2px;")
+        utility_hint.setToolTip('Type "/" after a model id to pick a reasoning level:\n'
+                                '/off /minimal /low /medium /high /xhigh /default\n'
+                                'Controls how much the model "thinks" before answering —\n'
+                                'lower levels are faster and cheaper.')
+        utility_layout.addWidget(utility_hint)
+        self.layout.addWidget(utility_frame)
+
+        # --- QA audit phase frame ------------------------------------------
+        qa_frame = QFrame(self)
+        qa_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
+        qa_layout = QVBoxLayout(qa_frame)
+        qa_layout.setContentsMargins(12, 12, 12, 12)
+        qa_layout.setSpacing(8)
+
+        qa_title = QLabel("QA Audit (Post-Translation Scan)")
+        qa_title.setStyleSheet("font-weight: bold; color: #f2f4f8; border: none;")
+        qa_layout.addWidget(qa_title)
+
+        qa_top_row = QHBoxLayout()
+        qa_top_row.setSpacing(10)
+        self.cb_qa_enabled = QCheckBox("Enable QA scan after translation")
+        self.cb_qa_enabled.setChecked(self.config.qa_enabled)
+        qa_top_row.addWidget(self.cb_qa_enabled)
+        qa_top_row.addStretch()
+        qa_layout.addLayout(qa_top_row)
+
+        qa_provider_row = QHBoxLayout()
+        qa_provider_row.setSpacing(10)
+        qa_provider_label = QLabel("Auditor provider")
+        self.qa_provider_combo = QComboBox()
+        self.qa_provider_combo.setView(QListView())
+        self.qa_provider_combo.setEditable(False)
+        self.qa_provider_combo.setEnabled(self.cb_qa_enabled.isChecked())
+        self.qa_provider_combo.addItem("Same as utility (default)", "")
+        from config import ConfigManager as _CM
+        for p in _CM.AVAILABLE_PROVIDERS:
+            self.qa_provider_combo.addItem(p, p)
+        self.qa_provider_combo.setToolTip(
+            "Provider used ONLY for the QA audit pass.\n"
+            "Keys are taken from this provider's pool on the main screen.\n"
+            "If the pool is empty, falls back to the utility/main provider."
+        )
+        self.qa_provider_combo.setStyleSheet(
+            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
+            " border-radius: 6px; padding: 6px 10px; color: #f2f4f8; }"
+            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
+            "QComboBox QAbstractItemView { background-color: #171920; color: #f2f4f8;"
+            " selection-background-color: #306fcb; selection-color: #ffffff; }"
+        )
+        qa_provider_row.addWidget(qa_provider_label)
+        qa_provider_row.addWidget(self.qa_provider_combo)
+        qa_provider_row.addStretch()
+        qa_layout.addLayout(qa_provider_row)
+        # connect AFTER the handler exists on the class — safe at runtime
+        self.qa_provider_combo.currentIndexChanged.connect(self._on_qa_provider_changed)
+
+        qa_model_row = QHBoxLayout()
+        qa_model_row.setSpacing(10)
+        qa_model_label = QLabel("Auditor model")
+        self.qa_model_box = QComboBox()
+        self.qa_model_box.setEditable(True)
+        self.qa_model_box.setEnabled(False)
+        self.qa_model_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.qa_model_box.setLineEdit(GhostSuffixLineEdit("/low"))
+        self.qa_model_box.lineEdit().setPlaceholderText("(same as utility model)")
+        self.qa_model_box.setStyleSheet(
+            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
+            " border-radius: 6px; padding: 6px 10px; color: #f2f4f8; }"
+            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
+            "QComboBox QLineEdit { background-color: transparent; color: #f2f4f8; border: none; padding: 0; }"
+            "QLineEdit:disabled { background-color: transparent; color: #4b5263; border: none; }"
+        )
+        self.qa_model_box.lineEdit().textEdited.connect(self._on_qa_model_text_edited)
+        self._qa_orig_completer_model = None
+        self.qa_model_completer = QCompleter(self)
+        self.qa_model_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.qa_model_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.qa_model_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.qa_model_completer.popup().setStyleSheet(STYLE_SHEET)
+        self.qa_model_box.setCompleter(self.qa_model_completer)
+        qa_model_row.addWidget(qa_model_label)
+        qa_model_row.addWidget(self.qa_model_box, 1)
+        qa_layout.addLayout(qa_model_row)
+
+        qa_hint_label = QLabel('After the model you can type "/" for a reasoning level (e.g. gpt-5/low)')
+        qa_hint_label.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 2px;")
+        qa_hint_label.setToolTip('Type "/" after a model id to pick a reasoning level:\n'
+                                 '/off /minimal /low /medium /high /xhigh /default\n'
+                                 'Controls how much the model "thinks" before answering —\n'
+                                 'lower levels are faster and cheaper.')
+        qa_layout.addWidget(qa_hint_label)
+
+        self.cb_qa_update_glossary = QCheckBox("Update modpack glossary from scan results")
+        self.cb_qa_update_glossary.setChecked(self.config.qa_update_glossary)
+        self.cb_qa_update_glossary.setEnabled(self.cb_qa_enabled.isChecked())
+        self.cb_qa_update_glossary.setStyleSheet("color: #f2f4f8;")
+        qa_layout.addWidget(self.cb_qa_update_glossary)
+
+        qa_batch_row = QHBoxLayout()
+        qa_batch_label = QLabel("QA batch size")
+        qa_batch_label.setStyleSheet("color: #b8bfcc; border: none;")
+        self.qa_batch_spin = QSpinBox()
+        self.qa_batch_spin.setRange(10, 200)
+        self.qa_batch_spin.setSingleStep(10)
+        self.qa_batch_spin.setValue(self.config.qa_batch_size)
+        self.qa_batch_spin.setEnabled(self.cb_qa_enabled.isChecked())
+        self.qa_batch_spin.setToolTip(
+            "Number of translated pairs sent to the auditor model per request.\n"
+            "Bigger batches = fewer requests but slower answers.\n"
+            "Batches are scanned in parallel, one per API key.")
+        self.qa_batch_spin.setStyleSheet(
+            "QSpinBox { background-color: #171920; color: #e8ecf1; border: 1px solid #2d2d30; "
+            "border-radius: 4px; padding: 4px 6px; font-size: 12px; min-width: 60px; }")
+        qa_batch_row.addWidget(qa_batch_label)
+        qa_batch_row.addWidget(self.qa_batch_spin)
+        qa_batch_row.addStretch()
+        qa_layout.addLayout(qa_batch_row)
+
+        qa_temp_row = QHBoxLayout()
+        qa_temp_label = QLabel("QA temperature")
+        qa_temp_label.setStyleSheet("color: #b8bfcc; border: none;")
+        self.qa_temp_spin = QDoubleSpinBox()
+        self.qa_temp_spin.setRange(0.0, 2.0)
+        self.qa_temp_spin.setSingleStep(0.1)
+        self.qa_temp_spin.setDecimals(2)
+        self.qa_temp_spin.setValue(self.config.qa_temperature)
+        self.qa_temp_spin.setEnabled(self.cb_qa_enabled.isChecked())
+        self.qa_temp_spin.setToolTip(
+            "Sampling temperature for the QA auditor model.\n"
+            "0.0 = fully deterministic audit (recommended).\n"
+            "Higher values make the auditor more varied / less strict.")
+        self.qa_temp_spin.setStyleSheet(
+            "QDoubleSpinBox { background-color: #171920; color: #e8ecf1; border: 1px solid #2d2d30; "
+            "border-radius: 4px; padding: 4px 6px; font-size: 12px; min-width: 60px; }")
+        qa_temp_row.addWidget(qa_temp_label)
+        qa_temp_row.addWidget(self.qa_temp_spin)
+        qa_temp_row.addStretch()
+        qa_layout.addLayout(qa_temp_row)
+
+        qa_hint = QLabel("A second model re-reads every translated pair before writing ru_ru: hard errors are retranslated, safe terminology fixes are applied, glossary terms are learned. Skips silently if no keys or unsupported provider.")
+        qa_hint.setStyleSheet("font-size: 11px; color: #64748b; border: none;")
+        qa_hint.setWordWrap(True)
+        qa_layout.addWidget(qa_hint)
+
+        self.cb_qa_enabled.toggled.connect(self._on_qa_enabled_toggled)
+        self.layout.addWidget(qa_frame)
+
         filters_frame = QFrame(self)
         filters_frame.setStyleSheet("QFrame { background-color: #1e1e24; border: 1px solid #2d2d30; border-radius: 8px; }")
         filters_layout = QVBoxLayout(filters_frame)
@@ -1120,6 +1358,189 @@ class SettingsTab(QWidget):
     def _on_rp_mode_toggled(self, checked):
         self.config.resource_pack_mode = checked
         self.config.save_to_settings()
+
+    # --- Utility model (glossary pre-scan) ---------------------------
+    def _utility_keys_for(self, provider: str):
+        """Keys for the utility provider's model list: its own pool."""
+        return self.config.get_api_keys(provider) if provider else []
+
+    def _on_utility_provider_changed(self, index):
+        provider = self.utility_provider_combo.currentData() or ""
+        if getattr(self, "_utility_loader", None):
+            self._utility_loader.cancelled = True
+        self.utility_model_box.blockSignals(True)
+        self.utility_model_box.clear()
+        if not provider or "Google Translate" in provider or provider == "Mixed Providers":
+            self.utility_model_box.setEnabled(False)
+            self.utility_completer.setModel(QStringListModel([]))
+            ph = ("Utility model (same as main)" if not provider
+                  else ("Not needed (free engine)" if "Google Translate" in provider
+                        else "Defined per key in pool"))
+            self.utility_model_box.setPlaceholderText(ph)
+            self.utility_model_box.lineEdit().setPlaceholderText(ph)
+        else:
+            self.utility_model_box.setEnabled(True)
+            ph = "Utility model (empty = same as main)"
+            self.utility_model_box.setPlaceholderText(ph)
+            self.utility_model_box.lineEdit().setPlaceholderText(ph)
+            self.utility_model_box.addItem("Loading live models...")
+            self.utility_completer.setModel(QStringListModel(["Loading live models..."]))
+            keys = self._utility_keys_for(provider)
+            key = keys[0] if keys else None
+            loader = _track_qthread(ModelLoader(provider, key, 0, None))
+            self._utility_loader = loader
+            loader.loaded.connect(self._on_utility_models_loaded)
+            loader.finished.connect(lambda l=loader: self._cleanup_utility_loader(l))
+            loader.start()
+
+    def _cleanup_utility_loader(self, loader):
+        if getattr(self, "_utility_loader", None) is loader:
+            self._utility_loader = None
+
+    # --- QA audit phase -----------------------------------------------------
+    def _on_qa_enabled_toggled(self, checked):
+        self.qa_provider_combo.setEnabled(checked)
+        self.cb_qa_update_glossary.setEnabled(checked)
+        self.qa_batch_spin.setEnabled(checked)
+        self.qa_temp_spin.setEnabled(checked)
+        if not checked:
+            self.qa_model_box.setEnabled(False)
+        else:
+            # Mirror the utility flow: enable the model box according to the
+            # currently selected provider and load models if empty.
+            self._on_qa_provider_changed(self.qa_provider_combo.currentIndex())
+        # save immediately so the choice survives a crash/close
+        self.config.qa_enabled = checked
+        self.config.save_to_settings()
+
+    def _qa_keys_for(self, provider: str):
+        """Keys for the QA provider's model list: its own pool, with the
+        utility/main pool as fallback."""
+        if not provider:
+            provider = self.config.utility_provider or self.config.provider
+        if provider == "Mixed Providers":
+            return []
+        return self.config.get_api_keys(provider) if provider else []
+
+    def _on_qa_provider_changed(self, index):
+        provider = self.qa_provider_combo.currentData() or ""
+        if getattr(self, "_qa_loader", None):
+            self._qa_loader.cancelled = True
+        self.qa_model_box.blockSignals(True)
+        self.qa_model_box.clear()
+        if not provider or "Google Translate" in provider or provider == "Mixed Providers":
+            # Same as utility / free engine / per-key pool: no model list to load
+            self.qa_model_box.setEnabled(False)
+            self.qa_model_completer.setModel(QStringListModel([]))
+            ph = ("Auditor model (same as utility)" if not provider
+                  else ("Not needed (free engine)" if "Google Translate" in provider
+                        else "Defined per key in pool"))
+            self.qa_model_box.setPlaceholderText(ph)
+            self.qa_model_box.lineEdit().setPlaceholderText(ph)
+        elif not self.cb_qa_enabled.isChecked():
+            # QA off: everything stays grey until the user enables it.
+            self.qa_model_box.setEnabled(False)
+        else:
+            self.qa_model_box.setEnabled(True)
+            ph = "Auditor model (empty = same as utility)"
+            self.qa_model_box.setPlaceholderText(ph)
+            self.qa_model_box.lineEdit().setPlaceholderText(ph)
+            self.qa_model_box.addItem("Loading live models...")
+            self.qa_model_completer.setModel(QStringListModel(["Loading live models..."]))
+            keys = self._qa_keys_for(provider)
+            key = keys[0] if keys else None
+            loader = _track_qthread(ModelLoader(provider, key, 0, None))
+            self._qa_loader = loader
+            loader.loaded.connect(self._on_qa_models_loaded)
+            loader.finished.connect(lambda l=loader: self._qa_cleanup_loader(l))
+            loader.start()
+        self.qa_model_box.blockSignals(False)
+
+    def _qa_cleanup_loader(self, loader):
+        if getattr(self, "_qa_loader", None) is loader:
+            self._qa_loader = None
+
+    def _on_qa_models_loaded(self, models, error_msg="", loader_id=0, loader_provider=""):
+        if getattr(self, "_qa_loader", None) is None:
+            return
+        self.qa_model_box.blockSignals(True)
+        self.qa_model_box.clear()
+        filtered = []
+        if models:
+            for m in models:
+                m_low = m.lower()
+                if not any(x in m_low for x in ["whisper", "tts", "stablediffusion", "dall-e", "embed", "moderation", "davinci", "babbage", "curie", "ada", "guard", "shield", "rerank", "classify", "classifier", "nli", "sentiment", "bert"]):
+                    filtered.append(m)
+        if filtered:
+            self.qa_model_box.addItems(filtered)
+            self.qa_model_completer.setModel(QStringListModel(filtered))
+        else:
+            self.qa_model_box.addItem("Enter model name manually")
+        saved = self.settings.value("qa_model", "") or ""
+        if saved:
+            self.qa_model_box.setCurrentText(saved)
+        self.qa_model_box.blockSignals(False)
+
+    def _on_qa_model_text_edited(self, text):
+        """Same live hint as the main model box: typing "model/" swaps the
+        completer to reasoning-level suggestions, anything else restores the
+        normal model list."""
+        base, _, tail = text.rpartition("/")
+        tail_l = tail.strip().lower()
+        is_level_typing = bool(base.strip()) and (tail_l == "" or any(l.startswith(tail_l) for l in REASONING_EFFORT_LEVELS))
+        if is_level_typing:
+            if self._qa_orig_completer_model is None:
+                self._qa_orig_completer_model = self.qa_model_completer.model()
+            self.qa_model_completer.setModel(QStringListModel([f"{base.strip()}/{l}" for l in REASONING_EFFORT_LEVELS]))
+            self.qa_model_completer.setCompletionPrefix(text)
+            self.qa_model_completer.complete()
+        elif self._qa_orig_completer_model is not None:
+            self.qa_model_completer.setModel(self._qa_orig_completer_model)
+            self._qa_orig_completer_model = None
+
+    def _on_utility_model_text_edited(self, text):
+        """Same live hint as the main model box: typing "model/" swaps the
+        completer to reasoning-level suggestions, anything else restores the
+        normal model list."""
+        base, _, tail = text.rpartition("/")
+        tail_l = tail.strip().lower()
+        is_level_typing = bool(base.strip()) and (tail_l == "" or any(l.startswith(tail_l) for l in REASONING_EFFORT_LEVELS))
+        if is_level_typing:
+            if self._utility_orig_completer_model is None:
+                self._utility_orig_completer_model = self.utility_completer.model()
+            self.utility_completer.setModel(QStringListModel([f"{base.strip()}/{l}" for l in REASONING_EFFORT_LEVELS]))
+            self.utility_completer.setCompletionPrefix(text)
+            self.utility_completer.complete()
+        elif self._utility_orig_completer_model is not None:
+            self.utility_completer.setModel(self._utility_orig_completer_model)
+            self._utility_orig_completer_model = None
+
+    def _on_utility_models_loaded(self, models, error_msg="", loader_id=0, loader_provider=""):
+        if getattr(self, "_utility_loader", None) is None:
+            return
+        provider = self.utility_provider_combo.currentData() or ""
+        if loader_provider and provider and loader_provider != provider:
+            return
+        self.utility_model_box.blockSignals(True)
+        self.utility_model_box.clear()
+        filtered = []
+        if models:
+            for m in models:
+                m_low = m.lower()
+                if not any(x in m_low for x in ["whisper", "tts", "stablediffusion", "dall-e", "embed", "moderation", "davinci", "babbage", "curie", "ada", "guard", "shield", "rerank", "classify", "classifier", "nli", "sentiment", "bert"]):
+                    filtered.append(m)
+        if filtered:
+            self.utility_model_box.addItems(filtered)
+            self.utility_completer.setModel(QStringListModel(filtered))
+        else:
+            self.utility_model_box.addItem("Enter model name manually")
+            self.utility_completer.setModel(QStringListModel([]))
+        # restore the saved model choice now that the list is loaded
+        saved = getattr(self, "_utility_saved_model", "") or ""
+        if saved:
+            self.utility_model_box.setCurrentText(saved)
+        self.utility_model_box.blockSignals(False)
+
 
 class CacheHealerWorker(QThread):
     """Auto-Fix healer: re-translates garbage cache entries (wrong-language
@@ -1685,7 +2106,7 @@ class Worker(QThread):
     lines_translated = pyqtSignal(int, int)
     progress_state = pyqtSignal(int, int, str, int, int, float)
 
-    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, temperature=0.1, modpack=None, custom_base_url=None, translator=None, cache=None, resource_pack_mode=False):
+    def __init__(self, files, keys, provider, model, t_titles, t_subs, t_desc, custom_context="", policy="Complement (Дополнить)", target_lang="Russian (ru_ru)", concurrency=3, mixed_pool=None, batch_size=50, min_batch_size=1, max_concurrent_requests=10, temperature=0.1, modpack=None, custom_base_url=None, translator=None, cache=None, resource_pack_mode=False, prescan_params=None, qa_params=None):
         super().__init__()
         self.files = files
         self.keys = keys
@@ -1708,6 +2129,8 @@ class Worker(QThread):
         self.translator = translator
         self.cache = cache
         self.resource_pack_mode = resource_pack_mode
+        self.prescan_params = prescan_params
+        self.qa_params = qa_params
         self.is_aborted = False
         self.is_paused = False
         self._total_strings = 0
@@ -1723,6 +2146,34 @@ class Worker(QThread):
 
             # Apply the GUI temperature setting to every provider payload.
             set_temperature(self.temperature)
+
+            # --- Modpack glossary pre-scan (in Worker thread: own event loop) ---
+            # GUI thread runs inside asyncio.run(main_async()) from cli.py --gui,
+            # so asyncio.run() is illegal there. Here in the QThread it is fine.
+            # Best-effort: a failed pre-scan never blocks the translation itself.
+            if self.prescan_params and self.translator is not None:
+                try:
+                    from core import ensure_modpack_glossary
+                    pp = self.prescan_params
+                    self.log.emit("Glossary pre-scan: extracting recurring mod terms...")
+                    glossary = asyncio.run(ensure_modpack_glossary(
+                        pp["texts"],
+                        pp["root"],
+                        pp["keys"],
+                        pp["provider"],
+                        pp["model"],
+                        pp["lang_name"],
+                        mixed_pool=pp.get("mixed_pool"),
+                        custom_base_url=pp.get("custom_base_url"),
+                        logger=self.log.emit,
+                        check_status=None,
+                        force_refresh=pp.get("force_refresh", False),
+                    ))
+                    if glossary.terms:
+                        self.translator.modpack_glossary_terms = glossary.terms
+                        self.log.emit(f"Modpack glossary active: {len(glossary.terms)} terms pinned.")
+                except Exception as e:
+                    self.log.emit(f"Glossary pre-scan skipped: {e}")
 
             snbt_files = [f for f in self.files if str(f).endswith('.snbt') and not Path(f).is_dir()]
             json_files = [f for f in self.files if str(f).endswith('en_us.json')]
@@ -1768,7 +2219,8 @@ class Worker(QThread):
                         resource_pack_mode=self.resource_pack_mode,
                         progress_callback=json_progress,
                         batch_size=self.batch_size,
-                        min_batch_size=self.min_batch_size
+                        min_batch_size=self.min_batch_size,
+                        qa_params=self.qa_params
                     )
                     asyncio.run(run_with_abort_watchdog(manager.process(
                         log_callback=self.log.emit,
@@ -1820,6 +2272,7 @@ class Worker(QThread):
             self.log.emit("No files to process.")
             return
 
+        reset_request_timeout()
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
         m = SNBTManager(
@@ -1836,7 +2289,8 @@ class Worker(QThread):
             min_batch_size=self.min_batch_size,
             max_concurrent_requests=self.max_concurrent_requests,
             modpack=self.modpack,
-            custom_base_url=self.custom_base_url
+            custom_base_url=self.custom_base_url,
+            qa_params=self.qa_params
         )
 
         total_lines = 0
@@ -1969,7 +2423,8 @@ class JSONWorker(QThread):
             resource_pack_mode=self.resource_pack_mode,
             progress_callback=lambda cur, tot: self.progress_batch.emit(cur, tot),
             batch_size=self.batch_size,
-            min_batch_size=self.min_batch_size
+            min_batch_size=self.min_batch_size,
+            qa_params=self.qa_params
         )
         await manager.process(
             log_callback=self.log.emit,
@@ -2455,6 +2910,31 @@ class App(QMainWindow):
         self.config.max_concurrent_requests = self.settings_tab.max_requests_spin.value()
         self.config.temperature = self.settings_tab.temperature_spin.value()
         self.settings.setValue("temperature", self.settings_tab.temperature_spin.value())
+        # Utility model (glossary pre-scan)
+        utility_provider = self.settings_tab.utility_provider_combo.currentData() or ""
+        utility_model = self.settings_tab.utility_model_box.currentText().strip()
+        if utility_model in ("Loading live models...", "Enter model name manually"):
+            utility_model = ""
+        if utility_provider and utility_provider == self.config.provider and not utility_model:
+            # explicitly "same as main": store empty (default semantics)
+            utility_provider, utility_model = "", ""
+        self.config.utility_provider = utility_provider
+        self.config.utility_model = utility_model
+        self.settings.setValue("utility_provider", utility_provider)
+        self.settings.setValue("utility_model", utility_model)
+        # QA audit phase
+        qa_provider = (self.settings_tab.qa_provider_combo.currentData() or "").strip()
+        qa_model = self.settings_tab.qa_model_box.currentText().strip()
+        if qa_model in ("Loading live models...", "Enter model name manually"):
+            qa_model = ""
+        self.config.qa_provider = qa_provider
+        self.config.qa_model = qa_model
+        self.config.qa_enabled = self.settings_tab.cb_qa_enabled.isChecked()
+        self.config.qa_update_glossary = self.settings_tab.cb_qa_update_glossary.isChecked()
+        self.config.qa_batch_size = self.settings_tab.qa_batch_spin.value()
+        self.config.qa_temperature = self.settings_tab.qa_temp_spin.value()
+        self.settings.setValue("qa_provider", qa_provider)
+        self.settings.setValue("qa_model", qa_model)
         self.config.save_to_settings()
 
     def _disconnect_dir_box(self):
@@ -3185,8 +3665,13 @@ class App(QMainWindow):
                     self.model_box.setEditText(saved_model)
                     self.config.model = saved_model
                 else:
+                    # The saved model's base is not in the (fallback) list:
+                    # keep the saved value instead of overwriting it with the
+                    # placeholder item — this used to wipe saved models and
+                    # their reasoning-effort suffixes on every restart for
+                    # providers with no keys loaded.
                     self.model_box.setCurrentIndex(0)
-                    self.settings.setValue(f"model_{provider}", self.model_box.currentText())
+                    self.model_box.setEditText(saved_model)
             self.config.model = self.model_box.currentText()
 
         self.update_run_status()
@@ -3200,11 +3685,172 @@ class App(QMainWindow):
         if not hasattr(self, 'w') or self.w is None:
             return
         if self.w.is_paused:
+            # Resume: apply live settings FIRST (keys/model/temperature/
+            # batches/QA edited while paused), then release the pause flag
+            # and re-lock the live-editable widgets.
+            try:
+                self._apply_live_settings()
+            except Exception as e:
+                self._append_log(f"Live-update failed: {repr(e)[:150]} — continuing with the previous settings.")
             self.w.is_paused = False
             self.btn_pause.setText("Pause")
+            self._set_live_edit_enabled(False)
         else:
             self.w.is_paused = True
             self.btn_pause.setText("Resume")
+            self._set_live_edit_enabled(True)
+            self._append_log("Paused — you can edit the API key pool, model, temperature, batch sizes and QA settings; press Resume to apply them.")
+
+    def _set_live_edit_enabled(self, enabled: bool):
+        """Enable/disable the widgets that can be changed during a pause.
+
+        Structure-defining widgets (provider, language, directory, policy,
+        titles/subs/desc checkboxes, concurrency, context) stay locked for
+        the whole run. In skip-mode the key pool/model are pointless — the
+        run translates nothing — so they stay locked too.
+        """
+        skip_mode = any(k == "SKIP" for k in (getattr(self.w, 'keys', None) or []))
+        pool_editable = enabled and not skip_mode
+        self.key_pool_edit.setEnabled(pool_editable)
+        self.model_box.setEnabled(pool_editable)
+        self.tabs.setTabEnabled(1, enabled)
+        # batch/min/max were disabled individually in start(); temperature
+        # and the QA frame are inside the Settings tab and become available
+        # simply by enabling the tab itself.
+        self.settings_tab.batch_spin.setEnabled(enabled)
+        self.settings_tab.min_batch_spin.setEnabled(enabled)
+        self.settings_tab.max_requests_spin.setEnabled(enabled)
+
+    def _apply_live_settings(self):
+        """Mutate the RUNNING worker with the settings edited while paused.
+
+        Everything is applied on the live objects the workers already hold
+        references to: translator.mixed_pool (the actual rotation pool),
+        the worker's snapshot fields (used by managers created later) and
+        the shared qa_params dict (mutated in place, in original batch
+        order). In-flight requests finish on the old settings — the new
+        ones apply from the next request/manager/QA file.
+        """
+        w = self.w
+        prov = getattr(w, 'provider', '')
+        # Sync config from the widgets first so the QA cascade reads the
+        # values the user just edited (force: skip the model-update guard).
+        try:
+            self.save_current_settings(force=True)
+        except Exception:
+            pass
+
+        log_parts = []
+        skip_mode = any(k == "SKIP" for k in (getattr(w, 'keys', None) or []))
+        tr = getattr(w, 'translator', None)
+
+        # --- key pool + model (rotation pool is mixed_pool, not api_keys) ---
+        if not skip_mode and tr is not None:
+            raw_keys = self.key_pool_edit.toPlainText().strip().splitlines()
+            keys = [k.strip() for k in raw_keys if k.strip()]
+            seen = set()
+            unique_keys = []
+            for k in keys:
+                if k not in seen:
+                    seen.add(k)
+                    unique_keys.append(k)
+            unique_keys = unique_keys[:10]
+
+            needs_keys = prov not in ("Google Translate (Free)", "Ollama (Local / Free)")
+            model_text = self.model_box.currentText() or ""
+
+            if prov == "Mixed Providers":
+                pairs = []
+                for entry in unique_keys:
+                    if "\\" in entry:
+                        parts = entry.split("\\", 1)
+                        pairs.append({"key": parts[0].strip(),
+                                      "model": parts[1].strip() if parts[1].strip() else None})
+                    else:
+                        pairs.append({"key": entry, "model": None})
+                saved_keys_by_provider = {}
+                saved_models_by_provider = {}
+                default_models_by_provider = {}
+                for p in ["Groq Cloud (Fast)", "NVIDIA NIM", "Google Gemini (Free API)", "Sambanova", "OpenRouter (Cloud AI)", "OpenAI", "Mistral AI", "Anthropic (Claude)", "Cohere", "OpenCode", "Crusoe Cloud", "RunInfra", "Google Translate (Free)", "Ollama (Local / Free)", "Custom (OpenAI-compatible)"]:
+                    saved_keys_by_provider[p] = self.config.get_api_keys(p)
+                    saved_models_by_provider[p] = self.settings.value(f"model_{p}", "")
+                    default_models_by_provider[p] = PROVIDER_DEFAULTS.get(p, "")
+                from core import resolve_mixed_pool
+                mp = resolve_mixed_pool(pairs, saved_keys_by_provider,
+                                        saved_models_by_provider, default_models_by_provider)
+                if mp:
+                    tr.mixed_pool = mp
+                    tr.api_keys = [item["api_key"] for item in mp]
+                    log_parts.append(f"mixed pool {len(mp)} key(s)")
+                else:
+                    self._append_log("Live-update: Mixed pool resolved to nothing — kept the old pool.")
+            elif unique_keys or not needs_keys:
+                new_model = model_text if (model_text and model_text not in
+                                           ("", "Loading live models...", "None (Free Engine)")) else tr.model
+                base = get_base_url(prov)
+                new_pool = [{"provider": prov, "api_key": k, "model": new_model,
+                             "base_url": base} for k in unique_keys]
+                if not new_pool and prov == "Ollama (Local / Free)":
+                    new_pool = [{"provider": prov, "api_key": "", "model": new_model,
+                                 "base_url": base}]
+                tr.mixed_pool = new_pool
+                tr.api_keys = list(unique_keys)
+                if unique_keys:
+                    tr.api_key = unique_keys[0]
+                    log_parts.append(f"keys {len(unique_keys)} (...{unique_keys[0][-4:]})")
+                if new_model != getattr(tr, 'model', None):
+                    tr.model = new_model
+                    log_parts.append(f"model {new_model}")
+            elif needs_keys:
+                self._append_log("Live-update: the key pool is empty — kept the old keys.")
+
+        # --- temperature (global; applies to every next request) ---
+        new_temp = float(self.settings_tab.temperature_spin.value())
+        set_temperature(new_temp)
+        w.temperature = new_temp
+        if tr is not None:
+            log_parts.append(f"temperature {new_temp}")
+
+        # --- batch sizes (worker snapshot + translator thresholds; the
+        #     currently running manager keeps its own snapshot) ---
+        b = int(self.settings_tab.batch_spin.value())
+        mb = int(self.settings_tab.min_batch_spin.value())
+        mr = int(self.settings_tab.max_requests_spin.value())
+        w.batch_size, w.min_batch_size, w.max_concurrent_requests = b, mb, mr
+        if tr is not None:
+            tr.batch_size, tr.min_batch_size = b, mb
+        log_parts.append(f"batch {b} (min {mb}, max-req {mr})")
+
+        # --- QA params: same dict the managers already reference ---
+        qp = getattr(w, 'qa_params', None)
+        if qp is not None:
+            if not self.config.qa_enabled:
+                # Turning QA off mid-run: empty keys make each QA phase skip
+                # itself instantly ("no live API keys") without touching the
+                # running translation. Turning it back on re-fills the keys.
+                qp["keys"] = []
+                log_parts.append("QA off")
+            else:
+                qa_provider = self.config.qa_provider or self.config.utility_provider or prov
+                qa_keys = [k for k in (getattr(w, 'translator', None) and w.translator.api_keys) or [] if k]
+                if qa_provider != "Mixed Providers":
+                    pool_keys = self.config.get_api_keys(qa_provider)
+                    if pool_keys:
+                        qa_keys = pool_keys
+                qa_model = self.config.qa_model or self.config.utility_model or (self.model_box.currentText() or "")
+                qp["keys"] = qa_keys
+                qp["provider"] = qa_provider
+                qp["model"] = qa_model
+                qp["batch_size"] = int(self.settings_tab.qa_batch_spin.value())
+                qp["temperature"] = float(self.settings_tab.qa_temp_spin.value())
+                qp["update_glossary"] = bool(self.settings_tab.cb_qa_update_glossary.isChecked())
+                qp["custom_base_url"] = (self.custom_base_url_edit.text()
+                                         if qa_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)")
+                                         else None)
+                log_parts.append(f"QA {qa_model or '(default)'} {len(qa_keys)} key(s)")
+
+        if log_parts:
+            self._append_log("[Live-update] applied on resume: " + ", ".join(log_parts))
 
     def stop(self):
         if not hasattr(self, 'w') or self.w is None:
@@ -3380,7 +4026,125 @@ class App(QMainWindow):
         )
         cache = TranslationCache(target_lang_code=target_lang_code)
         cache.autofix_records()
-        self.w = _track_qthread(Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.settings_tab.batch_spin.value(), self.settings_tab.min_batch_spin.value(), self.settings_tab.max_requests_spin.value(), temperature=self.settings_tab.temperature_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache, resource_pack_mode=self.config.resource_pack_mode))
+
+        # --- Modpack glossary pre-scan ----------------------------------
+        # Extract recurring Capitalized terms from the quest strings, then
+        # hand them to the Worker thread: it runs the utility model there
+        # (asyncio.run is illegal on the GUI thread because cli.py --gui
+        # wraps the whole GUI in a running asyncio event loop).
+        prescan_params = None
+        try:
+            from core import (
+                find_modpack_root, _find_all_snbt_strings,
+            )
+            prescan_texts = []
+            for qd in quest_dirs:
+                for snbt_file in [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]:
+                    try:
+                        content = snbt_file.read_text(encoding='utf-8')
+                    except OSError:
+                        continue
+                    for s in _find_all_snbt_strings(content):
+                        if s['key'] == 'title' or s['key'].endswith('.title') or s['key'] == 'subtitle' or s['key'].endswith('.quest_subtitle'):
+                            v = s['value']
+                            if v and len(v) < 250:
+                                prescan_texts.append(v)
+                for j5 in qd.rglob("lang/en_us/*.json5"):
+                    try:
+                        raw = j5.read_text(encoding='utf-8')
+                        raw = re.sub(r',(\s*[}\]])', r'\1', raw)
+                        data = json.loads(raw)
+                    except Exception:
+                        continue
+                    def _walk(node):
+                        if isinstance(node, dict):
+                            for k, v in node.items():
+                                if k in ("title", "subtitle") and isinstance(v, str) and len(v) < 250:
+                                    prescan_texts.append(v)
+                                else:
+                                    _walk(v)
+                        elif isinstance(node, list):
+                            for it in node:
+                                _walk(it)
+                    _walk(data)
+
+            if prescan_texts:
+                utility_provider = self.config.utility_provider or prov
+                utility_model = self.config.utility_model or model
+                utility_keys = unique_keys
+                utility_mixed = mixed_pool
+                if self.config.utility_provider and self.config.utility_provider != "Mixed Providers":
+                    pool_keys = self.config.get_api_keys(self.config.utility_provider)
+                    if pool_keys:
+                        utility_keys = pool_keys
+                        utility_mixed = [
+                            {"provider": self.config.utility_provider, "api_key": k,
+                             "model": utility_model or "", "base_url": get_base_url(self.config.utility_provider)}
+                            for k in pool_keys
+                        ]
+                    else:
+                        self._append_log(
+                            f"Glossary pre-scan: utility provider '{self.config.utility_provider}' has no keys — using the main provider."
+                        )
+                prescan_needed = (
+                    utility_provider not in ("Google Translate (Free)", "Ollama (Local / Free)")
+                    and prov not in ("Google Translate (Free)", "Ollama (Local / Free)")
+                )
+                if prescan_needed:
+                    first_root = find_modpack_root(quest_dirs[0]) if quest_dirs else None
+                    if first_root:
+                        target_lang_name_, _ = parse_target_lang(target_lang)
+                        # Overwrite re-builds the glossary from scratch, matching
+                        # the policy semantics for strings (cache bypassed).
+                        is_overwrite = policy.lower().split('(')[0].strip() == "overwrite"
+                        prescan_params = {
+                            "texts": prescan_texts,
+                            "root": first_root,
+                            "keys": utility_keys,
+                            "provider": utility_provider,
+                            "model": utility_model,
+                            "lang_name": target_lang_name_,
+                            "mixed_pool": utility_mixed,
+                            "custom_base_url": custom_url if self.config.utility_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None,
+                            "force_refresh": is_overwrite,
+                        }
+        except Exception as e:
+            self._append_log(f"Glossary pre-scan skipped: {e}")
+
+        # --- QA phase params (post-translation audit) ------------------
+        qa_params = None
+        try:
+            if self.config.qa_enabled:
+                target_lang_name_, _ = parse_target_lang(target_lang)
+                # Dedicated QA provider > utility provider > main provider.
+                qa_provider = self.config.qa_provider or self.config.utility_provider or prov
+                qa_keys = unique_keys
+                if qa_provider != "Mixed Providers":
+                    pool_keys = self.config.get_api_keys(qa_provider)
+                    if pool_keys:
+                        qa_keys = pool_keys
+                # Auditor model: dedicated QA model (may carry a "/effort"
+                # suffix typed in the model field) > utility > main.
+                qa_model = self.config.qa_model or self.config.utility_model or model
+                qa_custom_url = custom_url if qa_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
+                first_root = find_modpack_root(quest_dirs[0]) if quest_dirs else None
+                qa_params = {
+                    "keys": qa_keys,
+                    "provider": qa_provider,
+                    "model": qa_model,
+                    "custom_base_url": qa_custom_url,
+                    "update_glossary": bool(self.config.qa_update_glossary),
+                    "batch_size": int(self.config.qa_batch_size),
+                    "temperature": float(self.config.qa_temperature),
+                    "modpack_root": first_root,
+                    "lang_name": target_lang_name_,
+                }
+                if any(u in qa_provider for u in ("Google Translate", "Ollama")):
+                    self._append_log(f"QA audit: provider '{qa_provider}' is not supported — the QA phase will be skipped.")
+        except Exception as e:
+            self._append_log(f"QA audit skipped: {e}")
+
+        self.w = _track_qthread(Worker(files, unique_keys, prov, model, t_titles, t_subs, t_desc, custom_context, policy, target_lang, concurrency, mixed_pool, self.settings_tab.batch_spin.value(), self.settings_tab.min_batch_spin.value(), self.settings_tab.max_requests_spin.value(), temperature=self.settings_tab.temperature_spin.value(), modpack=modpack_name, custom_base_url=custom_url, translator=translator, cache=cache, resource_pack_mode=self.config.resource_pack_mode, prescan_params=prescan_params, qa_params=qa_params))
         self.w.is_aborted = False
         self.w.is_paused = False
         self.w.log.connect(self._append_log)

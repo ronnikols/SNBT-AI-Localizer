@@ -6,7 +6,7 @@ High-quality, production-grade Minecraft SNBT quest localizer. Tech stack: Pytho
 ## Architecture Map
 - core.py: Core translation logic, SNBT/JSON processing, caching, path utilities (including `find_modpack_root_from_quest_dir`), and Pluralization Guard implementation
 - config.py: Configuration management, CLI argument parsing, provider aliases, and QSettings integration
-- main.py: CLI entrypoint (snbt-tr) with argument isolation, setup wizards, and fast instance selection
+- cli.py: CLI entrypoint (snbt-tr) with argument isolation, setup wizards, and fast instance selection
 - gui.py: PyQt6-based graphical user interface with 4 main tabs (Workspace, Translation Memory, Settings, Credits)
 
 ## Key Technical Mechanisms
@@ -38,10 +38,10 @@ The Pluralization Guard in `TranslationCache.get()` is a sophisticated 3-stage f
 The `ConfigManager` class in `config.py` dynamically preserves the `quest_dir` state through:
 - **QSettings Integration**: The `quest_dir` is stored in QSettings under the key `"quest_dir"` and loaded during initialization via `load_from_settings()`
 - **CLI Argument Handling**: The `--dir` argument is parsed and converted to a `Path` object, which is then stored in `config.quest_dir`
-- **Bidirectional GUI/CLI Sync**: The GUI (`gui.py`) and CLI (`main.py`) share the same `ConfigManager` instance, ensuring that changes to `quest_dir` in either interface are reflected in the other. The `save_to_settings()` method persists the state to QSettings, while `load_from_settings()` restores it on startup
+- **Bidirectional GUI/CLI Sync**: The GUI (`gui.py`) and CLI (`cli.py`) share the same `ConfigManager` instance, ensuring that changes to `quest_dir` in either interface are reflected in the other. The `save_to_settings()` method persists the state to QSettings, while `load_from_settings()` restores it on startup
 - **Custom Instances Management**: User-added paths are stored in `custom_instances_paths` list and persisted to QSettings under `"custom_instances_paths"`
 
-### CLI Argument Isolation in `main.py`
+### CLI Argument Isolation in `cli.py`
 The `main_async()` function implements argument isolation to prevent interactive prompts from overwriting explicit `--dir` arguments:
 - **Explicit `--dir` Handling**: If `--dir` is provided via CLI, it is normalized and used directly without triggering the interactive setup wizard
 - **Setup Wizard Isolation**: The `else` branch in `main_async()` only invokes the interactive `run_setup_wizard()` if no explicit `--dir` is provided. This ensures that CLI arguments take precedence over interactive input

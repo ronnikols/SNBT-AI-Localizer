@@ -18,7 +18,7 @@ jobs:
           python-version: '3.12'
       - run: pip install pyinstaller pillow
       - run: pip install -r requirements.txt
-      - run: pyinstaller --onefile --noconsole --icon=resources/logo.png --add-data "resources;resources" main.py --name snbt-tr
+      - run: pyinstaller --onefile --noconsole --icon=resources/logo.png --add-data "resources;resources" cli.py --name snbt-tr
       - run: |
           & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" setup.iss
         shell: pwsh

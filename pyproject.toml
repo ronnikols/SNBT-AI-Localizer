@@ -20,10 +20,10 @@ dependencies = [
 ]
 
 [project.scripts]
-snbt-tr = "main:main"
+snbt-tr = "cli:main"
 
 [tool.setuptools]
-py-modules = ["config", "core", "gui", "main"]
+py-modules = ["config", "core", "gui", "cli"]
 packages = ["resources"]
 include-package-data = true
 

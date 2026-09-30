@@ -8,6 +8,26 @@ import os
 import tempfile
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_qsettings_env(tmp_path_factory):
+    """Redirect QSettings (NativeFormat) to a sandbox dir for the whole session.
+
+    The production app and tests both use QSettings("MineAI", "SNBT-Localizer"),
+    which maps to ~/.config/MineAI/SNBT-Localizer.conf — the user's REAL saved
+    settings (API key pools live there). QSettings is a process singleton keyed
+    by org/app, so calling .clear() on it in a test run wipes the live config.
+    Point XDG_CONFIG_HOME at a throwaway dir instead so tests can never touch
+    it. Session scope + autouse: must run before QSettings is first created."""
+    sandbox = tmp_path_factory.mktemp("qsettings-sandbox")
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = str(sandbox)
+    yield
+    if old_xdg is None:
+        os.environ.pop("XDG_CONFIG_HOME", None)
+    else:
+        os.environ["XDG_CONFIG_HOME"] = old_xdg
+
+
 @pytest.fixture(scope="session")
 def qapp():
     """Create QApplication once per session."""
@@ -20,7 +40,7 @@ def qapp():
 
 @pytest.fixture(autouse=True)
 def clean_qsettings():
-    """Reset QSettings before each test."""
+    """Reset sandboxed QSettings before/after each test (never the live one)."""
     from PyQt6.QtCore import QSettings
     QSettings("MineAI", "SNBT-Localizer").clear()
     QSettings("MineAI-Test", "SNBT-Localizer-Test").clear()
