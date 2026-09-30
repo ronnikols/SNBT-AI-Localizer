@@ -1290,6 +1290,29 @@ class SettingsTab(QWidget):
         qa_temp_row.addStretch()
         qa_layout.addLayout(qa_temp_row)
 
+        qa_ds_row = QHBoxLayout()
+        self.cb_qa_dataset = QCheckBox("Collect QA dataset (training records)")
+        self.cb_qa_dataset.setChecked(self.config.qa_dataset)
+        self.cb_qa_dataset.setEnabled(self.cb_qa_enabled.isChecked())
+        self.cb_qa_dataset.setToolTip(
+            "Passively record every audited pair (source / machine translation / final / verdicts / action)\n"
+            "into ~/.snbt-tr/datasets/<pack>/<run>.jsonl — training data for the future decision model.\n"
+            "The run is never affected: a write failure only disables the dataset.")
+        self.cb_qa_dataset.setStyleSheet("color: #b8bfcc; border: none;")
+        qa_ds_row.addWidget(self.cb_qa_dataset)
+
+        self.cb_qa_vcache = QCheckBox("Verdict cache (skip re-audit of clean lines)")
+        self.cb_qa_vcache.setChecked(self.config.qa_verdict_cache)
+        self.cb_qa_vcache.setEnabled(self.cb_qa_enabled.isChecked())
+        self.cb_qa_vcache.setToolTip(
+            "Hashes every (source, translation) pair with the QA config. Clean\n"
+            "pairs skip the LLM re-audit on the next run; change a line — it is\n"
+            "audited again automatically.")
+        self.cb_qa_vcache.setStyleSheet("color: #b8bfcc; border: none;")
+        qa_ds_row.addWidget(self.cb_qa_vcache)
+        qa_ds_row.addStretch()
+        qa_layout.addLayout(qa_ds_row)
+
         qa_hint = QLabel("A second model re-reads every translated pair before writing ru_ru: hard errors are retranslated, safe terminology fixes are applied, glossary terms are learned. Skips silently if no keys or unsupported provider.")
         qa_hint.setStyleSheet("font-size: 11px; color: #64748b; border: none;")
         qa_hint.setWordWrap(True)
@@ -1403,6 +1426,8 @@ class SettingsTab(QWidget):
         self.cb_qa_update_glossary.setEnabled(checked)
         self.qa_batch_spin.setEnabled(checked)
         self.qa_temp_spin.setEnabled(checked)
+        self.cb_qa_dataset.setEnabled(checked)
+        self.cb_qa_vcache.setEnabled(checked)
         if not checked:
             self.qa_model_box.setEnabled(False)
         else:
@@ -2273,6 +2298,10 @@ class Worker(QThread):
             return
 
         reset_request_timeout()
+        # ТЗ-health: one batch run = one health window (stats + benching).
+        from core import health_reset, health_mark_start
+        health_reset()
+        health_mark_start()
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
         m = SNBTManager(
@@ -2366,6 +2395,15 @@ class Worker(QThread):
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             from core import close_shared_httpx_clients
+            try:
+                # ТЗ-health п.4: per-key [POOL] stats into the GUI console
+                # and app.log at the end of the SNBT batch.
+                from core import health_summary_lines
+                for line in health_summary_lines():
+                    self.log.emit(line)
+                    logging.getLogger("snbt_localizer.core").info(line)
+            except Exception:
+                pass
             try:
                 await close_shared_httpx_clients()
             except Exception:
@@ -2933,6 +2971,8 @@ class App(QMainWindow):
         self.config.qa_update_glossary = self.settings_tab.cb_qa_update_glossary.isChecked()
         self.config.qa_batch_size = self.settings_tab.qa_batch_spin.value()
         self.config.qa_temperature = self.settings_tab.qa_temp_spin.value()
+        self.config.qa_dataset = self.settings_tab.cb_qa_dataset.isChecked()
+        self.config.qa_verdict_cache = self.settings_tab.cb_qa_vcache.isChecked()
         self.settings.setValue("qa_provider", qa_provider)
         self.settings.setValue("qa_model", qa_model)
         self.config.save_to_settings()
@@ -4136,6 +4176,8 @@ class App(QMainWindow):
                     "update_glossary": bool(self.config.qa_update_glossary),
                     "batch_size": int(self.config.qa_batch_size),
                     "temperature": float(self.config.qa_temperature),
+                    "dataset": bool(self.config.qa_dataset),
+                    "verdict_cache": bool(self.config.qa_verdict_cache),
                     "modpack_root": first_root,
                     "lang_name": target_lang_name_,
                 }

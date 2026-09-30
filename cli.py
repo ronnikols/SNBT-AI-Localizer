@@ -1119,6 +1119,10 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     policy = resolve_policy(config.policy)
     from core import reset_request_timeout
     reset_request_timeout()
+    # ТЗ-health: one CLI run = one health window (stats + benching).
+    from core import health_reset, health_mark_start
+    health_reset()
+    health_mark_start()
     file_progress = {idx: 0.0 for idx in range(total_files)}
     _mp_glossary_terms = None  # pinned by the pre-scan, carried into the JSON5 phase
 
@@ -1145,6 +1149,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 "update_glossary": bool(getattr(config, "qa_update_glossary", True)),
                 "batch_size": int(getattr(config, "qa_batch_size", 40) or 40),
                 "temperature": float(getattr(config, "qa_temperature", 0.0) or 0.0),
+                "dataset": bool(getattr(config, "qa_dataset", True)),
+                "verdict_cache": bool(getattr(config, "qa_verdict_cache", True)),
                 "modpack_root": find_modpack_root_from_quest_dir(quest_dirs[0]) if quest_dirs else None,
                 "lang_name": lang_name,
             }
@@ -1284,6 +1290,15 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         await close_shared_httpx_clients()
         logging.getLogger("snbt_localizer.cli").error("Критическая ошибка: все ключи невалидны. Перевод прерван.")
         return 1
+    # ТЗ-health п.4: per-key [POOL] stats into the console and app.log
+    # at the end of the SNBT batch (CLI prints via logging + stdout).
+    try:
+        from core import health_summary_lines
+        for line in health_summary_lines():
+            logging.getLogger("snbt_localizer.cli").info(line)
+            print(line)
+    except Exception:
+        pass
     sys.stdout.write('\n')
     sys.stdout.flush()
     logging.getLogger("snbt_localizer.cli").info("Finished.")

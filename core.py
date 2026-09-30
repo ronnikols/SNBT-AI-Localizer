@@ -176,11 +176,13 @@ def get_temperature() -> float:
     return _TEMPERATURE
 
 
-# Timeout ladder: reasoning models slow down heavily on large batches.
-# Base request timeout is 200s; after a timeout it escalates to 300s, then
-# 500s. A failure at the top rung aborts the run with a clear explanation
-# and a recommendation to reduce the batch size.
-REQUEST_TIMEOUT_LADDER = [200.0, 300.0, 500.0]
+# Timeout ladder (ТЗ-health п.1): read timeout 90s base; a timeout escalates
+# to 120s, then 150s. The ceiling stays ≤90s ONLY for the base rung by spec;
+# the ladder exists because reasoning models slow down on large batches —
+# the top rung must stay tight (≤150s) so a hanging request can never
+# silence the log for 5 minutes. Connect timeout is a flat 10s everywhere.
+REQUEST_TIMEOUT_LADDER = [90.0, 120.0, 150.0]
+HTTP_CONNECT_TIMEOUT = 10.0
 _timeout_ladder_level = 0
 
 
@@ -205,18 +207,188 @@ def reset_request_timeout() -> None:
     _timeout_ladder_level = 0
 
 
-def get_shared_httpx_client(timeout: float = 200.0) -> httpx.AsyncClient:
+# --- Request health (ТЗ-health): timing, timeouts, key benching, stats ------
+# One module-level registry tracks EVERY outbound LLM request of the run
+# (main translation, QA scans, retries). Per key it counts requests,
+# durations, timeouts and hard failures; two consecutive timeouts/failures
+# on the same key bench it for the rest of the run (ТЗ-health п.2). All
+# counters reset at the start of a run; the summary is emitted by the
+# caller at the end of the phase/run.
+_HEALTH_RESET_LOCK = asyncio.Lock()
+
+
+def health_reset() -> None:
+    """New run: clear all per-key stats, bench state and the wall clock."""
+    _KEY_HEALTH.clear()
+    _RUN_WALL_START.clear()
+
+
+def health_mark_start() -> None:
+    """Idempotent: remember when this run started (wall time for the summary)."""
+    _RUN_WALL_START.setdefault("t0", time.time())
+
+
+def _key_suffix(key: str) -> str:
+    key = str(key or "")
+    return key[-4:] if len(key) > 4 else key
+
+
+def health_note_request(key: str, duration: float, timed_out: bool = False,
+                        failed: bool = False) -> None:
+    """Record one finished request on a key.
+
+    ТЗ-health п.2: TWO consecutive timeouts OR hard failures (5xx / 402 /
+    403-level errors) on the same key bench it for the rest of the run.
+    A success resets the consecutive counter.
+    """
+    entry = _KEY_HEALTH.setdefault(key, {
+        "requests": 0, "total": 0.0, "max": 0.0,
+        "timeouts": 0, "fails": 0, "benched": False,
+        "consec": 0,
+    })
+    entry["requests"] += 1
+    entry["total"] += max(0.0, duration)
+    entry["max"] = max(entry["max"], max(0.0, duration))
+    if timed_out:
+        entry["timeouts"] += 1
+        entry["consec"] += 1
+    elif failed:
+        entry["fails"] += 1
+        entry["consec"] += 1
+    else:
+        entry["consec"] = 0
+    if not entry["benched"] and entry["consec"] >= 2:
+        entry["benched"] = True
+
+
+def health_is_benched(key: str) -> bool:
+    entry = _KEY_HEALTH.get(key)
+    return bool(entry and entry["benched"])
+
+
+def health_bench_now(key: str, reason: str = "consecutive failures") -> None:
+    """Manually bench a key (e.g. dead-key eviction) and remember the reason."""
+    entry = _KEY_HEALTH.setdefault(key, {
+        "requests": 0, "total": 0.0, "max": 0.0,
+        "timeouts": 0, "fails": 0, "benched": False,
+        "consec": 0,
+    })
+    if not entry["benched"]:
+        entry["benched"] = True
+        entry["bench_reason"] = reason
+
+
+def health_summary_lines() -> List[str]:
+    """ТЗ-health п.4: [POOL] per-key stats + the total line."""
+    lines: List[str] = []
+    total_requests = 0
+    total_timeouts = 0
+    benched = 0
+    for key, e in _KEY_HEALTH.items():
+        total_requests += e["requests"]
+        total_timeouts += e["timeouts"]
+        benched += 1 if e["benched"] else 0
+        avg = (e["total"] / e["requests"]) if e["requests"] else 0.0
+        parts = [f"[POOL] key ...{_key_suffix(key)}: {e['requests']} request(s)"]
+        if e["requests"]:
+            parts.append(f"avg {avg:.1f}s")
+            parts.append(f"max {e['max']:.1f}s")
+        else:
+            parts.append("no requests")
+        parts.append(f"{e['timeouts']} timeout(s)")
+        if e["benched"]:
+            parts.append("benched")
+        lines.append(", ".join(parts))
+    wall = time.time() - _RUN_WALL_START.get("t0", time.time())
+    lines.append(f"[POOL] total: {total_requests} request(s), {wall / 60.0:.1f} min wall, "
+                 f"{total_timeouts} timeout(s), {benched} key(s) benched")
+    return lines
+
+
+def health_totals() -> dict:
+    """Aggregate for the dataset meta line (ТЗ-health п.4)."""
+    total_requests = sum(e["requests"] for e in _KEY_HEALTH.values())
+    total_timeouts = sum(e["timeouts"] for e in _KEY_HEALTH.values())
+    benched = sum(1 for e in _KEY_HEALTH.values() if e["benched"])
+    wall = time.time() - _RUN_WALL_START.get("t0", time.time())
+    return {
+        "requests": total_requests,
+        "timeouts": total_timeouts,
+        "benched_keys": benched,
+        "wall_s": round(wall, 1),
+    }
+
+
+_KEY_HEALTH: Dict[str, dict] = {}
+_RUN_WALL_START: Dict[str, float] = {}
+
+
+def _health_log(logger, message: str) -> None:
+    """[TIMING]/[TIMEOUT]/[POOL] lines go to BOTH the GUI logger and app.log."""
+    if logger:
+        try:
+            logger(message)
+        except Exception:
+            pass
+    logging.getLogger("snbt_localizer.core").info(message)
+
+
+def _health_fmt_s(duration: float) -> str:
+    return f"{duration:.1f}s" if duration >= 10.0 else f"{duration:.2f}s"
+
+
+def health_track_call(key: str, phase_label: str, batch_label: str,
+                      coro_factory, logger, timeout_s: Optional[float] = None):
+    """Wrap ONE outbound LLM call with [TIMING]/[TIMEOUT] logging (ТЗ-health п.1/п.3).
+
+    coro_factory is a zero-arg callable returning the awaitable. On timeout
+    the [TIMEOUT] line names the phase, batch, key suffix and the ceiling;
+    the health registry records the outcome for the bench decision and the
+    end-of-run summary. Returns the coroutine's result; re-raises errors.
+    """
+    async def _wrapped():
+        t0 = time.time()
+        try:
+            result = await coro_factory()
+            dt = time.time() - t0
+            health_note_request(key, dt)
+            _health_log(logger, f"[TIMING] {phase_label} batch {batch_label} "
+                         f"(key ...{_key_suffix(key)}) {_health_fmt_s(dt)}")
+            return result
+        except httpx.TimeoutException:
+            dt = time.time() - t0
+            ceiling = timeout_s if timeout_s is not None else get_request_timeout()
+            health_note_request(key, dt, timed_out=True)
+            _health_log(logger, f"[TIMEOUT] {phase_label} batch {batch_label} "
+                         f"on key ...{_key_suffix(key)} after {ceiling:.0f}s")
+            if health_is_benched(key):
+                _health_log(logger, f"[POOL] key ...{_key_suffix(key)} benched "
+                             "(2 consecutive timeouts)")
+            raise
+        except httpx.HTTPStatusError:
+            dt = time.time() - t0
+            health_note_request(key, dt, failed=True)
+            _health_log(logger, f"[TIMING] {phase_label} batch {batch_label} "
+                         f"(key ...{_key_suffix(key)}) {_health_fmt_s(dt)} — failed")
+            if health_is_benched(key):
+                _health_log(logger, f"[POOL] key ...{_key_suffix(key)} benched "
+                             "(2 consecutive failures)")
+            raise
+    return _wrapped()
+
+
+def get_shared_httpx_client(timeout: float = 90.0) -> httpx.AsyncClient:
     global _shared_httpx_client_no_loop
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
     # Recreate the cached client whenever the requested timeout differs:
-    # the timeout ladder escalates 200s -> 300s -> 500s mid-run and the
-    # cached client must follow it.
+    # the timeout ladder escalates mid-run and the cached client must
+    # follow it. Connect timeout is a flat 10s (ТЗ-health п.1).
     def _fresh() -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            timeout=timeout,
+            timeout=httpx.Timeout(timeout, connect=HTTP_CONNECT_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0)
         )
     if loop is None:
@@ -923,6 +1095,61 @@ def has_cyrillic(text: str) -> bool:
     return bool(re.search('[а-яА-Я]', text))
 
 
+def extract_qa_ids_array(content: str) -> List[Optional[int]]:
+    """Speed-pack п.3 phase-1 parser: bare JSON array of problem ids.
+
+    Tolerates think-blocks/fences and [{"id": N}] objects the same way
+    the other QA parsers do. Non-numeric entries become None (filtered
+    by the caller). Returns [] when nothing parseable is found.
+    """
+    text = (content or "").strip()
+    text = re.sub(r'<'+'think' r'>[\s\S]*?'+'</think'+r'>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```$', '', text).strip()
+    out: List[Optional[int]] = []
+    parsed = None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        first = text.find('[')
+        last = text.rfind(']')
+        if first != -1 and last > first:
+            try:
+                parsed = json.loads(text[first:last+1])
+            except Exception:
+                parsed = None
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict):
+                out.append(_int_or_none(item.get("id")))
+            else:
+                out.append(_int_or_none(item))
+        return out
+    if isinstance(parsed, dict):
+        # {"ids": [...]} / {"problems": [ids]} wrappers
+        for v in parsed.values():
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        out.append(_int_or_none(item.get("id")))
+                    else:
+                        out.append(_int_or_none(item))
+                return out
+    return out
+
+
+def _int_or_none(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value == int(value):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
 def extract_qa_problems_array(content: str):
     """QA-auditor answer parser: tolerate polluted output.
 
@@ -1462,6 +1689,76 @@ class TranslationCache:
     def close(self):
         self.conn.close()
 
+class QAVerdictCache:
+    """Speed-pack п.4: verdict-level QA cache (incremental audit).
+
+    Key = sha1(source + NUL + mt + NUL + qa_config_hash). A 'clean' verdict
+    from a previous run means the LLM phase-1 scan may SKIP the pair (the
+    deterministic tiers still see every pair - they cost zero tokens).
+    Any change to the string, the translation, the model, the temperature,
+    the batch size or the prompt changes the hash, so the pair re-enters
+    the scan. Everything is best-effort: a broken/unavailable cache must
+    never break a run.
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        try:
+            if db_path is None:
+                db_path = str(Path.home() / ".snbt-tr" / "qa_cache.sqlite")
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA busy_timeout=3000")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS verdicts "
+                "(hash TEXT PRIMARY KEY, verdict TEXT NOT NULL, updated_at INTEGER)")
+            self.conn.commit()
+            self.ok = True
+        except Exception as e:
+            logging.getLogger("snbt_localizer.core").warning(
+                f"[QA] verdict cache disabled: {repr(e)[:120]} — the run is unaffected")
+            self.ok = False
+            self.conn = None
+
+    @staticmethod
+    def key(source: str, mt: str, config_hash: str) -> str:
+        raw = f"{source}\x00{mt}\x00{config_hash}".encode("utf-8", "replace")
+        return hashlib.sha1(raw).hexdigest()
+
+    @staticmethod
+    def config_hash(model_text: str, temperature, batch_size: int, prompt: str) -> str:
+        raw = (f"{model_text}|{temperature}|{batch_size}|{hashlib.sha1(prompt.encode('utf-8', 'replace')).hexdigest()}")
+        return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
+
+    def get_clean(self, key: str) -> bool:
+        if not self.ok:
+            return False
+        try:
+            row = self.conn.execute("SELECT verdict FROM verdicts WHERE hash=?", (key,)).fetchone()
+            return bool(row and row[0] == "clean")
+        except Exception:
+            return False
+
+    def mark(self, key: str, verdict: str) -> None:
+        if not self.ok:
+            return
+        try:
+            self.conn.execute(
+                "INSERT INTO verdicts (hash, verdict, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(hash) DO UPDATE SET verdict=excluded.verdict, updated_at=excluded.updated_at",
+                (key, verdict, int(time.time())))
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self.ok and self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+
+
 class GoogleFreeTranslator:
     async def translate(self, texts: List[str], target_lang_code: str = "ru_ru") -> List[str]:
         try:
@@ -1696,7 +1993,10 @@ class UnifiedTranslator:
         self.target_lang_name = target_lang_name
         self.target_lang_code = target_lang_code
         self.free_google = GoogleFreeTranslator()
-        self.timeout = 300.0 if "Ollama" in provider else 200.0
+        # ТЗ-health п.1: per-request ceiling 90s for every provider (the
+        # attribute is informational; the real timeout flows through the
+        # shared client / ladder).
+        self.timeout = 90.0
         self.key_index = 0
         self.key_cooldown_until = {}
         self.key_backoff = {}
@@ -1760,6 +2060,7 @@ class UnifiedTranslator:
             "Never translate, remove, add, or reorder __FMT_N__ placeholders. "
             "Translate the ENTIRE string, including articles and small words right before or after __FMT_N__ placeholders (e.g. 'The __FMT_0__Importer__FMT_1__ ...' must NOT start with the English article 'The' when the target language has no articles). "
             "Each source term appears exactly ONCE in the output: never write the translated term of a marked span again in the surrounding text (e.g. 'A huge 9x9 __FMT_0__Crafting Table__FMT_1__' becomes 'Огромный 9x9 __FMT_0__Верстак__FMT_1__', not 'Огромный Верстак 9x9 __FMT_0__Верстак__FMT_1__'). "
+            "Glossary pins translate ONLY their matching source terms — never insert a pinned term into other positions. "
             "Keep the word spacing of untranslated Latin names exactly as in the source: if the source says 'Toms Storage' as two words, write 'Toms Storage', never merge it into one word."
         )
         if mod_context:
@@ -1834,14 +2135,12 @@ class UnifiedTranslator:
                 modpack_suffix = build_glossary_context(
                     shielded_texts, modpack_gloss, limit=40, label="Modpack terminology"
                 )
-            saved_prompt = self.prompt
+            # Prompt override instead of self.prompt mutation: parallel
+            # translations (speed-pack п.2) would race on a shared attribute.
             combined_suffix = (glossary_suffix or "") + (modpack_suffix or "")
-            if combined_suffix:
-                self.prompt = self.prompt + combined_suffix
-            try:
-                res = await self._translate_with_binary_split(shielded_texts, logger, check_status, context)
-            finally:
-                self.prompt = saved_prompt
+            effective_prompt = self.prompt + combined_suffix if combined_suffix else None
+            res = await self._translate_with_binary_split(
+                shielded_texts, logger, check_status, context, prompt_override=effective_prompt)
 
         restored_res = []
         fmt_lost_count = 0
@@ -1867,20 +2166,20 @@ class UnifiedTranslator:
             logger(f"[FmtShield] {fmt_lost_count} string(s) returned with lost formatting markers — kept the original text for those (codes must survive translation; re-run Complement to retry).")
         return restored_res
 
-    async def _translate_with_binary_split(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
+    async def _translate_with_binary_split(self, texts: List[str], logger=print, check_status=None, context: str = "", prompt_override: Optional[str] = None) -> List[str]:
         indexed_batch = list(enumerate(texts))
-        results = await self._translate_indexed(indexed_batch, logger, check_status, context, depth=0)
+        results = await self._translate_indexed(indexed_batch, logger, check_status, context, depth=0, prompt_override=prompt_override)
         sorted_results = sorted(results.items(), key=lambda x: x[0])
         return [trans for _, trans in sorted_results]
 
-    async def _translate_indexed(self, batch: list, logger=print, check_status=None, context: str = "", depth: int = 0) -> dict:
+    async def _translate_indexed(self, batch: list, logger=print, check_status=None, context: str = "", depth: int = 0, prompt_override: Optional[str] = None) -> dict:
         if not batch:
             return {}
 
         try:
             async with self.request_semaphore:
                 batch_texts = [text for _, text in batch]
-                translations = await self._do_raw_translation(batch_texts, logger, check_status, context)
+                translations = await self._do_raw_translation(batch_texts, logger, check_status, context, prompt_override=prompt_override)
 
             if len(translations) != len(batch_texts):
                 raise ValueError("Array length mismatch")
@@ -1907,8 +2206,8 @@ class UnifiedTranslator:
             left_batch = batch[:mid]
             right_batch = batch[mid:]
 
-            left_task = self._translate_indexed(left_batch, logger, check_status, context, depth + 1)
-            right_task = self._translate_indexed(right_batch, logger, check_status, context, depth + 1)
+            left_task = self._translate_indexed(left_batch, logger, check_status, context, depth + 1, prompt_override=prompt_override)
+            right_task = self._translate_indexed(right_batch, logger, check_status, context, depth + 1, prompt_override=prompt_override)
             left_results, right_results = await asyncio.gather(left_task, right_task)
             return {**left_results, **right_results}
 
@@ -1974,7 +2273,7 @@ class UnifiedTranslator:
             logger(f"[Salvage] Depth {depth}: recovered {len(result) - missing}/{n} items, {missing} left untranslated (picked up by a later complement run).")
         return result
 
-    async def _do_raw_translation(self, texts: List[str], logger=print, check_status=None, context: str = "") -> List[str]:
+    async def _do_raw_translation(self, texts: List[str], logger=print, check_status=None, context: str = "", prompt_override: Optional[str] = None) -> List[str]:
         if not self.mixed_pool:
             raise AbortException("No providers configured in mixed pool")
 
@@ -1995,15 +2294,26 @@ class UnifiedTranslator:
             while tried < max(len(self.mixed_pool), 1):
                 if check_status:
                     await check_status()
-                pool = list(self.mixed_pool)
+                # ТЗ-health п.2: benched keys (2 consecutive timeouts/failures)
+                # are excluded from rotation for the rest of the run.
+                pool = [e for e in self.mixed_pool
+                        if not health_is_benched(e["api_key"])]
                 if not pool:
-                    raise AbortException("All API keys failed with 401/403.")
+                    raise AbortException(
+                        "All API keys are benched (2+ consecutive timeouts/failures each). "
+                        "Try different keys or check the provider status."
+                    )
                 idx = self.key_index % len(pool)
                 self.key_index += 1
                 entry = pool[idx]
                 now = time.time()
 
                 if entry["api_key"] in self.key_cooldown_until and now < self.key_cooldown_until[entry["api_key"]]:
+                    tried += 1
+                    continue
+
+                # ТЗ-health п.2: benched keys never re-enter rotation.
+                if health_is_benched(entry["api_key"]):
                     tried += 1
                     continue
 
@@ -2027,7 +2337,20 @@ class UnifiedTranslator:
                     tried += 1
                     continue
                 try:
-                    res = await provider_instance.send_request(texts, entry["api_key"], entry["model"], logger, check_status, context, self.prompt)
+                    # ТЗ-health п.3: [TIMING]/[TIMEOUT] for every main
+                    # translation request, with the chunk label as context.
+                    self._health_chunk_counter = getattr(self, "_health_chunk_counter", 0)
+                    res = await health_track_call(
+                        entry["api_key"],
+                        "translation",
+                        f"{self._health_chunk_counter + 1}",
+                        lambda e=entry, p=provider_instance, pr=prompt_override: p.send_request(
+                            texts, e["api_key"], e["model"], logger, check_status, context,
+                            pr if pr is not None else self.prompt),
+                        logger,
+                        timeout_s=get_request_timeout(),
+                    )
+                    self._health_chunk_counter += 1
                     self.key_backoff[entry["api_key"]] = 0
                     break
                 except PartialResponseError:
@@ -2083,6 +2406,11 @@ class UnifiedTranslator:
                             self.key_index = 0
                             if not self.mixed_pool:
                                 raise AbortException("All API keys failed with 401/403.")
+                        # ТЗ-health п.2: a 401/403 eviction is a hard failure —
+                        # bench the key in the health registry too so the
+                        # end-of-run summary reports it as benched.
+                        health_bench_now(str(entry["api_key"]), "401/403")
+                        _health_log(logger, f"[POOL] key ...{key_suffix} benched (401/403)")
                         continue
                     elif status == 429:
                         current_backoff = self.key_backoff.get(entry["api_key"], 0)
@@ -2366,23 +2694,30 @@ class SNBTManager:
 
         try:
             chunk_size = 5 if "Ollama" in self.provider else self.batch_size
-            total_chunks = (len(to_trans) + chunk_size - 1) // chunk_size if to_trans else 0
-            for i in range(0, len(to_trans), chunk_size):
-                if progress_callback:
-                    progress_callback(i // chunk_size, total_chunks, translated_ok, len(to_trans))
-                if check_status: await check_status()
-                chunk = to_trans[i:i+chunk_size]
+            chunks_list = [to_trans[i:i+chunk_size] for i in range(0, len(to_trans), chunk_size)]
+            total_chunks = len(chunks_list)
+            # Speed-pack п.2: chunks run CONCURRENTLY through per-key workers
+            # (the same pool the QA phase uses). One key = 1 worker = the old
+            # sequential timing; extra keys scale near-linearly. Results are
+            # applied in the ORIGINAL chunk order, so the file output is
+            # identical regardless of completion order.
+            n_workers = min(len(chunks_list), max(1, len(getattr(self.translator, 'mixed_pool', []) or [None])))
+            chunk_results: List[Optional[Dict[str, str]]] = [None] * len(chunks_list)
+            chunk_queue: "asyncio.Queue[int]" = asyncio.Queue()
+            for bi in range(len(chunks_list)):
+                chunk_queue.put_nowait(bi)
+            pool_for_workers = list(getattr(self.translator, 'mixed_pool', []) or [None])
+            requeued: set = set()
 
+            async def _translate_chunk(ci: int) -> Dict[str, str]:
+                chunk = chunks_list[ci]
                 chunk_to_send = [t for t in chunk if t not in mapping]
                 if not chunk_to_send:
-                    translated_ok += len(chunk)
-                    continue
-
-                if progress_callback:
-                    progress_callback(i // chunk_size, total_chunks, translated_ok, len(to_trans))
+                    return {}
+                if check_status: await check_status()
+                new_map: Dict[str, str] = {}
                 try:
                     res = await self.translator.translate(chunk_to_send, logger, check_status, context=filepath.name)
-                    new_map = {}
                     for orig, trans in zip(chunk_to_send, res):
                         new_map[orig] = apply_dictionary(sanitize_with_original(orig, trans), self.dictionary)
                 except (AbortException, ValueError):
@@ -2400,14 +2735,69 @@ class SNBTManager:
                             raise
                         except Exception:
                             new_map[item] = item
-                            
+                return new_map
+
+            async def _translation_worker() -> None:
+                while True:
+                    try:
+                        ci = chunk_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        chunk_results[ci] = await _translate_chunk(ci)
+                    except AbortException:
+                        chunk_queue.put_nowait(ci)
+                        raise
+                    except Exception as e:
+                        # Transient chunk failure: requeue once, then warn.
+                        if ci not in requeued:
+                            requeued.add(ci)
+                            chunk_queue.put_nowait(ci)
+                        else:
+                            logger(f"Chunk {ci+1} failed twice ({repr(e)[:120]}) — leaving its strings untranslated")
+                            logging.getLogger("snbt_localizer.core").warning(f"Chunk {ci+1} failed twice ({repr(e)[:120]}) — leaving its strings untranslated")
+
+            async def _drain_chunks() -> None:
+                # Fallback: a worker died; finish the remaining chunks with all keys.
+                while True:
+                    try:
+                        ci = chunk_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        chunk_results[ci] = await _translate_chunk(ci)
+                    except AbortException:
+                        raise
+                    except Exception as e:
+                        logger(f"Chunk {ci+1} failed in the fallback drain ({repr(e)[:120]}) — leaving its strings untranslated")
+                        logging.getLogger("snbt_localizer.core").warning(f"Chunk {ci+1} failed in the fallback drain ({repr(e)[:120]}) — leaving its strings untranslated")
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for w in range(n_workers):
+                        tg.create_task(_translation_worker())
+            except BaseExceptionGroup as eg:
+                # TaskGroup wraps child exceptions; AbortException must surface.
+                for exc in eg.exceptions:
+                    if isinstance(exc, AbortException):
+                        raise exc
+                raise
+
+            # Fallback drain: any chunks left when a worker aborted (402/403
+            # exhausted that worker's key but other keys may still be live).
+            await _drain_chunks()
+
+            # Apply + log in the ORIGINAL order (byte-identical output).
+            for ci, new_map in enumerate(chunk_results):
+                if progress_callback:
+                    progress_callback(ci, total_chunks, translated_ok, len(to_trans))
+                if new_map is None:
+                    continue
                 mapping.update(new_map)
                 self.cache.save_batch({o: t for o, t in new_map.items() if o != t}, modpack=self.modpack)
                 translated_ok += sum(1 for orig, trans in new_map.items() if orig != trans)
-
                 if progress_callback:
-                    progress_callback((i + chunk_size) // chunk_size, total_chunks, translated_ok, len(to_trans))
-
+                    progress_callback((ci + 1), total_chunks, translated_ok, len(to_trans))
                 for orig, trans in new_map.items():
                     if orig != trans:
                         provider_name = self.translator.provider
@@ -2415,19 +2805,7 @@ class SNBTManager:
                         if self.translator.mixed_pool:
                             provider_name = "Mixed"
                             model_name = "Multiple"
-                        orig_str = str(orig)
-                        trans_str = str(trans)
-                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig_str}\" -> \"{trans_str}\"")
-                
-                if "Ollama" not in self.provider and "Google Translate" not in self.provider:
-                    next_chunk = to_trans[i+chunk_size:i+chunk_size*2]
-                    next_to_send = [t for t in next_chunk if t not in mapping]
-                    if next_to_send:
-                        # With several keys in the pool round-robin rotation spreads
-                        # the load; the fixed throttle is only needed for small pools
-                        pool_len = max(1, len(getattr(self.translator, 'mixed_pool', []) or []))
-                        if pool_len < 4:
-                            await countdown_sleep(1, "Delay between chunks", logger, check_status)
+                        logger(f"Translated [{provider_name} / {model_name}]: \"{orig}\" -> \"{trans}\"")
         except AbortException as e:
             reason = f" ({e})" if str(e) else ""
             logger(f"Aborted processing of {filepath.name}{reason}.")
@@ -2583,6 +2961,10 @@ class JSONManager:
 
     async def process(self, log_callback=print, check_status=None) -> int:
         reset_request_timeout()
+        # ТЗ-health: one JSON run = one health window; the summary is
+        # emitted right before the shared clients close.
+        health_reset()
+        health_mark_start()
         log_callback(f"Strategy: {self.policy.upper()}"
                      f"{' — cache BYPASSED (all strings re-translated)' if self.policy == 'overwrite' else ''}")
         lang_dirs = self._find_lang_dirs()
@@ -2846,6 +3228,14 @@ class JSONManager:
                         raise
 
         finally:
+            # ТЗ-health п.4: per-key [POOL] stats into the GUI console and
+            # app.log at the end of the run, before the shared clients close.
+            try:
+                for line in health_summary_lines():
+                    log_callback(line)
+                    logging.getLogger("snbt_localizer.core").info(line)
+            except Exception:
+                pass
             await close_shared_httpx_clients()
 
         if self.progress_callback:
@@ -3059,6 +3449,272 @@ def build_glossary_context(texts: List[str], glossary: Dict[str, str], limit: in
     )
 
 
+def _qa_ru_inflect_pattern(word: str) -> str:
+    """Inflection-tolerant regex for ONE Russian word of a glossary pin.
+
+    ТЗ2.2-4: Russian terms are rarely stored in the exact form the
+    translation uses ('Лунный камень' vs 'Лунного камня'). The pattern
+    matches any inflected form sharing the root:
+
+    - dictionary endings are stripped first: adjectives -ый/-ий/-ой/
+      -ая/-ое/-ые/-ие (Лунный -> лунн) and vowel/soft endings of nouns
+      (колба -> колб, камень -> камен, слиток -> слиток);
+    - a fleeting vowel (беглая гласная: е/о) may drop when declined:
+      камень -> камня, свинец -> свинца, слиток -> слитка;
+    - up to 3 trailing Cyrillic case letters may follow the stem:
+      Верстаками, Лунного, Свинцового.
+
+    'ё' is normalized to 'е' on both sides (IGNORECASE does not map ё).
+    """
+    w = word.lower().replace('ё', 'е')
+    if len(w) >= 4 and w[-2:] in ("ый", "ий", "ой", "ая", "ое", "ые", "ие"):
+        stem = w[:-2]
+    elif len(w) >= 3 and w[-1:] in ("а", "я", "о", "е", "у", "ю", "ь", "й"):
+        stem = w[:-1]
+    else:
+        stem = w
+    pat = re.escape(stem)
+    if len(stem) >= 3 and stem[-2] in "ео" and stem[-1] not in "ео":
+        # soft-stem nouns drop the fleeting vowel when declined
+        head, tail = stem[:-2], stem[-1]
+        pat = re.escape(head) + "[ео]?" + re.escape(tail)
+    return pat + "(?:[а-я]{0,3})?"
+
+
+# ТЗ3.1-1: models emit nested verdict arrays under different key names
+# (problems / issues / findings / flags / errors — production dumps show
+# all of them across runs). The unwrapper must accept ALL of them once,
+# killing the per-schema whack-a-mole.
+_QA_NESTED_KEYS = ("problems", "issues", "findings", "flags", "errors")
+
+# canonical field <- accepted synonyms (production dumps 2026-09-30: the
+# same model answered main/arb/repair passes with type|kind, message|
+# details|explanation|description, suggestion|fix|advice...)
+_QA_CATEGORY_KEYS = ("category", "type", "kind", "problem_class")
+_QA_ISSUE_KEYS = ("issue", "problem", "detail", "note", "description",
+                  "message", "details", "explanation")
+_QA_SUGGESTED_KEYS = ("suggested", "suggestion", "fix", "corrected",
+                      "corrected_translation", "advice")
+
+
+def _qa_flatten_raw_verdicts(raw: List[dict]) -> List[dict]:
+    """ТЗ3-3/ТЗ3.1-1: unwrap ANY nested {id, problems/issues/...:[...]} schema.
+
+    Models answer the same prompt with different envelope names across runs
+    (problems / issues / findings / flags / errors). The extractor must
+    NEVER silently drop any of them: each nested problem inherits the parent
+    id (unless it carries its own) and enters the pipeline as a first-class
+    verdict candidate. Flat objects pass through unchanged.
+    """
+    out: List[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        nested = None
+        for key in _QA_NESTED_KEYS:
+            value = item.get(key)
+            if isinstance(value, list) and value:
+                nested = value
+                break
+        if nested is not None:
+            for sub in nested:
+                if not isinstance(sub, dict):
+                    continue
+                merged = {**sub}
+                if merged.get("id") is None and item.get("id") is not None:
+                    merged["id"] = item["id"]
+                out.append(merged)
+        else:
+            out.append(item)
+    return out
+
+
+def _qa_canonical_keys(item: dict) -> dict:
+    """ТЗ3.1-1: map the model's floating field synonyms to canonical ones.
+
+    Production dumps show the same model answering with type/kind/problem_
+    class for the category, message/details/explanation/description for the
+    issue, suggestion/fix/advice for the suggested fix. Canonical keys win;
+    synonyms fill the gaps; unknown string keys are NOT dropped — they are
+    appended to the issue text so the finding is never lost.
+    """
+    out = dict(item)
+
+    def pick(keys, current):
+        if current:
+            return current
+        for k in keys:
+            v = item.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return None
+
+    if not (isinstance(out.get("category"), str) and out.get("category").strip()):
+        out["category"] = pick(_QA_CATEGORY_KEYS, out.get("category"))
+    if not (isinstance(out.get("issue"), str) and out.get("issue").strip()):
+        out["issue"] = pick(_QA_ISSUE_KEYS, out.get("issue"))
+    if not (isinstance(out.get("suggested"), str) and out.get("suggested").strip()):
+        out["suggested"] = pick(_QA_SUGGESTED_KEYS, out.get("suggested"))
+
+    # structured arbitration fields (ТЗ2.2): {term, pinned, used} -> the
+    # glossary candidate is built directly from them; issue carries context
+    term = out.get("term")
+    pinned = out.get("pinned")
+    used = out.get("used")
+    if (isinstance(term, str) and term.strip()
+            and isinstance(pinned, str) and pinned.strip()):
+        if not isinstance(out.get("glossary_fix"), dict):
+            out["glossary_fix"] = {"en": term.strip(), "ru": pinned.strip()}
+        if not (isinstance(out.get("issue"), str) and out["issue"].strip()):
+            used_txt = f", used as \"{used}\"" if isinstance(used, str) and used.strip() else ""
+            out["issue"] = f"term \"{term.strip()}\" should be pinned as \"{pinned.strip()}\"{used_txt}"
+
+    # unknown string keys survive as extra context in the issue text
+    known = {"id", "severity", "category", "issue", "suggested", "glossary_fix",
+             "term", "pinned", "used", "source", "translation", "note",
+             "missed_pins", "_batch_index"}
+    known |= set(_QA_CATEGORY_KEYS) | set(_QA_ISSUE_KEYS) | set(_QA_SUGGESTED_KEYS)
+    extras = []
+    for k, v in out.items():
+        if k in known or k.startswith("_"):
+            continue
+        if isinstance(v, str) and v.strip():
+            extras.append(f"{k}=\"{v.strip()[:120]}\"")
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            extras.append(f"{k}={v}")
+    if extras:
+        base = out.get("issue") if isinstance(out.get("issue"), str) else ""
+        extra_txt = " ".join(extras)
+        out["issue"] = f"{base} [{extra_txt}]" if base else extra_txt
+    return out
+
+
+def _qa_repair_prompt(candidates: List[dict], lang_name: str) -> str:
+    """Tier C repair prompt (ТЗ3-3): re-issue crippled verdicts, full schema.
+
+    The machine prepared candidates: pair, source, translation and a note
+    (the raw issue text / missed pins) — everything the model needs to just
+    FILL IN category + suggested. What the model is too lazy to produce from
+    scratch it does reliably from a ready-made question.
+    """
+    payload = json.dumps(candidates, ensure_ascii=False)
+    return (
+        "Verdict repair. An earlier audit pass produced INCOMPLETE findings for"
+        f" the {lang_name} strings below: the finding was reported but the"
+        " required schema fields (category and/or suggested) were missing.\n"
+        "Re-issue EVERY finding below as a COMPLETE verdict object. For each"
+        " candidate DECIDE what the real problem is, then answer with a JSON"
+        " array of objects: {\"id\": <integer, the candidate's id>,"
+        " \"category\": <one of: UNTRANSLATED, SOURCE_GARBAGE, MEANING_FLIP,"
+        " GRAMMAR, WRONG_DOMAIN, CODES_MISMATCH, NUMBERS_MISMATCH, TRUNCATED,"
+        " GLUE_ARTIFACT, CALQUE, INVENTED_WORD, TERM_INCONSISTENT,"
+        " GLOSSARY_VIOLATION, GLOSSARY_AWKWARD, VANILLA_TERM, PROPER_NOUN,"
+        " STYLE>, \"severity\": \"hard\" or \"soft\", \"issue\": <one-line"
+        " explanation>, \"suggested\": <full corrected string, or null only"
+        " if a fix is genuinely impossible>, and optionally"
+        " \"glossary_fix\": {\"en\": ..., \"ru\": ...}}.\n"
+        "The suggested string MUST keep the source's exact formatting codes"
+        " (&l, &r, &#RRGGBB), tags (#id:paths) and numbers. Mod names, tags"
+        " and @-references stay in English by design — never report them as"
+        " UNTRANSLATED.\n"
+        "If a candidate is actually fine, answer [] for it (omit its id).\n"
+        "Output ONLY the JSON array.\n\n"
+        f"Candidates (id, source, translation, note):\n{payload}\n"
+    )
+
+
+def _qa_retry_prompt() -> str:
+    """Speed-pack п.1: batch constraint-retry prompt (instruction part).
+
+    One call retranslates MANY flagged strings at once; _qa_retry_send
+    appends the candidates payload. Output contract: ONE JSON object
+    mapping each candidate id to the full corrected string (numbers are
+    cheap to emit — nothing for the model to drift on).
+    """
+    return (
+        "Batch retranslation. Each object in the attached array is a"
+        " translation pair with a CRITICAL FIX DIRECTIVE (the auditor's"
+        " finding). Apply the directive and return the corrected full"
+        " string for EVERY id.\n"
+        "Keep every formatting code (&l, &r, &#RRGGBB), tag (#id:paths),"
+        " @-reference and number EXACTLY as in the source. Mod names, tags"
+        " and @-handles stay in English.\n"
+        "Output ONLY a JSON object: {\"<id>\": \"<full corrected string>\","
+        " ...} — one key per candidate id, no extra text.\n"
+    )
+
+
+def extract_qa_fix_map(content: str) -> Dict[int, str]:
+    """Parse the batch-retry answer: {"<id>": "fixed string"} map.
+
+    Tolerates think-blocks/fences the same way the other QA parsers do;
+    ids may come back as JSON numbers or strings — both are coerced.
+    Returns {} when nothing parseable is found (callers fall back to the
+    single-string retry path).
+    """
+    text = (content or "").strip()
+    text = re.sub(r'<'+'think' r'>[\s\S]*?'+'</think'+r'>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```$', '', text).strip()
+
+    def _from_dict(obj) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        if not isinstance(obj, dict):
+            return out
+        for k, v in obj.items():
+            pid = _qa_coerce_pid(k)
+            if pid is not None and isinstance(v, str) and v.strip():
+                out[pid] = v
+        return out
+
+    def _try_dict(s: str) -> Dict[int, str]:
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            # JS-style unquoted numeric keys ({"2": .., 3: ..}) are invalid
+            # JSON yet a common model slip — quote them and retry once.
+            try:
+                parsed = json.loads(re.sub(r'([{,]\s*)(-?\d+)\s*:', r'\1"\2":', s))
+            except Exception:
+                return {}
+        return _from_dict(parsed)
+
+    # direct object parse
+    out = _try_dict(text)
+    if out:
+        return out
+    # object nested in prose: first balanced {...} slice
+    first = text.find('{')
+    last = text.rfind('}')
+    if first != -1 and last > first:
+        out = _try_dict(text[first:last+1])
+        if out:
+            return out
+    # some models still answer with an array of {"id":..,"fixed"/"suggested":..}
+    arr = extract_json_array(text)
+    out: Dict[int, str] = {}
+    if isinstance(arr, list):
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            pid = _qa_coerce_pid(item.get("id"))
+            val = item.get("fixed") or item.get("fixed_string") or item.get("suggested") \
+                or item.get("translation") or item.get("result")
+            if pid is not None and isinstance(val, str) and val.strip():
+                out[pid] = val
+    return out
+
+
+# Нит 1 (m11236): regex cache for the glossary pre-check — the lenient EN
+# pattern and the inflection-tolerant RU pattern are compiled ONCE per
+# (term_en, term_ru) pair instead of once per source pair; a 278-pair
+# batch re-compiled ~5600 patterns (one per glossary term per pair) and
+# burned tens of seconds in re._compile.
+_QA_GLOSSARY_PATTERN_CACHE: Dict[Tuple[str, str], Tuple[object, object]] = {}
+
+
 def _qa_glossary_violations(batch: List[dict], vanilla_gloss: Dict[str, str],
                             modpack_terms: Dict[str, str]) -> List[dict]:
     """Deterministic glossary-compliance pre-check (zero tokens).
@@ -3096,19 +3752,23 @@ def _qa_glossary_violations(batch: List[dict], vanilla_gloss: Dict[str, str],
             for term_en, term_ru in gloss.items():
                 if len(term_en) < 3 or not term_ru:
                     continue
-                body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in term_en.split())
-                pat = r"(?<![A-Za-z])" + body + r"(?![A-Za-z])"
-                if not re.search(pat, src_clean, re.IGNORECASE):
+                cached = _QA_GLOSSARY_PATTERN_CACHE.get((term_en, term_ru))
+                if cached is None:
+                    body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in term_en.split())
+                    pat = re.compile(r"(?<![A-Za-z])" + body + r"(?![A-Za-z])", re.IGNORECASE)
+                    # the pin IS in the source: the pinned Russian must be
+                    # in the translation — EVERY word is inflection-tolerant
+                    # (ТЗ2.2-4: 'Лунный камень' must hit 'Лунного камня',
+                    # 'Свинец' must hit 'Свинцовому'; was last-word-only,
+                    # which flooded the arbitration with false positives)
+                    ru_body = r"\s+".join(_qa_ru_inflect_pattern(w) for w in term_ru.split())
+                    ru_pat = re.compile(r"(?<![А-Яа-яЁёA-Za-z])" + ru_body + r"(?![А-Яа-яЁёA-Za-z])", re.IGNORECASE)
+                    _QA_GLOSSARY_PATTERN_CACHE[(term_en, term_ru)] = (pat, ru_pat)
+                    cached = (pat, ru_pat)
+                pat, ru_pat = cached
+                if not pat.search(src_clean):
                     continue
-                # the pin IS in the source: the pinned Russian must be in the
-                # translation (last word is inflection-tolerant: Верстак /
-                # Верстаки / Верстаками — Russian plurals and cases)
-                ru_words = [re.escape(w) for w in term_ru.split()]
-                if ru_words:
-                    ru_words[-1] = ru_words[-1] + r"(?:[а-яё]{0,3})?"
-                ru_body = r"\s+".join(ru_words)
-                ru_pat = r"(?<![А-Яа-яЁёA-Za-z])" + ru_body + r"(?![А-Яа-яЁёA-Za-z])"
-                if not re.search(ru_pat, tr_clean, re.IGNORECASE):
+                if not ru_pat.search(tr_clean):
                     missed.append((term_en, term_ru))
         if missed:
             # longest English terms first, dedup
@@ -3156,12 +3816,21 @@ def _qa_glossary_compliance_prompt(flagged: List[dict], lang_name: str) -> str:
         " TERM_INCONSISTENT with severity \"soft\" and a \"suggested\" full"
         " replacement string that uses the pinned term;\n"
         "(b) the pin does not fit this context (homonym: e.g. metal 'Lead'"
-        " vs wire 'lead') -> report nothing for this pair.\n"
+        " vs wire 'lead') -> report nothing for this pair;\n"
+        "(c) the pinned translation itself is wrong or awkward for this"
+        " context (e.g. a bad homonym pin, an unnatural calque that keeps"
+        " appearing) -> report GLOSSARY_AWKWARD with severity \"soft\", a"
+        " \"glossary_fix\" object {\"en\": <the pinned English term>,"
+        " \"ru\": <the better translation>}, and a \"suggested\" full"
+        " replacement string for the affected pair using the better"
+        " translation. The glossary pin will be ADDED alongside the"
+        " existing one — it never overwrites.\n"
         "Never change formatting codes (&l, &#RRGGBB), tags (#id:paths) or"
         " numbers: the suggested string must keep the source's exact"
         " codes/numbers/tags multiset.\n"
         "Answer with the SAME JSON array format as before (objects with"
-        " integer id/category/severity/issue/suggested). An empty array []"
+        " integer id/category/severity/issue/suggested, and optionally"
+        " glossary_fix). An empty array []"
         " means every pin was fine as translated.\n\n"
         f"Pairs to arbitrate (id, source, translation, missed_pins):\n{pairs_json}\n"
     )
@@ -3374,24 +4043,21 @@ async def ensure_modpack_glossary(
     utility model (1-2 fast batches, seconds on /low). Errors never abort
     the main run — the glossary is best-effort by design.
 
-    force_refresh=True (Overwrite policy): re-ask the utility model for ALL
-    candidate terms and replace the stored translations with fresh ones.
+    ТЗ3-1: the pre-scan is ADDITIVE FOREVER. Existing pins are NEVER
+    re-asked (the historical force_refresh roulette — Cloche ->
+    Клеш/Клок/Клош/Колокол/Колпак on every Overwrite run — is dead: the
+    policy may re-translate quest strings, but the modpack's pinned
+    terminology is converged state). The parameter is kept for signature
+    compatibility with the GUI/CLI call sites and IGNORED.
     """
     glossary = ModpackGlossary(modpack_root)
     candidates = extract_glossary_candidates(texts)
-    if force_refresh:
-        missing = list(candidates)
+    missing = glossary.untranslated_terms(candidates)
+    if not missing:
         if glossary.terms:
-            logger(f"Modpack glossary: OVERWRITE — re-translating all {len(missing)} terms from scratch...")
-        else:
-            logger(f"Modpack glossary: found {len(missing)} recurring terms — asking the utility model...")
-    else:
-        missing = glossary.untranslated_terms(candidates)
-        if not missing:
-            if glossary.terms:
-                logger(f"Modpack glossary: {len(glossary.terms)} terms up to date (0 new).")
-            return glossary
-        logger(f"Modpack glossary: found {len(candidates)} recurring terms, {len(missing)} new — asking the utility model...")
+            logger(f"Modpack glossary: {len(glossary.terms)} terms up to date (0 new).")
+        return glossary
+    logger(f"Modpack glossary: found {len(candidates)} recurring terms, {len(missing)} new — asking the utility model...")
     try:
         learned = await translate_glossary_terms(
             missing, api_keys, provider, model, target_lang_name,
@@ -3406,7 +4072,7 @@ async def ensure_modpack_glossary(
         return glossary
     added = 0
     for term, tr in learned.items():
-        if force_refresh or term not in glossary.terms:
+        if term not in glossary.terms:
             if glossary.terms.get(term) != tr:
                 glossary.terms[term] = tr
                 added += 1
@@ -3527,7 +4193,11 @@ yields 2 objects):
   "issue": "<one-line explanation>",
   "suggested": "<full corrected translation or null>",
   "glossary_fix": {{"en": "<term>", "ru": "<canonical translation>"}} | null}}]
-The "severity" field must be EXACTLY the string "hard" or "soft" — never
+MANDATORY FIELDS: every object MUST have a non-empty "category" from the list
+above AND a full corrected string in "suggested" ("null" ONLY if a fix is
+genuinely impossible). Objects without a category or without a "suggested"
+field are DISCARDED without being applied — the finding is lost, so never
+omit them. The "severity" field must be EXACTLY the string "hard" or "soft" — never
 "major"/"minor"/anything else: "hard" for the HARD block, "soft" for the
 SOFT block. Pairs without problems produce no output objects. glossary_fix
 only for categories where a canonical pair makes sense; null otherwise.
@@ -3537,16 +4207,51 @@ Never output any text outside the JSON array."""
 # speaks the /chat/completions dialect and skips these with a warning.
 _QA_UNSUPPORTED_PROVIDERS = ("Anthropic", "Cohere", "Google Translate", "Ollama")
 
+# Speed-pack п.3: phase-1 (ids-only) prompt. The model sees the same pairs
+# with the same glossary contexts but answers with a BARE JSON array of
+# problem pair ids — ~20x shorter output, nothing for the schema to drift
+# on. Phase 2 then re-asks ONLY the flagged pairs with the full prompt.
+_QA_IDS_PROMPT_TEMPLATE = """You are a translation quality auditor for Minecraft modpack quest files (SNBT,
+FTB Quests). You will receive a JSON array of objects, each with:
+"id" — pair identifier, "source" (original English string) and "translation"
+(the {target_language} translation produced by another model).
+An aggregated term map "term -> [translation variants with pair ids]" may
+also be attached.
+
+Minecraft formatting codes (&l, &r, &0-&f, &o, &#RRGGBB) are markup, not text.
+Tags like #minecraft:logs are technical identifiers. Mod names (AE2, JEI,
+Mekanism etc.) and any @-handles / recipe IDs / NBT paths stay in English
+BY DESIGN — never report them as UNTRANSLATED. A pinned modpack glossary and
+the official vanilla Minecraft glossary are provided — their terms are
+MANDATORY and authoritative.
+
+Screen EVERY pair for translation problems:
+- Terminology consistency: the same source term translated differently
+  across pairs; violations of the pinned glossaries; wrong vanilla terms.
+- UNTRANSLATED (English left in the translation, or the translation equals
+  the source), broken grammar, meaning flips, wrong-domain homonyms
+  (Lead the metal vs a leash), SOURCE_GARBAGE typos, truncated strings.
+- Formatting codes / numbers / tags mismatching the source.
+- Glue artifacts, calques, invented words, awkward style.
+
+Judge meaning, not style preferences: do NOT flag a correct translation
+just because you would phrase it differently.
+
+Output ONLY a JSON array of the ids that have at least one problem:
+[<id>, <id>, ...]
+Empty array if every pair is fine. Ids of pairs without problems are never
+included. No objects, no explanations, no text outside the JSON array."""
+
 # Transient HTTP codes (rate limit / overloaded server) retry the SAME
 # batch up to this many times with backoff — never split it.
 _QA_MAX_RETRIES = 10
 
 # The auditor uses its own fixed-timeout client: the main translation's
-# timeout ladder (200s -> 300s -> 500s) must not leak into the QA phase —
-# a slow escalation would make QA waits pointlessly long, and recreating
-# the SHARED client at a different timeout mid-run would disturb the
-# main translation. Separate cache, same pattern as the shared one.
-_QA_HTTP_TIMEOUT = 200.0
+# timeout ladder (main run) must not leak into the QA phase — the QA
+# auditor has its own fixed ceiling (ТЗ-health п.1: read 90s, connect 10s).
+# Recreating the SHARED client at a different timeout mid-run would disturb
+# the main translation. Separate cache, same pattern as the shared one.
+_QA_HTTP_TIMEOUT = 90.0
 
 # RAW DUMP (ТЗ2.1-1): with SNBT_QA_DEBUG=1 every raw auditor response
 # (main scan / arbitration / pass-2, including every split half) is
@@ -3585,16 +4290,112 @@ def _qa_temperature_value(value) -> float:
     if v != v or v in (float("inf"), float("-inf")):
         return 0.0
     return max(0.0, min(2.0, v))
+
+
+# --- Dataset collection (ТЗ-dataset): passive training-data recording ---------
+# Every QA run writes machine-readable learning records (source / mt / final /
+# verdicts / action / retry) for a future fine-tune of the decision model.
+# Zero user actions; a single GUI switch (default ON) disables it. The writer
+# is best-effort by design: a dataset failure NEVER breaks the run.
+DATASET_DIR = Path.home() / ".snbt-tr" / "datasets"
+_DATASET_FLUSH_EVERY = 200
+
+
+class QADataSetWriter:
+    """Buffered JSONL writer for one QA run (one file, append per file batch).
+
+    File layout: ~/.snbt-tr/datasets/<pack_hash>/<run_ts>.jsonl — the pack id
+    reuses the glossary pattern (_glossary_id). The first line is run meta;
+    every pair of the run gets one record, including CLEAN pairs (negative
+    examples calibrate the decision model). All I/O is wrapped: the first
+    failure logs ONE warning and the writer goes silent-dead for the rest
+    of the run — the translation pipeline must never feel it.
+    """
+
+    def __init__(self, modpack_root, meta: dict, logger=None):
+        self._records: List[dict] = []
+        self._count = 0
+        self._failed = False
+        self._warned = False
+        self._logger = logger
+        self._path: Optional[Path] = None
+        self._meta_written = False
+        try:
+            pack = _glossary_id(modpack_root)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self._path = DATASET_DIR / pack / f"{ts}.jsonl"
+            # Two runs started in the same second must not mix records:
+            # append _1/_2/... until the name is free.
+            seq = 0
+            while self._path.exists():
+                seq += 1
+                self._path = DATASET_DIR / pack / f"{ts}_{seq}.jsonl"
+            self._meta = dict(meta or {})
+            self._meta["meta"] = True
+            self._meta["ts"] = self._meta.get("ts") or time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as e:
+            self._fail(e)
+
+    @property
+    def path(self) -> Optional[Path]:
+        return self._path
+
+    def add(self, record: dict) -> None:
+        """Buffer one pair record; flush every _DATASET_FLUSH_EVERY records."""
+        if self._failed or self._path is None:
+            return
+        try:
+            self._records.append(record)
+            self._count += 1
+            if len(self._records) >= _DATASET_FLUSH_EVERY:
+                self.flush()
+        except Exception as e:
+            self._fail(e)
+
+    def flush(self) -> None:
+        """Append buffered records to the JSONL file (never raises)."""
+        if self._failed or self._path is None:
+            return
+        if not self._records and self._meta_written:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._path, "a", encoding="utf-8") as f:
+                if not self._meta_written:
+                    f.write(json.dumps(self._meta, ensure_ascii=False) + "\n")
+                    self._meta_written = True
+                for rec in self._records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._records.clear()
+        except Exception as e:
+            self._fail(e)
+
+    def finish(self) -> Optional[int]:
+        """Final flush; returns the record count (None if dead)."""
+        self.flush()
+        return None if self._failed else self._count
+
+    def _fail(self, e) -> None:
+        self._failed = True
+        if not self._warned and self._logger:
+            try:
+                self._logger(f"[QA] dataset writer disabled: {repr(e)[:120]} — the run is unaffected")
+                self._warned = True
+            except Exception:
+                pass
+        if self._records and not self._warned and self._logger is None:
+            pass  # no logger: stay silent (best-effort)
+
 _qa_httpx_clients: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
 
 def _get_qa_httpx_client() -> httpx.AsyncClient:
-    """Per-loop cached httpx client for the QA phase (fixed 200s timeout)."""
+    """Per-loop cached httpx client for the QA phase (read 90s / connect 10s)."""
     loop = asyncio.get_running_loop()
     client = _qa_httpx_clients.get(loop)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(
-            timeout=_QA_HTTP_TIMEOUT,
+            timeout=httpx.Timeout(_QA_HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0))
         _qa_httpx_clients[loop] = client
     return client
@@ -3677,7 +4478,8 @@ def _qa_aggregate_term_map(pairs: List[dict]) -> str:
 async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider: str,
                    model_text: str, custom_base_url: Optional[str], logger, check_status,
                    temperature: Optional[float] = None,
-                   phase: str = "main", batch_label: str = "0") -> List[dict]:
+                   phase: str = "main", batch_label: str = "0",
+                   ids_only: bool = False) -> List[dict]:
     """One auditor call: batch of pairs -> list of problem objects.
 
     OpenAI /chat/completions only. Key rotation mirrors the main run:
@@ -3686,6 +4488,11 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
     is retried as a whole (up to _QA_MAX_RETRIES with backoff + the
     server's Retry-After header when present) instead of being split —
     splitting only hammers a busy server with twice the requests.
+
+    ids_only=True (Speed-pack п.3 phase 1): the answer is a bare JSON
+    array of problem ids; it is normalized into pseudo-verdicts
+    [{"id": N}] with no category (the phase-2 rescan with the full prompt
+    produces the real verdicts; these only ROUTE pairs to it).
     """
     if not api_keys:
         raise RuntimeError("no API keys")
@@ -3709,10 +4516,19 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
     retry = 0
     last_error = None
     while True:
-        key = api_keys[key_idx % len(api_keys)]
+        # ТЗ-health п.2: benched keys (2 consecutive timeouts/failures) are
+        # excluded from QA rotation for the rest of the run.
+        active_keys = [k for k in api_keys if not health_is_benched(k)]
+        if not active_keys:
+            raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+        key = active_keys[key_idx % len(active_keys)]
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         try:
-            resp = await client.post(url, headers=headers, json=payload)
+            resp = await health_track_call(
+                key, f"QA {phase}", batch_label,
+                lambda k=key: client.post(url, headers={"Content-Type": "application/json",
+                                                        "Authorization": f"Bearer {k}"}, json=payload),
+                logger, timeout_s=_QA_HTTP_TIMEOUT)
             if resp.status_code in (401, 403, 402):
                 # 402 Payment Required (credits/limits exhausted) is an
                 # ACCESS error like 401/403: rotate the key; when all keys
@@ -3720,16 +4536,26 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
                 # (scan splitter / workers / fallback) treats it as fatal
                 # instead of splitting the batch into a request waterfall.
                 last_error = f"{resp.status_code} on key {key[:6]}..."
+                health_note_request(key, 0.0, failed=True)
+                if health_is_benched(key):
+                    _health_log(logger, f"[POOL] key ...{_key_suffix(key)} benched (2 consecutive failures)")
                 key_idx += 1
-                if key_idx < len(api_keys):
+                if key_idx < len(active_keys):
                     continue
                 raise RuntimeError(f"all QA keys failed: {last_error}")
             if resp.status_code == 400 and parse_model_effort(model_text)[1] is not None:
                 bare = {k: v for k, v in payload.items() if k not in ("reasoning_effort", "chat_template_kwargs")}
-                resp = await client.post(url, headers=headers, json=bare)
+                resp = await health_track_call(
+                    key, f"QA {phase}", batch_label,
+                    lambda b=bare, k=key: client.post(url, headers={"Content-Type": "application/json",
+                                                                    "Authorization": f"Bearer {k}"}, json=b),
+                    logger, timeout_s=_QA_HTTP_TIMEOUT)
             resp.raise_for_status()
             content = resp.json()['choices'][0]['message']['content']
             _qa_dump_raw(phase, batch_label, content)
+            if ids_only:
+                ids = extract_qa_ids_array(content)
+                return [{"id": i} for i in ids if i is not None]
             parsed = extract_qa_problems_array(content)
             if not isinstance(parsed, list):
                 raise ValueError("auditor response is not a JSON array")
@@ -3764,6 +4590,11 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
                 # does not block the retry (harmless for 503s).
                 key_idx += 1
                 continue
+            if code in (500, 501, 504) and health_is_benched(key):
+                # ТЗ-health п.2: a hard 5xx on an already-benched key means
+                # nothing will succeed on it — fail loudly instead of
+                # hammering the broken server with more requests.
+                raise RuntimeError(f"auditor HTTP {code} on benched key ...{_key_suffix(key)}")
             raise RuntimeError(f"auditor HTTP error: {code}")
         except httpx.TimeoutException:
             # Read timeouts ARE size-related: re-raise so _qa_scan_pairs
@@ -3771,11 +4602,147 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
             raise
 
 
+async def _qa_retry_send(candidates: List[dict], prompt: str, api_keys: List[str], provider: str,
+                         model_text: str, custom_base_url: Optional[str], logger, check_status,
+                         temperature: Optional[float] = None,
+                         phase: str = "retry", batch_label: str = "0") -> Dict[int, str]:
+    """Speed-pack п.1: one call retranslates a BATCH of flagged strings.
+
+    Transport mirrors _qa_send (key rotation incl. 402, transient 429/502/503
+    same-batch retry, effort-400 bare retry, raw dumps); the answer contract
+    is the {"<id>": "fixed string"} map instead of a problems array.
+    Returns {} on unparseable answers — callers fall back to the
+    single-string retry path per candidate.
+    """
+    if not api_keys:
+        raise RuntimeError("no API keys")
+    base_url = custom_base_url or get_base_url(provider)
+    if not base_url:
+        raise RuntimeError(f"no base URL for provider '{provider}'")
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    user_content = prompt + "\nCandidates:\n" + json.dumps(candidates, ensure_ascii=False)
+    payload = {
+        "model": model_text,
+        "messages": [{"role": "user", "content": user_content}],
+        "temperature": _qa_temperature_value(temperature),
+    }
+    payload = apply_reasoning_effort(payload, model_text, provider)
+    client = _get_qa_httpx_client()
+    key_idx = 0
+    retry = 0
+    last_error = None
+    while True:
+        # ТЗ-health п.2: benched keys are excluded from QA retry rotation.
+        active_keys = [k for k in api_keys if not health_is_benched(k)]
+        if not active_keys:
+            raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+        key = active_keys[key_idx % len(active_keys)]
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+        try:
+            resp = await health_track_call(
+                key, f"QA {phase}", batch_label,
+                lambda k=key: client.post(url, headers={"Content-Type": "application/json",
+                                                        "Authorization": f"Bearer {k}"}, json=payload),
+                logger, timeout_s=_QA_HTTP_TIMEOUT)
+            if resp.status_code in (401, 403, 402):
+                last_error = f"{resp.status_code} on key {key[:6]}..."
+                health_note_request(key, 0.0, failed=True)
+                if health_is_benched(key):
+                    _health_log(logger, f"[POOL] key ...{_key_suffix(key)} benched (2 consecutive failures)")
+                key_idx += 1
+                if key_idx < len(active_keys):
+                    continue
+                raise RuntimeError(f"all QA keys failed: {last_error}")
+            if resp.status_code == 400 and parse_model_effort(model_text)[1] is not None:
+                bare = {k: v for k, v in payload.items() if k not in ("reasoning_effort", "chat_template_kwargs")}
+                resp = await health_track_call(
+                    key, f"QA {phase}", batch_label,
+                    lambda b=bare, k=key: client.post(url, headers={"Content-Type": "application/json",
+                                                                    "Authorization": f"Bearer {k}"}, json=b),
+                    logger, timeout_s=_QA_HTTP_TIMEOUT)
+            resp.raise_for_status()
+            content = resp.json()['choices'][0]['message']['content']
+            _qa_dump_raw(phase, batch_label, content)
+            return extract_qa_fix_map(content)
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code in (429, 502, 503):
+                retry += 1
+                if retry > _QA_MAX_RETRIES:
+                    raise RuntimeError(f"auditor HTTP {code} after {_QA_MAX_RETRIES} retries — server unavailable")
+                retry_after = e.response.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        pause = float(retry_after)
+                    except (TypeError, ValueError):
+                        pause = None
+                else:
+                    pause = None
+                if pause is None:
+                    pause = min(10.0 * retry, 60.0)
+                logger(f"[QA] retry-batch HTTP {code} — retrying in {pause:.0f}s ({retry}/{_QA_MAX_RETRIES})")
+                if check_status:
+                    await check_status()
+                await asyncio.sleep(pause)
+                key_idx += 1
+                continue
+            raise RuntimeError(f"auditor HTTP error: {code}")
+        except httpx.TimeoutException:
+            # size-related: let the splitter below halve the candidate list
+            raise
+
+
+# Speed-pack п.1: candidates per ONE batch-retry call (15-20 by the spec).
+_QA_RETRY_CHUNK = 20
+
+# Нит 1 (m11236): pairs per ONE arbitration call — chunked parallel arb
+# keeps every request under the 90s read-timeout ceiling.
+_QA_ARB_CHUNK = 40
+
+async def _qa_scan_retries(candidates: List[dict], prompt: str, api_keys: List[str], provider: str,
+                           model_text: str, custom_base_url: Optional[str], logger, check_status,
+                           temperature: Optional[float] = None,
+                           phase: str = "retry", batch_label: str = "0") -> Dict[int, str]:
+    """BinarySplit-style recovery for batch retries (same contract as
+    _qa_scan_pairs: fatal auth/config errors re-raise, size-related ones
+    halve the list; a single candidate that still fails returns {} and the
+    caller falls back to the single-string retry)."""
+    if not candidates:
+        return {}
+    try:
+        return await _qa_retry_send(candidates, prompt, api_keys, provider, model_text,
+                                    custom_base_url, logger, check_status, temperature,
+                                    phase, batch_label)
+    except AbortException:
+        raise
+    except Exception as e:
+        msg = str(e)
+        if ("keys failed" in msg or "keys unavailable" in msg
+                or "server unavailable" in msg
+                or "no API keys" in msg or "no base URL" in msg):
+            raise
+        if len(candidates) == 1:
+            logger(f"[QA] retry-batch failed for candidate id {candidates[0].get('id')}: "
+                   f"{repr(e)[:120]} — falling back to the single retry")
+            return {}
+        mid = len(candidates) // 2
+        logger(f"[QA] retry-batch of {len(candidates)} split in halves after: {repr(e)[:80]}")
+        left = await _qa_scan_retries(candidates[:mid], prompt, api_keys, provider, model_text,
+                                      custom_base_url, logger, check_status, temperature,
+                                      phase, batch_label + "L")
+        right = await _qa_scan_retries(candidates[mid:], prompt, api_keys, provider, model_text,
+                                       custom_base_url, logger, check_status, temperature,
+                                       phase, batch_label + "R")
+        left.update(right)
+        return left
+
+
 async def _qa_scan_pairs(pairs: List[dict], prompt: str, api_keys: List[str], provider: str,
                          model_text: str, custom_base_url: Optional[str], logger, check_status,
                          vanilla_gloss: Dict[str, str], modpack_terms: Dict[str, str],
                          temperature: Optional[float] = None,
-                         phase: str = "main", batch_label: str = "0") -> List[dict]:
+                         phase: str = "main", batch_label: str = "0",
+                         ids_only: bool = False) -> List[dict]:
     """Scan pairs with BinarySplit-style recovery on a broken/invalid response.
 
     Large batches may return broken JSON or time out (size-related); those
@@ -3788,6 +4755,9 @@ async def _qa_scan_pairs(pairs: List[dict], prompt: str, api_keys: List[str], pr
     same batch-scoped pinning as the main translator), lenient-matched:
     case-insensitive with plural tolerance. A false pin is harmless for the
     auditor; a missed pin is not.
+
+    ids_only=True (Speed-pack п.3): phase-1 routing scan — the answer is a
+    bare id array; ids_only output flows through the same split/retry path.
     """
     if not pairs:
         return []
@@ -3806,7 +4776,7 @@ async def _qa_scan_pairs(pairs: List[dict], prompt: str, api_keys: List[str], pr
     try:
         return await _qa_send(pairs, full_prompt, api_keys, provider, model_text,
                               custom_base_url, logger, check_status, temperature,
-                              phase=phase, batch_label=batch_label)
+                              phase=phase, batch_label=batch_label, ids_only=ids_only)
     except AbortException:
         raise
     except Exception as e:
@@ -3824,10 +4794,10 @@ async def _qa_scan_pairs(pairs: List[dict], prompt: str, api_keys: List[str], pr
         logger(f"[QA] {phase}: batch of {len(pairs)} split in halves after: {repr(e)[:80]}")
         left = await _qa_scan_pairs(pairs[:mid], prompt, api_keys, provider, model_text,
                                     custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
-                                    temperature, phase, batch_label + "L")
+                                    temperature, phase, batch_label + "L", ids_only)
         right = await _qa_scan_pairs(pairs[mid:], prompt, api_keys, provider, model_text,
                                      custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
-                                     temperature, phase, batch_label + "R")
+                                     temperature, phase, batch_label + "R", ids_only)
         return left + right
 
 
@@ -3890,6 +4860,116 @@ def _qa_script_violations(pairs: List[dict], target_script: str) -> List[Tuple[d
     return out
 
 
+# Tier B (ТЗ3-2): protected latin single words — mod/tech names that are
+# legitimate full copies and must NOT trigger the machine UNTRANSLATED
+# verdict (mod names stay English by design).
+_QA_TECH_WHITELIST = frozenset({
+    "minecraft", "forge", "fabric", "neoforge", "quark", "jei", "rei", "emi",
+    "ae2", "mek", "rf", "fe", "create", "kubejs", "mekanism", "xnet", "sfm",
+    "immersive engineering", "enderio", "applied energistics", "ftb",
+})
+
+# word immediately repeated after itself ('камень камень', 'Snow snow')
+# ТЗ3.1-addendum A: a repeated word in the TRANSLATION is legitimate when
+# the source repeats a word the same way ("Eggs Eggs Eggs" -> "Яйца Яйца
+# Яйца" mirrors the source). It is a glue artifact only when the source has
+# no such proximate repeat ("Верстак 9x9 Верстак" for a non-repeating
+# source). The two occurrences must be CLOSE — at most _QA_GLUE_MAX_GAP
+# tokens between them — so far-apart legitimate repeats never flag.
+_QA_GLUE_MAX_GAP = 1
+_QA_GLUE_TOKEN_STRIP = "!.,:;\"'()[]{}«»„“”…—–"
+
+
+def _qa_glue_repeat(text: str) -> Optional[str]:
+    """First word (>=3 chars, alphabetic) repeated with at most
+    _QA_GLUE_MAX_GAP tokens between the occurrences (case-insensitive,
+    FMT-shielded), or None."""
+    clean = FMT_CODE_PATTERN.sub('', text)
+    tokens = [t.casefold().strip(_QA_GLUE_TOKEN_STRIP) for t in clean.split()]
+    last: Dict[str, int] = {}
+    for i, t in enumerate(tokens):
+        if len(t) < 3 or not ALPHA_WORD.fullmatch(t):
+            continue
+        j = last.get(t)
+        if j is not None and i - j - 1 <= _QA_GLUE_MAX_GAP:
+            return t
+        last[t] = i
+    return None
+
+
+def _qa_machine_problems(pairs: List[dict]) -> List[dict]:
+    """Tier B deterministic verdicts — the machine decides, no LLM is called.
+
+    ТЗ3-2: full-copy UNTRANSLATED (including single-word copies like
+    'Marsium' -> 'Marsium'; protected mod/tech names and pure-technical
+    strings are skipped), CODES_MISMATCH / NUMBERS_MISMATCH (multisets of
+    formatting codes/tags/numbers differ from the source) and GLUE
+    duplicates (a word repeated right after itself). Every verdict is
+    already in the final normalized shape (severity=hard, machine-prefixed
+    issue) and merges into the common apply path BEFORE the LLM verdicts —
+    the caller drops LLM verdicts on the same pair id (the machine already
+    retranslates it; double retry is wasted tokens).
+    """
+    out: List[dict] = []
+    for pair in pairs:
+        src = pair.get("source") or ""
+        tr = pair.get("translation") or ""
+        if not src or not tr:
+            continue
+        pid = pair.get("id")
+
+        # --- GLUE duplicate: a word repeated right after itself ---
+        # ТЗ3.1-addendum A: first check the SOURCE — if it repeats the same
+        # word just as closely, the translation mirrors it legitimately.
+        tr_stripped = FMT_CODE_PATTERN.sub('', tr)
+        glue_word = _qa_glue_repeat(tr_stripped)
+        if glue_word is not None and _qa_glue_repeat(src) is None:
+            out.append({"id": pid, "category": "GLUE_ARTIFACT", "severity": "hard",
+                        "issue": f"machine: word '{glue_word}' duplicated — glue artifact",
+                        "suggested": None, "glossary_fix": None})
+            continue
+
+        # --- full copy of the source (untranslated) ---
+        src_clean = FMT_CODE_PATTERN.sub('', src).strip()
+        tr_clean = tr_stripped.strip()
+        # a single token with no spaces that IS a technical identifier
+        # (#tag:path, @handle) is a legitimate copy by design
+        is_tech_string = (" " not in src_clean and src_clean
+                          and src_clean[0] in "#@")
+        if (src_clean and tr_clean and src_clean == tr_clean
+                and ALPHA_WORD.search(src_clean) and not is_tech_string):
+            skip = False
+            # ТЗ3.1-4: single-word full copies are caught UNLESS the word is
+            # an explicitly protected mod/tech name. No more length/case
+            # heuristics — 'marsium'/'clat' must become hard verdicts. The
+            # whitelist match uses the RAW token (ALPHA_WORD strips digits,
+            # so 'AE2' would degenerate to 'AE' and lose its protection).
+            single = src_clean.split()
+            if len(single) == 1:
+                low = single[0].lower().strip("!.,:;\"'()")
+                if low in _QA_TECH_WHITELIST:
+                    skip = True
+            if not skip:
+                out.append({"id": pid, "category": "UNTRANSLATED", "severity": "hard",
+                            "issue": "machine: full copy of the source — untranslated",
+                            "suggested": None, "glossary_fix": None})
+                continue
+
+        # --- codes / numbers / tags multiset mismatch ---
+        src_codes, src_nums, src_tags = _qa_multisets(src)
+        tr_codes, tr_nums, tr_tags = _qa_multisets(tr)
+        if src_codes != tr_codes or src_tags != tr_tags:
+            out.append({"id": pid, "category": "CODES_MISMATCH", "severity": "hard",
+                        "issue": "machine: formatting codes/tags multiset differs from the source",
+                        "suggested": None, "glossary_fix": None})
+            continue
+        if src_nums != tr_nums:
+            out.append({"id": pid, "category": "NUMBERS_MISMATCH", "severity": "hard",
+                        "issue": "machine: numbers multiset differs from the source",
+                        "suggested": None, "glossary_fix": None})
+    return out
+
+
 async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, translator,
                               cache, logger, check_status) -> None:
     """Audit-and-fix pass over the finished translations of ONE file.
@@ -3945,14 +5025,55 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         modpack_terms = getattr(translator, "modpack_glossary_terms", None) or {}
 
         _qa_reset_counters()
+        # --- Dataset collection (ТЗ-dataset): passive training records ----
+        # The writer is best-effort (a failure kills only the dataset, the
+        # run is untouched). Verdicts/actions are collected per pair id in
+        # the dicts below and written at the END of the phase when every
+        # pair's FINAL state (after pass-2) is known.
+        ds_writer = None
+        qa_vcache = None
+        qa_cfg_hash = ""
+        ds_machine: Dict[int, List[dict]] = {}
+        ds_llm: Dict[int, List[dict]] = {}
+        ds_action: Dict[int, str] = {}
+        ds_retry: Dict[int, dict] = {}
+        mt_snapshot: Dict[int, str] = {}
+        try:
+            if qa_params.get("dataset", True):
+                ds_writer = QADataSetWriter(modpack_root, {
+                    "pack": (Path(modpack_root).name if modpack_root else None),
+                    "model": getattr(translator, "model", None) or qa_params.get("model"),
+                    "temp": get_temperature(),
+                    "effort": (parse_model_effort(qa_params.get("model") or "")[1] or None),
+                    "qa_model": qa_params.get("model"),
+                    "qa_effort": (parse_model_effort(qa_params.get("model") or "")[1] or None),
+                    "qa_temp": _qa_temperature_value(qa_params.get("temperature")),
+                    "lang": lang_name,
+                    # ТЗ-health п.4: request-health aggregate for the run.
+                    "health": health_totals(),
+                }, logger=qa_log)
+        except Exception as e:
+            qa_log(f"[QA] dataset writer disabled: {repr(e)[:120]} — the run is unaffected")
+        mt_snapshot = {p["id"]: p["translation"] for p in pairs}
         try:
             batch_size = int(qa_params.get("batch_size") or 40)
         except (TypeError, ValueError):
             batch_size = 40
         qa_temperature = qa_params.get("temperature")
         BATCH = max(10, min(200, batch_size))
+        # Speed-pack п.4: verdict-level QA cache. Only the LLM phase-1 scan
+        # is skipped for cached-clean pairs; the deterministic tiers still
+        # see every pair (they cost zero tokens).
+        if qa_params.get("verdict_cache", True):
+            try:
+                qa_vcache = QAVerdictCache()
+                qa_cfg_hash = QAVerdictCache.config_hash(model_text, qa_temperature, BATCH, qa_prompt)
+            except Exception as e:
+                qa_log(f"[QA] verdict cache unavailable ({repr(e)[:100]}) — full scan")
+                qa_vcache = None
         scanned = 0
         retranslated_pairs: List[dict] = []
+        crippled_all: List[dict] = []
 
         # Deterministic script-artifact pre-check (zero tokens): glue
         # artifacts like 'Sсейчас' (mixed-script token) or 'S&lnow' (latin
@@ -3962,6 +5083,11 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         # retry; the retry is idempotent and pass-2 reports the rest.
         target_script = _qa_target_script(qa_params, pairs)
         script_bad = _qa_script_violations(pairs, target_script)
+        # Snapshot of the ORIGINAL translations for the machine scan (the
+        # script pre-check below mutates pair["translation"] in place).
+        machine_pairs = [{"id": p["id"], "source": p["source"],
+                          "translation": p["translation"]} for p in pairs]
+        script_fixed_ids: set = set()
         for pair, reason in script_bad:
             source = pair["source"]
             _QA_COUNTERS["hard"] += 1
@@ -3973,105 +5099,263 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                 res = await translator.translate([source], qa_log, check_status, context="qa-script-retry")
                 new_tr = apply_dictionary(sanitize_with_original(source, res[0]), dictionary)
                 if new_tr:
-                    pairs_dict[source] = new_tr
-                    pair["translation"] = new_tr
-                    if cache is not None:
-                        cache.save_batch({source: new_tr})
-                    qa_log(f"[QA] #{pair['id']} retranslated -> \"{str(new_tr)[:80]}\"")
-                retranslated_pairs.append(pair)
+                    if _qa_norm_same(new_tr, pair["translation"] or ""):
+                        # ТЗ3.1-5: the script retry returned the equivalent
+                        # string — no pass-2 for this pair, surface it instead.
+                        _QA_COUNTERS["unresolved"] += 1
+                        qa_log(f"[QA] #{pair['id']} unresolved: script retry returned the same string "
+                               f"\"{str(new_tr)[:60]}\" (source: \"{source[:60]}\") — needs glossary/manual fix")
+                    else:
+                        pairs_dict[source] = new_tr
+                        pair["translation"] = new_tr
+                        if cache is not None:
+                            cache.save_batch({source: new_tr})
+                        qa_log(f"[QA] #{pair['id']} retranslated -> \"{str(new_tr)[:80]}\"")
+                        retranslated_pairs.append(pair)
+                script_fixed_ids.add(pair["id"])
             except AbortException:
                 raise
             except Exception as e:
                 _QA_COUNTERS["warnings"] += 1
                 qa_log(f"[QA] #{pair['id']} script retranslation failed ({repr(e)[:100]}) — kept the existing translation")
 
+        # --- Speed-pack п.3: two-phase audit --------------------------------
+        # Tier B machine scan runs FIRST (free, deterministic): pairs it
+        # caught go straight to retranslation and are EXCLUDED from the LLM
+        # scan — their LLM verdicts would be dropped anyway, so paying for
+        # the scan is waste. Phase 1 (ids-only) routes the rest; phase 2
+        # re-asks ONLY the flagged pairs with the full verdict prompt.
+        machine_all = _qa_machine_problems(machine_pairs)
+        machine_all = [p for p in machine_all if p["id"] not in script_fixed_ids]
+        machine_by_id = {p["id"]: p for p in machine_all}
+        for p in machine_all:
+            ds_machine.setdefault(p["id"], []).append({"category": p["category"], "issue": p["issue"]})
+        for pid in script_fixed_ids:
+            ds_action.setdefault(pid, "retranslated")
+        if machine_all:
+            cats: Dict[str, int] = {}
+            for p in machine_all:
+                cats[p["category"]] = cats.get(p["category"], 0) + 1
+            qa_log("[QA] machine scan (tier B): " + ", ".join(
+                f"{v} {k}" for k, v in sorted(cats.items())) + f" — {len(machine_all)} pair(s) to retranslate")
+        excluded_ids = set(machine_by_id) | script_fixed_ids
+        llm_caught_ids: set = set()  # late LLM verdicts on machine pairs (kept for the matrix)
+        llm_pairs = [p for p in pairs if p["id"] not in excluded_ids]
+        if len(llm_pairs) < len(pairs):
+            qa_log(f"[QA] two-phase audit: {len(pairs) - len(llm_pairs)} pair(s) excluded from the LLM scan "
+                   f"(machine-caught / script-fixed)")
+        # Speed-pack п.4: pairs whose (source, mt, config) hash is cached
+        # clean from a previous run skip the LLM phase-1 scan entirely.
+        if qa_vcache is not None and qa_cfg_hash:
+            cached_clean = [
+                p for p in llm_pairs
+                if qa_vcache.get_clean(QAVerdictCache.key(p["source"], p["translation"], qa_cfg_hash))
+            ]
+            if cached_clean:
+                cache_skipped_ids = {p["id"] for p in cached_clean}
+                llm_pairs = [p for p in llm_pairs if p["id"] not in cache_skipped_ids]
+                qa_log(f"[QA] verdict cache: {len(cached_clean)} clean pair(s) skipped in phase 1 "
+                       f"(cached from previous runs)")
+
         batches = [pairs[i:i + BATCH] for i in range(0, len(pairs), BATCH)]
         n_batches = len(batches)
-        n_workers = min(len(batches), len(api_keys))
-        results: List[Optional[List[dict]]] = [None] * n_batches
-        requeued: set = set()
-        batch_queue: "asyncio.Queue[int]" = asyncio.Queue()
-        for bi in range(n_batches):
-            batch_queue.put_nowait(bi)
+        pair_batch_of = {p["id"]: bi for bi, batch in enumerate(batches) for p in batch}
 
-        # One worker per API key: 5 keys -> 5 batches scanned in parallel,
-        # each pinned to its own key (no cross-worker rate-limit storms).
-        # A dead key (401/403) stops ITS worker with a warning and returns
-        # its claimed batch index to the queue; live workers drain the rest.
-        async def qa_worker(worker_idx: int):
-            key = api_keys[worker_idx % len(api_keys)]
-            while True:
-                try:
-                    bi = batch_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                batch = batches[bi]
-                qa_log(f"[QA] scanning {len(batch)} pairs (batch {bi + 1}/{n_batches}, key ...{key[-4:]})...")
-                try:
-                    probs = await _qa_scan_pairs(
-                        batch, qa_prompt, [key], provider, model_text,
-                        custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
-                        qa_temperature, phase="main", batch_label=str(bi + 1))
-                    results[bi] = probs
-                except AbortException:
-                    raise
-                except Exception as e:
-                    if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
-                        qa_log(f"[QA] worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
-                        # Return the claimed batch so live workers (or the
-                        # all-keys fallback after the TaskGroup) can re-scan it.
-                        batch_queue.put_nowait(bi)
+        # Phase 1: ids-only routing scan over the pairs the machine did not
+        # catch. Same workerpool (per-key), same BinarySplit recovery; the
+        # answer per batch is a bare id array -> [{"id": N}] pseudo-verdicts.
+        ids_prompt = _QA_IDS_PROMPT_TEMPLATE.replace("{target_language}", lang_name)
+        llm_batches = [llm_pairs[i:i + BATCH] for i in range(0, len(llm_pairs), BATCH)]
+        n_ids_batches = len(llm_batches)
+        ids_results: List[List[dict]] = [[] for _ in range(n_ids_batches)]
+        if n_ids_batches:
+            ids_queue: "asyncio.Queue[int]" = asyncio.Queue()
+            for bi in range(n_ids_batches):
+                ids_queue.put_nowait(bi)
+            ids_requeued: set = set()
+            n_ids_workers = min(n_ids_batches, len(api_keys))
+
+            async def ids_worker(worker_idx: int):
+                while True:
+                    # ТЗ-health п.2: worker keys are re-selected per batch so
+                    # a benched key hands its queue items to live workers.
+                    candidates = [k for k in api_keys if not health_is_benched(k)]
+                    if not candidates:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    key = candidates[worker_idx % len(candidates)]
+                    try:
+                        bi = ids_queue.get_nowait()
+                    except asyncio.QueueEmpty:
                         return
-                    # Size-related failure that survived splitting: put the
-                    # batch back so a healthier worker can pick it up once.
-                    if bi not in requeued:
-                        requeued.add(bi)
-                        batch_queue.put_nowait(bi)
-                    else:
-                        _QA_COUNTERS["warnings"] += 1
-                        qa_log(f"[QA] batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
-                    return
+                    batch = llm_batches[bi]
+                    qa_log(f"[QA] phase 1 (ids): scanning {len(batch)} pairs (batch {bi + 1}/{n_ids_batches}, key ...{key[-4:]})...")
+                    try:
+                        pseudo = await _qa_scan_pairs(
+                            batch, ids_prompt, [key], provider, model_text,
+                            custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
+                            qa_temperature, phase="phase1", batch_label=str(bi + 1), ids_only=True)
+                        ids_results[bi] = pseudo
+                    except AbortException:
+                        raise
+                    except Exception as e:
+                        if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
+                            qa_log(f"[QA] phase-1 worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
+                            ids_queue.put_nowait(bi)
+                            return
+                        if health_is_benched(key):
+                            # benched mid-flight: hand the batch to the queue
+                            # (another worker / the fallback drain picks it up)
+                            qa_log(f"[QA] phase-1 worker key ...{key[-4:]} benched — requeueing batch {bi + 1}")
+                            ids_queue.put_nowait(bi)
+                            return
+                        if bi not in ids_requeued:
+                            ids_requeued.add(bi)
+                            ids_queue.put_nowait(bi)
+                        else:
+                            _QA_COUNTERS["warnings"] += 1
+                            qa_log(f"[QA] phase-1 batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
+                        return
 
-        if n_batches:
-            # TaskGroup wraps child failures into an ExceptionGroup; the
-            # phase contract expects a bare AbortException on user cancel,
-            # so unwrap a single/group Abort back out of the group.
             try:
                 async with asyncio.TaskGroup() as tg:
-                    for w in range(n_workers):
-                        tg.create_task(qa_worker(w))
+                    for w in range(n_ids_workers):
+                        tg.create_task(ids_worker(w))
             except BaseExceptionGroup as eg:
                 aborts = [e for e in eg.exceptions if isinstance(e, AbortException)]
                 if aborts:
                     raise aborts[0]
                 raise
-            # Drain any batches a dead worker returned to the queue: one
-            # worker over all remaining keys, sequential, no re-queue loops.
-            leftovers = []
-            while not batch_queue.empty():
-                leftovers.append(batch_queue.get_nowait())
-            for bi in leftovers:
-                batch = batches[bi]
-                qa_log(f"[QA] scanning {len(batch)} pairs (batch {bi + 1}/{n_batches}, fallback all keys)...")
+            # fallback drain over live (non-benched) keys
+            while not ids_queue.empty():
+                bi = ids_queue.get_nowait()
+                batch = llm_batches[bi]
+                qa_log(f"[QA] phase 1 (ids): scanning {len(batch)} pairs (batch {bi + 1}/{n_ids_batches}, fallback all keys)...")
                 try:
-                    probs = await _qa_scan_pairs(
-                        batch, qa_prompt, api_keys, provider, model_text,
+                    live_keys = [k for k in api_keys if not health_is_benched(k)]
+                    if not live_keys:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    ids_results[bi] = await _qa_scan_pairs(
+                        batch, ids_prompt, live_keys, provider, model_text,
                         custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
-                        qa_temperature, phase="main", batch_label=str(bi + 1))
-                    results[bi] = probs
+                        qa_temperature, phase="phase1", batch_label=str(bi + 1), ids_only=True)
                 except AbortException:
                     raise
                 except Exception as e:
-                    # Fatal pool-wide errors (all keys dead / server down)
-                    # must stop the whole phase with ONE skip line — running
-                    # the remaining batches would just repeat the failure.
                     msg = str(e)
                     if ("keys failed" in msg or "keys unavailable" in msg
                             or "server unavailable" in msg):
                         raise
                     _QA_COUNTERS["warnings"] += 1
-                    qa_log(f"[QA] batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — kept the existing translations")
-                    results[bi] = []
+                    qa_log(f"[QA] phase-1 batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — kept the existing translations")
+                    ids_results[bi] = []
+
+        flagged_ids: set = set()
+        for bi in range(n_ids_batches):
+            for pv in ids_results[bi]:
+                pid = pv.get("id")
+                if pid is not None and pid not in excluded_ids:
+                    flagged_ids.add(pid)
+        by_id_all = {p["id"]: p for p in pairs}
+        flagged_pairs = [by_id_all[pid] for pid in sorted(flagged_ids) if pid in by_id_all]
+
+        # Phase 2: full verdicts for the flagged pairs only (~10-20%).
+        results: List[Optional[List[dict]]] = [None] * n_batches
+        if flagged_pairs:
+            qa_log(f"[QA] phase 2: {len(flagged_pairs)} flagged pair(s) — full verdict scan...")
+            p2_batches = [flagged_pairs[i:i + BATCH] for i in range(0, len(flagged_pairs), BATCH)]
+            p2_queue: "asyncio.Queue[int]" = asyncio.Queue()
+            for bi in range(len(p2_batches)):
+                p2_queue.put_nowait(bi)
+            p2_requeued: set = set()
+            p2_results: List[Optional[List[dict]]] = [None] * len(p2_batches)
+            n_p2_workers = min(len(p2_batches), len(api_keys))
+
+            async def p2_worker(worker_idx: int):
+                while True:
+                    # ТЗ-health п.2: re-select the worker key per batch so a
+                    # benched key hands its queue items to live workers.
+                    candidates = [k for k in api_keys if not health_is_benched(k)]
+                    if not candidates:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    key = candidates[worker_idx % len(candidates)]
+                    try:
+                        bi = p2_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    batch = p2_batches[bi]
+                    qa_log(f"[QA] phase 2: scanning {len(batch)} pairs (batch {bi + 1}/{len(p2_batches)}, key ...{key[-4:]})...")
+                    try:
+                        probs = await _qa_scan_pairs(
+                            batch, qa_prompt, [key], provider, model_text,
+                            custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
+                            qa_temperature, phase="main", batch_label=str(bi + 1))
+                        p2_results[bi] = probs
+                    except AbortException:
+                        raise
+                    except Exception as e:
+                        if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
+                            qa_log(f"[QA] phase-2 worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
+                            p2_queue.put_nowait(bi)
+                            return
+                        if health_is_benched(key):
+                            qa_log(f"[QA] phase-2 worker key ...{key[-4:]} benched — requeueing batch {bi + 1}")
+                            p2_queue.put_nowait(bi)
+                            return
+                        if bi not in p2_requeued:
+                            p2_requeued.add(bi)
+                            p2_queue.put_nowait(bi)
+                        else:
+                            _QA_COUNTERS["warnings"] += 1
+                            qa_log(f"[QA] phase-2 batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
+                        return
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for w in range(n_p2_workers):
+                        tg.create_task(p2_worker(w))
+            except BaseExceptionGroup as eg:
+                aborts = [e for e in eg.exceptions if isinstance(e, AbortException)]
+                if aborts:
+                    raise aborts[0]
+                raise
+            while not p2_queue.empty():
+                bi = p2_queue.get_nowait()
+                batch = p2_batches[bi]
+                qa_log(f"[QA] phase 2: scanning {len(batch)} pairs (batch {bi + 1}/{len(p2_batches)}, fallback all keys)...")
+                try:
+                    live_keys = [k for k in api_keys if not health_is_benched(k)]
+                    if not live_keys:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    p2_results[bi] = await _qa_scan_pairs(
+                        batch, qa_prompt, live_keys, provider, model_text,
+                        custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
+                        qa_temperature, phase="main", batch_label=str(bi + 1))
+                except AbortException:
+                    raise
+                except Exception as e:
+                    msg = str(e)
+                    if ("keys failed" in msg or "keys unavailable" in msg
+                            or "server unavailable" in msg):
+                        raise
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] phase-2 batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — kept the existing translations")
+                    p2_results[bi] = []
+            # distribute phase-2 verdicts back into the ORIGINAL batch grid
+            # (ids coerced: models return "574"/573.0 just as often here)
+            for bi, batch in enumerate(p2_batches):
+                for prob in (p2_results[bi] or []):
+                    pid = _qa_coerce_pid(prob.get("id"))
+                    if pid is None:
+                        continue
+                    obi = pair_batch_of.get(pid)
+                    if obi is not None:
+                        if results[obi] is None:
+                            results[obi] = []
+                        results[obi].append(prob)
+            qa_log(f"[QA] two-phase audit: {len(flagged_ids)} pair(s) flagged in phase 1, "
+                   f"{sum(len(r or []) for r in p2_results)} verdict(s) issued in phase 2")
+        else:
+            qa_log("[QA] two-phase audit: phase 1 flagged nothing — skipping the full verdict scan")
 
         # Apply problems batch by batch in the ORIGINAL order (no races:
         # pairs_dict / cache / glossary are touched sequentially here).
@@ -4082,9 +5366,35 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             summary = _qa_drop_summary(f"batch {bi + 1}", drop_stats, batch)
             if summary:
                 qa_log(f"[QA] batch {bi + 1}: {summary}")
+            # merge machine verdicts for THIS batch (machine first: its
+            # retranslation wins; LLM verdicts on the same id are dropped)
+            batch_machine = [machine_by_id[p["id"]] for p in batch if p["id"] in machine_by_id]
+            if batch_machine:
+                caught_ids = {p["id"] for p in batch_machine}
+                llm_overlap = [p for p in probs if p.get("id") in caught_ids]
+                if llm_overlap:
+                    llm_caught_ids.update(p["id"] for p in llm_overlap)
+                    qa_log(f"[QA] batch {bi + 1}: {len(llm_overlap)} LLM verdict(s) on pair(s) the "
+                           f"machine already caught — dropped (machine retranslation wins)")
+                probs = batch_machine + [p for p in probs if p.get("id") not in caught_ids]
+            crippled: List[dict] = [p for p in probs
+                                    if p.get("severity") == "warning"
+                                    and (not p.get("category") or p.get("suggested") is None)]
+            crippled_all.extend({**p, "_batch_index": bi} for p in crippled)
+            # ТЗ-dataset: LLM-only verdicts (post overlap-drop; machine
+            # findings are recorded separately in ds_machine)
+            for p in probs:
+                if (p.get("id") is not None and p.get("severity") != "warning"
+                        and p["id"] not in machine_by_id):
+                    ds_llm.setdefault(p["id"], []).append(
+                        {"category": p.get("category"), "severity": p.get("severity"),
+                         "issue": p.get("issue"), "suggested": p.get("suggested")})
             new_retrans = await _qa_apply_problems(
                 probs, batch, pairs_dict, translator, cache, qa_log, check_status,
-                update_glossary, modpack_root)
+                update_glossary, modpack_root, ds_action, ds_retry,
+                qa_keys=api_keys, qa_provider=provider, qa_model=model_text,
+                qa_base_url=custom_base_url, qa_temperature=qa_temperature,
+                phase_label="retry")
             retranslated_pairs.extend(new_retrans)
 
         # Deterministic glossary-compliance pass: pairs where a pinned term
@@ -4096,26 +5406,145 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         for batch in batches:
             flagged_all.extend(_qa_glossary_violations(batch, vanilla_gloss, modpack_terms))
         if flagged_all:
-            qa_log(f"[QA] glossary pre-check flagged {len(flagged_all)} pair(s) — arbitrating...")
-            arb_prompt = _qa_glossary_compliance_prompt(flagged_all, lang_name)
+            # Нит 1 (m11236): chunk the arbitration — flagged pairs in
+            # batches of _QA_ARB_CHUNK through a phase-1-style workerpool
+            # (one key per worker, health-aware). One giant 278-pair call
+            # blew the 90s ceiling and crippled verdicts (>5%); chunked
+            # parallel calls keep the arbitration under the timeout.
+            arb_batches = [flagged_all[i:i + _QA_ARB_CHUNK]
+                           for i in range(0, len(flagged_all), _QA_ARB_CHUNK)]
+            n_arb_batches = len(arb_batches)
+            qa_log(f"[QA] glossary pre-check flagged {len(flagged_all)} pair(s) — "
+                   f"arbitrating ({n_arb_batches} batch(es) of up to {_QA_ARB_CHUNK})...")
+            arb_queue: "asyncio.Queue[int]" = asyncio.Queue()
+            for bi in range(n_arb_batches):
+                arb_queue.put_nowait(bi)
+            arb_requeued: set = set()
+            arb_results: List[Optional[List[dict]]] = [None] * n_arb_batches
+            n_arb_workers = min(n_arb_batches, len(api_keys))
+            arb_prompt_cache: Dict[int, str] = {}
+
+            async def arb_worker(worker_idx: int):
+                while True:
+                    # ТЗ-health п.2: re-select the worker key per batch so a
+                    # benched key hands its queue items to live workers.
+                    candidates = [k for k in api_keys if not health_is_benched(k)]
+                    if not candidates:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    key = candidates[worker_idx % len(candidates)]
+                    try:
+                        bi = arb_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    chunk = arb_batches[bi]
+                    arb_prompt = arb_prompt_cache.get(bi)
+                    if arb_prompt is None:
+                        arb_prompt = _qa_glossary_compliance_prompt(chunk, lang_name)
+                        arb_prompt_cache[bi] = arb_prompt
+                    qa_log(f"[QA] arb: arbitrating {len(chunk)} pair(s) "
+                           f"(batch {bi + 1}/{n_arb_batches}, key ...{key[-4:]})...")
+                    try:
+                        arb_results[bi] = await _qa_scan_pairs(
+                            chunk, arb_prompt, [key], provider, model_text,
+                            custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
+                            qa_temperature, phase="arb", batch_label=str(bi + 1))
+                    except AbortException:
+                        raise
+                    except Exception as e:
+                        if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
+                            qa_log(f"[QA] arb worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
+                            arb_queue.put_nowait(bi)
+                            return
+                        if health_is_benched(key):
+                            qa_log(f"[QA] arb worker key ...{key[-4:]} benched — requeueing batch {bi + 1}")
+                            arb_queue.put_nowait(bi)
+                            return
+                        if bi not in arb_requeued:
+                            arb_requeued.add(bi)
+                            arb_queue.put_nowait(bi)
+                        else:
+                            _QA_COUNTERS["warnings"] += 1
+                            qa_log(f"[QA] arb batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
+                        return
+
             try:
-                arb_raw = await _qa_scan_pairs(
-                    flagged_all, arb_prompt, api_keys, provider, model_text,
-                    custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
-                    qa_temperature, phase="arb", batch_label="0")
+                async with asyncio.TaskGroup() as tg:
+                    for w in range(n_arb_workers):
+                        tg.create_task(arb_worker(w))
+            except BaseExceptionGroup as eg:
+                aborts = [e for e in eg.exceptions if isinstance(e, AbortException)]
+                if aborts:
+                    raise aborts[0]
+                raise
+            # fallback drain: every batch that did not finish (worker died
+            # on a benched/rejected key) goes once through ALL live keys.
+            while not arb_queue.empty():
+                bi = arb_queue.get_nowait()
+                chunk = arb_batches[bi]
+                qa_log(f"[QA] arb: arbitrating {len(chunk)} pair(s) "
+                       f"(batch {bi + 1}/{n_arb_batches}, fallback all keys)...")
+                try:
+                    live_keys = [k for k in api_keys if not health_is_benched(k)]
+                    if not live_keys:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    arb_results[bi] = await _qa_scan_pairs(
+                        chunk, arb_prompt_cache.get(bi)
+                        if arb_prompt_cache.get(bi) is not None
+                        else _qa_glossary_compliance_prompt(chunk, lang_name),
+                        live_keys, provider, model_text,
+                        custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
+                        qa_temperature, phase="arb", batch_label=str(bi + 1))
+                except AbortException:
+                    raise
+                except Exception as e:
+                    msg = str(e)
+                    if ("keys failed" in msg or "keys unavailable" in msg
+                            or "server unavailable" in msg):
+                        raise
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] arb batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — kept the existing translations")
+                    arb_results[bi] = []
+            # Нит 1: pre-init so a failure inside the try leaves the pairs
+            # flowing to Tier C repair instead of NameError-skipping the phase.
+            arb_probs: List[dict] = []
+            try:
+                arb_raw: List[dict] = []
+                for bi in range(n_arb_batches):
+                    part = arb_results[bi]
+                    if part:
+                        # ТЗ3-3: unwrap the {id, problems:[...]} custom schema —
+                        # the arbitration path must NEVER go silent on raw material
+                        arb_raw.extend(_qa_flatten_raw_verdicts(part))
                 arb_drop: Dict[str, int] = {}
                 arb_probs = _qa_normalize_problems(arb_raw or [], flagged_all, arb_drop)
                 arb_summary = _qa_drop_summary("arbitration", arb_drop, flagged_all)
                 if arb_summary:
                     qa_log(f"[QA] glossary arbitration: {arb_summary}")
-                # all arbitration verdicts are soft TERM_INCONSISTENT
-                # (enforce) and are applied through the standard path
+                # ТЗ2.2-2: demoted no-category arbitration verdicts keep
+                # their warning semantics even here — the forced
+                # TERM_INCONSISTENT/soft rewrite below must not resurrect
+                # them into applied fixes.
+                arb_probs = [p for p in arb_probs if p.get("severity") != "warning"]
+                # all remaining arbitration verdicts are soft
+                # TERM_INCONSISTENT (enforce) and are applied through the
+                # standard path. ТЗ3.1-addendum B: GLOSSARY_AWKWARD (branch
+                # (c): the pin itself is wrong) keeps its category — the
+                # pin correction in _qa_add_glossary_pins keys off it.
                 for prob in arb_probs:
-                    prob["category"] = "TERM_INCONSISTENT"
+                    if prob.get("category") != "GLOSSARY_AWKWARD":
+                        prob["category"] = "TERM_INCONSISTENT"
                     prob["severity"] = "soft"
+                for p in arb_probs:
+                    if p.get("id") is not None and p.get("severity") != "warning":
+                        ds_llm.setdefault(p["id"], []).append(
+                            {"category": p.get("category"), "severity": p.get("severity"),
+                             "issue": p.get("issue"), "suggested": p.get("suggested")})
                 new_retrans = await _qa_apply_problems(
                     arb_probs, flagged_all, pairs_dict, translator, cache, qa_log,
-                    check_status, update_glossary, modpack_root)
+                    check_status, update_glossary, modpack_root, ds_action, ds_retry,
+                    qa_keys=api_keys, qa_provider=provider, qa_model=model_text,
+                    qa_base_url=custom_base_url, qa_temperature=qa_temperature,
+                    phase_label="arb-retry")
                 retranslated_pairs.extend(new_retrans)
                 qa_log(f"[QA] glossary arbitration: {len(arb_probs)} verdict(s), "
                        f"{_QA_COUNTERS['soft_fixed']} soft fix(es) total")
@@ -4124,16 +5553,102 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             except Exception as e:
                 _QA_COUNTERS["warnings"] += 1
                 qa_log(f"[QA] glossary arbitration failed ({repr(e)[:120]}) — kept the existing translations")
+            # ТЗ3-3: flagged pairs the arbitration did NOT resolve with an
+            # applied verdict become Tier C repair candidates — the
+            # arbitration path must NEVER go silent on raw material.
+            arb_applied_ids = {p["id"] for p in arb_probs} if flagged_all else set()
+            for fp in flagged_all:
+                if fp["id"] not in arb_applied_ids:
+                    crippled_all.append({
+                        "id": fp["id"],
+                        "source": fp["source"],
+                        "translation": pairs_dict.get(fp["source"], fp["translation"]),
+                        "note": "glossary pin missing from the translation; missed_pins="
+                                + json.dumps([[en, ru] for en, ru in fp.get("missed_pins", [])], ensure_ascii=False),
+                        "_batch_index": -1,
+                    })
 
-        # Pass 2: ONE rescan of the retranslated (hard) strings. A problem
-        # found here is reported as a warning — never a third retranslation.
-        if retranslated_pairs:
+        # Tier C repair batch (ТЗ3-3): crippled verdicts (no category / no
+        # suggested) + unresolved arbitration pairs -> ONE cheap repair call.
+        # The machine prepared the candidates; the model only fills in the
+        # schema. Repaired verdicts go through the standard normalize+apply.
+        if crippled_all:
+            # dedup by pair id (a pair may arrive from several sources)
+            seen_ids = set()
+            repair_pairs: List[dict] = []
+            for c in crippled_all:
+                pid = c.get("id")
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                # ids are PER-BATCH (phase numbering); keep the batch context
+                repair_pairs.append(c)
+            qa_log(f"[QA] tier C repair: {len(repair_pairs)} crippled verdict(s) — asking the auditor to re-issue them in full schema...")
+            candidates = []
+            for c in repair_pairs:
+                bi = c.get("_batch_index", -1)
+                if 0 <= bi < len(batches):
+                    pair = next((p for p in batches[bi] if p["id"] == c["id"]), None)
+                else:
+                    pair = None
+                if pair is None:
+                    # arbitration leftovers carry their own source/translation
+                    pair = c
+                candidates.append({
+                    "id": c["id"],
+                    "source": pair["source"],
+                    "translation": pair.get("translation") if isinstance(pair, dict) else c.get("translation"),
+                    "note": c.get("issue") or c.get("note") or "",
+                })
+            try:
+                repair_prompt = _qa_repair_prompt(candidates, lang_name)
+                repair_raw = await _qa_scan_pairs(
+                    candidates, repair_prompt, api_keys, provider, model_text,
+                    custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
+                    qa_temperature, phase="repair", batch_label="0")
+                repair_raw = _qa_flatten_raw_verdicts(repair_raw or [])
+                repair_drop: Dict[str, int] = {}
+                repair_probs = _qa_normalize_problems(repair_raw, candidates, repair_drop)
+                repair_summary = _qa_drop_summary("tier C repair", repair_drop, candidates)
+                if repair_summary:
+                    qa_log(f"[QA] tier C repair: {repair_summary}")
+                # repaired verdicts apply against the candidates batch
+                for p in repair_probs:
+                    if p.get("id") is not None and p.get("severity") != "warning":
+                        ds_llm.setdefault(p["id"], []).append(
+                            {"category": p.get("category"), "severity": p.get("severity"),
+                             "issue": p.get("issue"), "suggested": p.get("suggested")})
+                new_retrans = await _qa_apply_problems(
+                    repair_probs, candidates, pairs_dict, translator, cache, qa_log,
+                    check_status, update_glossary, modpack_root, ds_action, ds_retry,
+                    qa_keys=api_keys, qa_provider=provider, qa_model=model_text,
+                    qa_base_url=custom_base_url, qa_temperature=qa_temperature,
+                    phase_label="repair-retry")
+                retranslated_pairs.extend(new_retrans)
+                qa_log(f"[QA] tier C repair: {len(repair_probs)} verdict(s) re-issued")
+            except AbortException:
+                raise
+            except Exception as e:
+                _QA_COUNTERS["warnings"] += 1
+                qa_log(f"[QA] tier C repair failed ({repr(e)[:120]}) — kept the existing translations")
+
+        # Pass 2: ONE rescan of the CHANGED strings (hard retranslations +
+        # soft fixes — Speed-pack п.5). A problem found here is reported as
+        # a warning — never a third retranslation. Dedup by pair id: the
+        # same pair may be touched by several verdicts, but it is rescanned
+        # once with its latest translation.
+        soft_changed = _QA_COUNTERS.get("soft_changed_pairs") or {}
+        changed_ids = {p["id"] for p in retranslated_pairs} | set(soft_changed)
+        if changed_ids:
+            by_id_pairs = {p["id"]: p for p in pairs}
             refreshed = [
-                {"id": p["id"], "source": p["source"],
-                 "translation": pairs_dict.get(p["source"], p["translation"])}
-                for p in retranslated_pairs
+                {"id": pid, "source": by_id_pairs[pid]["source"],
+                 "translation": pairs_dict.get(by_id_pairs[pid]["source"], by_id_pairs[pid]["translation"])}
+                for pid in sorted(changed_ids) if pid in by_id_pairs
             ]
-            qa_log(f"[QA] pass-2: rescanning {len(refreshed)} retranslated pair(s)...")
+            n_hard = len({p["id"] for p in retranslated_pairs} & {r["id"] for r in refreshed})
+            qa_log(f"[QA] pass-2: rescanning {len(refreshed)} changed pair(s) "
+                   f"({n_hard} retranslated, {len(refreshed) - n_hard} soft-fixed)...")
             problems2 = await _qa_scan_pairs(
                 refreshed, qa_prompt, api_keys, provider, model_text,
                 custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
@@ -4149,9 +5664,69 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             if not p2_probs:
                 qa_log("[QA] pass-2: clean — retranslations passed the rescan")
 
+        # ТЗ3-5 dual-run proof (updated by Speed-pack п.3): machine-caught
+        # pairs are excluded from the LLM scan BY DESIGN, so the direct
+        # overlap is no longer measurable — the matrix now reports the split
+        # of the corpus between the deterministic channel and phase 1.
+        if machine_all or llm_caught_ids:
+            overlap = len(llm_caught_ids)
+            qa_log(f"[QA] catch-matrix: machine {len(machine_all)} pair(s) deterministic; "
+                   f"LLM scanned {len(llm_pairs)} pair(s) in phase 1, flagged {len(flagged_ids)}; "
+                   f"{overlap} late LLM verdict(s) on machine pair(s) dropped")
+
+        # --- Dataset final pass (ТЗ-dataset) --------------------------------
+        # One record per pair, INCLUDING the clean ones (negative examples
+        # calibrate the future decision model). final is written at the END
+        # so pass-2 and tier C results are already reflected in pairs_dict.
+        if ds_writer is not None:
+            try:
+                for p in pairs:
+                    pid = p["id"]
+                    mt = mt_snapshot.get(pid)
+                    final = pairs_dict.get(p["source"])
+                    record = {
+                        "pair_id": pid,
+                        "source": p["source"],
+                        "mt": mt,
+                        "final": (final if final != mt else None),
+                        "machine": ds_machine.get(pid, []),
+                        "llm": ds_llm.get(pid, []),
+                        "action": ds_action.get(pid, "clean"),
+                        "retry": ds_retry.get(pid),
+                    }
+                    ds_writer.add(record)
+                n = ds_writer.finish()
+                if n:
+                    qa_log(f"[QA] dataset: {ds_writer.path} ({n} records)")
+            except Exception as e:
+                qa_log(f"[QA] dataset final pass failed: {repr(e)[:120]} — the run is unaffected")
+
+        # Speed-pack п.4: persist the verdict-cache state. A pair whose
+        # final action is clean (no tier touched it; the full phase-2 scan
+        # itself cleared the phase-1 flags) is cached as clean and skips the
+        # LLM scan next run. Everything else is marked dirty so it always
+        # comes back to the scan.
+        if qa_vcache is not None and qa_cfg_hash:
+            try:
+                marked_clean = 0
+                for p in pairs:
+                    pid = p["id"]
+                    k = QAVerdictCache.key(p["source"], mt_snapshot.get(pid, p["translation"]), qa_cfg_hash)
+                    if ds_action.get(pid) is None:
+                        qa_vcache.mark(k, "clean")
+                        marked_clean += 1
+                    else:
+                        qa_vcache.mark(k, "dirty")
+                qa_log(f"[QA] verdict cache: {marked_clean} pair(s) marked clean, "
+                       f"{len(pairs) - marked_clean} marked dirty")
+            except Exception as e:
+                qa_log(f"[QA] verdict cache mark failed: {repr(e)[:120]} — the run is unaffected")
+            finally:
+                qa_vcache.close()
+
         qa_log(f"[QA] scanned {scanned} pairs: hard {_QA_COUNTERS['hard']}, "
                f"soft-fixed {_QA_COUNTERS['soft_fixed']}, warnings {_QA_COUNTERS['warnings']}, "
-               f"glossary +{_QA_COUNTERS['glossary']}")
+               f"glossary +{_QA_COUNTERS['glossary']}, unresolved {_QA_COUNTERS['unresolved']}")
 
     except AbortException:
         raise
@@ -4159,18 +5734,288 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         qa_log(f"[QA] phase skipped: {repr(e)[:200]} — translations are kept as is.")
 
 
+def _qa_norm_same(a: str, b: str) -> bool:
+    """ТЗ3.1-5: normalized 'the retry returned the same string' check.
+
+    Formatting codes, casing and whitespace collapse are ignored — if the
+    retranslation is equivalent to what was already there, a second retry is
+    wasted tokens; the pair goes to the unresolved list instead.
+    """
+    def norm(s):
+        s = FMT_CODE_PATTERN.sub('', str(s or ""))
+        return " ".join(s.split()).casefold()
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+async def _qa_constraint_retry(source: str, constraint: str, translator, qa_log,
+                               check_status, dictionary) -> Optional[str]:
+    """ТЗ3.1-2: retranslate ONE string with the auditor's finding attached.
+
+    The model reliably produces quality ANALYSIS but rarely a valid final
+    string — so the analysis becomes a CONSTRAINT on the retry instead of
+    being dropped. The main translator's prompt is temporarily extended
+    with the fix directive (same save/restore pattern the glossary suffix
+    uses); the result still passes sanitize + dictionary + the deterministic
+    validation gate in the caller. Returns the new translation or None.
+    """
+    saved_prompt = getattr(translator, "prompt", None)
+    directive = (
+        "\n\nCRITICAL FIX DIRECTIVE for the next string: " + (constraint or "").strip()[:400]
+        + "\nReturn ONLY the full corrected string; keep every formatting code"
+          " (&l, &r, &#RRGGBB), tag (#id:paths) and number exactly as in the source."
+    )
+    try:
+        if saved_prompt is not None:
+            translator.prompt = saved_prompt + directive
+        res = await translator.translate([source], qa_log, check_status, context="qa-constraint-retry")
+    finally:
+        if saved_prompt is not None:
+            translator.prompt = saved_prompt
+    if not res:
+        return None
+    new_tr = apply_dictionary(sanitize_with_original(source, res[0]), dictionary)
+    return new_tr or None
+
+
+def _qa_extract_glossary_pins(issue: str, suggested: Optional[str], source: str) -> List[Tuple[str, str]]:
+    """ТЗ3.1-3: harvest (en, ru) glossary candidates from ADVICE TEXT.
+
+    The auditor's analysis routinely contains the canonical pair in prose
+    ("'lime' should be 'лаймовый'", "Standardize 'Wither' as 'Визер'",
+    "pins Визер", "unify as Слитки Техниума"). Extracting the pair turns
+    an advice-only finding into an additive glossary pin — the convergence
+    loop the tool needs. Filters: en must be latin (2-60 chars), ru must
+    contain cyrillic, and the en term must actually occur in THIS pair's
+    source (otherwise the pin does not belong to this finding).
+    """
+    text = " ".join(x for x in (issue, suggested) if isinstance(x, str) and x.strip())
+    if not text:
+        return []
+    pins = []
+    seen = set()
+
+    def _add(en: str, ru: str) -> None:
+        en = (en or "").strip().strip(".,:;!?()").strip()
+        ru = (ru or "").strip().strip(".,:;!?()").strip()
+        if not en or not ru or (en, ru) in seen:
+            return
+        if not LATIN_CHARS.search(en) or CYRILLIC_CHARS.search(en):
+            return
+        if not CYRILLIC_CHARS.search(ru) or LATIN_CHARS.search(ru) and len(LATIN_CHARS.findall(ru)) > 3:
+            # ru must be mostly cyrillic; stray latin artifacts (codes) allowed
+            return
+        # the pin must belong to THIS pair: en lenient-matches the source
+        words = en.split()
+        if not words:
+            return
+        try:
+            body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in words)
+            pat = r"(?<![A-Za-z])" + body + r"(?![A-Za-z])"
+            if not re.search(pat, FMT_CODE_PATTERN.sub('', source or ""), re.IGNORECASE):
+                return
+        except re.error:
+            return
+        seen.add((en, ru))
+        pins.append((en, ru))
+
+    Q = r"['\"\u2018\u2019\u201c\u201d]"
+    INNER = r"([^'\"\u2018\u2019\u201c\u201d]{2,60}?)"
+    MARK = (r"(?:should(?:\s+be)?|unify(?:\s+(?:as|with))?|standardiz[ei](?:\s+(?:as|into))?"
+            r"|pins?\s+(?:[A-Za-z]+(?:\s+[A-Za-z]+)?\s+)?(?:as)?|must\s+be|=|→|—)")
+    # P1: 'X' ... marker ... 'Y'  (the marker sits BETWEEN the tokens)
+    p1 = re.compile(Q + INNER + Q + r"[\s\S]{0,300}?" + MARK +
+                    r"[\s\S]{0,60}?" + Q + INNER + Q, re.IGNORECASE)
+    # P2: marker ... 'X' (as) 'Y'  ("unify 'Wither' as 'Визер'")
+    p2 = re.compile(MARK + r"[\s\S]{0,40}?" + Q + INNER + Q +
+                    r"[\s\S]{0,40}?(?:as|is|→|=|—)?[\s\S]{0,12}?" + Q + INNER + Q,
+                    re.IGNORECASE)
+    # P3: bare arrow pairs, no quotes at all: "Пин Book→Книга",
+    # "Crude Blast Furnace → Примитивная доменная печь was mistranslated"
+    p3 = re.compile(r"([A-Za-z][A-Za-z0-9 .'-]{1,40}?)\s*(?:→|—|->|=>)\s*"
+                    r"([А-Яа-яЁё][А-Яа-яЁё0-9 ,'-]{1,40}?)"
+                    r"(?=\s*\(|$|[\n.;,!?]|\s+[A-Za-z][a-z])")
+    # P4: quoted 'X' → 'Y' with the arrow itself between the quotes
+    p4 = re.compile(Q + INNER + Q + r"\s*(?:→|—|->|=>|=)\s*" + Q + INNER + Q)
+
+    def _scan(pattern, chunk: str, trim: bool = False) -> None:
+        # overlapping scan: a rejected latin→latin pairing must not eat the
+        # tokens, or the real 'X'→'Y' pair starting mid-way is lost (the
+        # non-overlapping finditer jumps past the second token).
+        pos = 0
+        while True:
+            m = pattern.search(chunk, pos)
+            if not m:
+                return
+            en = m.group(1)
+            ru = m.group(2)
+            if trim:
+                # bare-arrow prose tail: "Book→Книга не использован" — cut
+                # the ru candidate at the first comment stop-word so the
+                # pin is the TERM, not the whole clause.
+                stop = re.search(r"\s+(?:не|нет|вместо|отсутствует\w*|пропущен\w*|в|на|для|и)\s", " " + ru + " ", re.IGNORECASE)
+                if stop:
+                    ru = ru[:max(0, stop.start())].rstrip()
+            _add(en, ru)
+            pos = m.end(1)  # advance past the EN token: overlapping re-pairs
+            # of the SAME ru with shorter en prefixes ("Blast Furnace",
+            # "Furnace") are noise, not new pins.
+
+    _scan(p1, text)
+    _scan(p2, text)
+    _scan(p3, text, trim=True)
+    _scan(p4, text)
+    return pins[:3]
+
+
+def _qa_add_glossary_pins(pin_candidates: List[Tuple[str, str]], pid, qa_log,
+                          update_glossary: bool, modpack_root,
+                          allow_correction: bool = False) -> None:
+    """ТЗ3.1-3: additive glossary pins from verdicts and advice texts.
+
+    Structured glossary_fix and prose-extracted pairs share this ONE
+    additive path: existing pins are NEVER overwritten silently; a
+    conflicting suggestion is logged as a visible pin conflict (ТЗ2.2-3),
+    an identical pin is acknowledged quietly.
+
+    ТЗ3.1-addendum B: when `allow_correction` is set — the verdict is an
+    explicit GLOSSARY_AWKWARD arbitration finding (branch (c): the pinned
+    translation itself is wrong/awkward) — the conflicting pin is
+    CORRECTED in place with a visible log line instead of dead-ending in
+    a warning. Quiet additive pinning of new terms is untouched.
+    """
+    if not update_glossary or not pin_candidates:
+        return
+    gloss = ModpackGlossary(modpack_root)
+    for en, ru in pin_candidates:
+        en = (en or "").strip()
+        ru = (ru or "").strip()
+        if not en or not ru:
+            continue
+        if en not in gloss.terms:
+            gloss.terms[en] = ru
+            gloss.save()
+            _QA_COUNTERS["glossary"] += 1
+            qa_log(f"[QA] glossary pin: {en} -> {ru}")
+        elif gloss.terms.get(en) != ru:
+            # ТЗ3.1-addendum B: an explicit GLOSSARY_AWKWARD verdict (branch
+            # (c)) means the auditor looked at the PIN itself and says it is
+            # wrong. The pin conflict is no longer a dead end: replace the
+            # pin so the loop converges, with a visible log line. Any other
+            # conflicting suggestion (not an awkward-pin verdict) stays the
+            # ТЗ2.2-3 visible conflict — the additive guarantee holds.
+            if allow_correction:
+                old = gloss.terms[en]
+                gloss.terms[en] = ru
+                gloss.save()
+                _QA_COUNTERS["glossary"] += 1
+                qa_log(f"[QA] glossary pin corrected: {en} -> {ru} (was \"{old}\")")
+            else:
+                _QA_COUNTERS["warnings"] += 1
+                qa_log(f"[QA] glossary pin conflict: '{en}' pinned as "
+                       f"\"{gloss.terms[en]}\" but the auditor suggests "
+                       f"\"{ru}\" — kept the existing pin, review it manually")
+        else:
+            qa_log(f"[QA] glossary term '{en}' already pinned — kept the existing translation")
+
+
 async def _qa_apply_problems(problems: List[dict], batch: List[dict], pairs_dict: Dict[str, str],
                              translator, cache, qa_log, check_status,
-                             update_glossary: bool, modpack_root) -> List[dict]:
+                             update_glossary: bool, modpack_root,
+                             ds_action: Optional[Dict[int, str]] = None,
+                             ds_retry: Optional[Dict[int, dict]] = None,
+                             qa_keys: Optional[List[str]] = None,
+                             qa_provider: str = "",
+                             qa_model: str = "",
+                             qa_base_url: Optional[str] = None,
+                             qa_temperature: Optional[float] = None,
+                             phase_label: str = "retry") -> List[dict]:
     """Apply one batch of auditor problems to the pairs dict.
 
     Returns the list of retranslated (hard) pairs for the caller's single
     pass-2 rescan. Counters live in the module-level _QA_COUNTERS (reset by
     the phase runner; the QA phase is awaited sequentially, no reentrancy).
+    ds_action/ds_retry (ТЗ-dataset) are filled in place when provided.
+
+    Speed-pack п.1: when the batch has ≥2 constraint-retry candidates and QA
+    transport params are given, ALL single-string retries are replaced by
+    ONE batch call (_qa_scan_retries, {"id": fixed} map). Each fix passes
+    the SAME deterministic gates as the single path; an id missing/invalid
+    in the batch answer falls back to the existing single retry.
     """
     by_id = {p["id"]: p for p in batch}
     dictionary = getattr(translator, "dictionary", None) or {}
     retranslated = []
+
+    def ds_set(pid, action: str, retry: Optional[dict] = None):
+        if ds_action is not None:
+            ds_action[pid] = action
+        if ds_retry is not None and retry is not None:
+            ds_retry[pid] = retry
+
+    # --- Speed-pack п.1: pre-pass — collect the constraint of every verdict
+    # that would trigger a retry, then batch-retranslate them in ONE call
+    # (chunks of _QA_RETRY_CHUNK through _qa_scan_retries). The per-verdict
+    # loop below then consumes batch_fixes and falls back to the single
+    # retry only for ids the batch missed or failed to fix validly.
+    retry_meta: Dict[int, dict] = {}   # pid -> {severity, category, constraint, source, old_tr}
+    for prob in problems:
+        pid = prob.get("id")
+        pair = by_id.get(pid)
+        if not pair:
+            continue
+        severity = (prob.get("severity") or "soft").lower()
+        if severity == "warning":
+            continue
+        suggested = prob.get("suggested")
+        if severity == "soft" and suggested and _qa_validate_suggestion(pair["source"], suggested):
+            continue  # applied directly below, no retry needed
+        issue = (prob.get("issue") or "")[:200]
+        constraint = issue
+        if suggested:
+            constraint = f"{issue} Auditor's suggested fix: {suggested}" if issue else str(suggested)
+        retry_meta[pid] = {
+            "severity": severity,
+            "category": (prob.get("category") or "").upper(),
+            "constraint": constraint,
+            "source": pair["source"],
+            "old_tr": pairs_dict.get(pair["source"]) or pair.get("translation") or "",
+        }
+    batch_fixes: Dict[int, str] = {}
+    if len(retry_meta) >= 2 and qa_keys and qa_model:
+        retry_candidates = [
+            {"id": pid, "source": m["source"],
+             "current_translation": m["old_tr"],
+             "constraint": m["constraint"][:400]}
+            for pid, m in retry_meta.items()
+        ]
+        qa_log(f"[QA] {phase_label}: {len(retry_candidates)} fix(es) — one batch retry...")
+        # chunks of _QA_RETRY_CHUNK per call, all keys per chunk
+        fixed_map: Dict[int, str] = {}
+        for ci in range(0, len(retry_candidates), _QA_RETRY_CHUNK):
+            chunk = retry_candidates[ci:ci + _QA_RETRY_CHUNK]
+            try:
+                part = await _qa_scan_retries(
+                    chunk, _qa_retry_prompt(), qa_keys, qa_provider, qa_model,
+                    qa_base_url, qa_log, check_status, qa_temperature,
+                    phase=phase_label, batch_label=f"{ci // _QA_RETRY_CHUNK}")
+            except AbortException:
+                raise
+            except Exception as e:
+                qa_log(f"[QA] {phase_label}: batch retry chunk failed ({repr(e)[:120]}) "
+                       f"— all {len(chunk)} candidate(s) fall back to single retries")
+                part = {}
+            fixed_map.update(part)
+        for pid, raw in fixed_map.items():
+            if pid not in retry_meta:
+                continue  # hallucinated id — ignore
+            src = retry_meta[pid]["source"]
+            new_tr = apply_dictionary(sanitize_with_original(src, raw), dictionary)
+            if new_tr:
+                batch_fixes[pid] = new_tr
+        missing = len(retry_meta) - len(batch_fixes)
+        if missing:
+            qa_log(f"[QA] {phase_label}: batch retry returned {len(batch_fixes)} valid fix(es), "
+                   f"{missing} candidate(s) fall back to single retries")
 
     for prob in problems:
         pid = prob.get("id")
@@ -4178,66 +6023,169 @@ async def _qa_apply_problems(problems: List[dict], batch: List[dict], pairs_dict
         if not pair:
             continue
         source = pair["source"]
+        old_tr = pairs_dict.get(source) or pair.get("translation") or ""
         severity = (prob.get("severity") or "soft").lower()
         category = (prob.get("category") or "").upper()
         issue = (prob.get("issue") or "")[:200]
         suggested = prob.get("suggested")
 
+        if severity == "warning":
+            # ТЗ2.2-2: demoted no-category verdict — log the raw finding,
+            # apply nothing. It is informational only; glossary_fix is
+            # discarded too (there is no category to attribute it to).
+            _QA_COUNTERS["warnings"] += 1
+            qa_log(f"[QA] #{pid} [no category/soft] {issue} (source: \"{source[:60]}\") — no safe fix, warning only")
+            ds_set(pid, "warning")
+            continue
+
+        # ТЗ3.1-3: harvest glossary pins from the ADVICE TEXT itself —
+        # before any retry, so even a failed retranslation still converges
+        # the glossary for the NEXT run. Structured glossary_fix wins;
+        # extracted prose pins are additive-only (existing pins never
+        # overwritten) exactly like the structured ones.
+        pin_candidates: List[Tuple[str, str]] = []
+        gf = prob.get("glossary_fix")
+        if isinstance(gf, dict) and gf.get("en") and gf.get("ru"):
+            pin_candidates.append((str(gf["en"]).strip(), str(gf["ru"]).strip()))
+        if update_glossary:
+            pin_candidates.extend(_qa_extract_glossary_pins(issue, suggested, source))
+
+        # ТЗ3.1-2: build the fix directive from whatever the auditor gave —
+        # a valid suggested string, or the analysis as a retry constraint.
+        constraint = issue
+        if suggested:
+            constraint = f"{issue} Auditor's suggested fix: {suggested}" if issue else str(suggested)
+
         if severity == "hard":
             _QA_COUNTERS["hard"] += 1
             qa_log(f"[QA] #{pid} [{category}/hard] {issue} (source: \"{source[:60]}\") — retranslating...")
-            try:
-                if check_status:
-                    await check_status()
-                res = await translator.translate([source], qa_log, check_status, context="qa-retry")
-                new_tr = apply_dictionary(sanitize_with_original(source, res[0]), dictionary)
-                if new_tr:
+            # Speed-pack п.1: prefer the batch fix; single retry only as fallback
+            new_tr = batch_fixes.get(pid)
+            if new_tr and _qa_norm_same(new_tr, old_tr):
+                new_tr = None  # equivalent string — treat as a miss below
+            if new_tr is None:
+                try:
+                    if check_status:
+                        await check_status()
+                    new_tr = await _qa_constraint_retry(source, constraint, translator, qa_log,
+                                                        check_status, dictionary)
+                except AbortException:
+                    raise
+                except Exception as e:
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] #{pid} retranslation failed ({repr(e)[:100]}) — kept the existing translation")
+                    ds_set(pid, "warning")
+                    _qa_add_glossary_pins(pin_candidates, pid, qa_log, update_glossary, modpack_root,
+                                          allow_correction=category == "GLOSSARY_AWKWARD")
+                    continue
+            if new_tr:
+                if _qa_norm_same(new_tr, old_tr):
+                    # ТЗ3.1-5: the retry returned the equivalent string —
+                    # a second retry is wasted tokens; surface the pair
+                    # instead of silently looping.
+                    _QA_COUNTERS["unresolved"] += 1
+                    qa_log(f"[QA] #{pid} unresolved: retry returned the same string "
+                           f"\"{str(new_tr)[:60]}\" (source: \"{source[:60]}\") — needs glossary/manual fix")
+                    ds_set(pid, "unresolved", {"constraint": constraint[:400], "result": str(new_tr)[:2000]})
+                else:
                     pairs_dict[source] = new_tr
                     if cache is not None:
                         cache.save_batch({source: new_tr})
                     qa_log(f"[QA] #{pid} retranslated -> \"{str(new_tr)[:80]}\"")
-                retranslated.append(pair)
+                    retranslated.append(pair)
+                    ds_set(pid, "retranslated", {"constraint": constraint[:400], "result": str(new_tr)[:2000]})
+            else:
+                _QA_COUNTERS["unresolved"] += 1
+                qa_log(f"[QA] #{pid} unresolved: retranslation returned nothing "
+                       f"(source: \"{source[:60]}\") — needs glossary/manual fix")
+                ds_set(pid, "unresolved", {"constraint": constraint[:400], "result": None})
+            _qa_add_glossary_pins(pin_candidates, pid, qa_log, update_glossary, modpack_root,
+                                  allow_correction=category == "GLOSSARY_AWKWARD")
+            continue
+
+        # --- soft ---
+        applied = False
+        if suggested and _qa_validate_suggestion(source, suggested):
+            pairs_dict[source] = suggested
+            if cache is not None:
+                cache.save_batch({source: suggested})
+            _QA_COUNTERS["soft_fixed"] += 1
+            # Speed-pack п.5: soft fixes are rescanned in pass-2 too
+            _QA_COUNTERS.setdefault("soft_changed_pairs", {})[pid] = source
+            qa_log(f"[QA] #{pid} [{category}/soft] fixed -> \"{str(suggested)[:80]}\" (source: \"{source[:60]}\")")
+            applied = True
+            ds_set(pid, "soft_fixed", {"constraint": constraint[:400], "result": str(suggested)[:2000]})
+        else:
+            # ТЗ3.1-2: advice ≠ replacement. A missing/invalid suggested
+            # string is NOT a dead end anymore: the finding (issue or the
+            # failed suggestion) becomes a CONSTRAINT on ONE retry through
+            # the main translator; the result is gated by the same
+            # deterministic validation before it may replace the string.
+            if suggested:
+                qa_log(f"[QA] #{pid} [{category}/soft] suggestion failed validation "
+                       f"(codes/numbers/tags) (source: \"{source[:60]}\") — retrying with the finding as a constraint...")
+            else:
+                qa_log(f"[QA] #{pid} [{category}/soft] advice without a replacement string "
+                       f"(source: \"{source[:60]}\") — retrying with the finding as a constraint...")
+            # Speed-pack п.1: prefer the batch fix; single retry only as fallback
+            new_tr = batch_fixes.get(pid)
+            if new_tr and (_qa_norm_same(new_tr, old_tr) or not _qa_validate_suggestion(source, new_tr)):
+                new_tr = None  # equivalent or invalid — treat as a miss
+            if new_tr is None:
+                try:
+                    if check_status:
+                        await check_status()
+                    new_tr = await _qa_constraint_retry(source, constraint, translator, qa_log,
+                                                        check_status, dictionary)
+                except AbortException:
+                    raise
+                except Exception as e:
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] #{pid} constraint retry failed ({repr(e)[:100]}) — kept the existing translation")
+                    ds_set(pid, "warning")
+                    _qa_add_glossary_pins(pin_candidates, pid, qa_log, update_glossary, modpack_root,
+                                          allow_correction=category == "GLOSSARY_AWKWARD")
+                    continue
+            try:
+                if new_tr and _qa_validate_suggestion(source, new_tr) and not _qa_norm_same(new_tr, old_tr):
+                    pairs_dict[source] = new_tr
+                    if cache is not None:
+                        cache.save_batch({source: new_tr})
+                    _QA_COUNTERS["soft_fixed"] += 1
+                    # Speed-pack п.5: soft fixes are rescanned in pass-2 too
+                    _QA_COUNTERS.setdefault("soft_changed_pairs", {})[pid] = source
+                    qa_log(f"[QA] #{pid} [{category}/soft] constraint retry fixed -> \"{str(new_tr)[:80]}\"")
+                    applied = True
+                    ds_set(pid, "soft_fixed", {"constraint": constraint[:400], "result": str(new_tr)[:2000]})
+                elif new_tr and _qa_norm_same(new_tr, old_tr):
+                    _QA_COUNTERS["unresolved"] += 1
+                    qa_log(f"[QA] #{pid} unresolved: constraint retry returned the same string "
+                           f"\"{str(new_tr)[:60]}\" (source: \"{source[:60]}\") — needs glossary/manual fix")
+                    ds_set(pid, "unresolved", {"constraint": constraint[:400], "result": str(new_tr)[:2000]})
+                else:
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] #{pid} [{category}/soft] constraint retry did not produce a valid fix "
+                           f"(source: \"{source[:60]}\") — not applied")
+                    ds_set(pid, "warning", {"constraint": constraint[:400],
+                                            "result": str(new_tr)[:2000] if new_tr else None})
             except AbortException:
                 raise
             except Exception as e:
                 _QA_COUNTERS["warnings"] += 1
-                qa_log(f"[QA] #{pid} retranslation failed ({repr(e)[:100]}) — kept the existing translation")
-            continue
+                qa_log(f"[QA] #{pid} constraint retry failed ({repr(e)[:100]}) — kept the existing translation")
+                ds_set(pid, "warning")
 
-        # --- soft ---
-        if suggested:
-            if _qa_validate_suggestion(source, suggested):
-                pairs_dict[source] = suggested
-                if cache is not None:
-                    cache.save_batch({source: suggested})
-                _QA_COUNTERS["soft_fixed"] += 1
-                qa_log(f"[QA] #{pid} [{category}/soft] fixed -> \"{str(suggested)[:80]}\" (source: \"{source[:60]}\")")
-            else:
-                _QA_COUNTERS["warnings"] += 1
-                qa_log(f"[QA] #{pid} [{category}/soft] suggestion failed validation (codes/numbers/tags) (source: \"{source[:60]}\") — not applied")
-        else:
-            _QA_COUNTERS["warnings"] += 1
-            qa_log(f"[QA] #{pid} [{category}/soft] {issue} (source: \"{source[:60]}\") — no safe fix, warning only")
-
-        gf = prob.get("glossary_fix")
-        if update_glossary and isinstance(gf, dict) and gf.get("en") and gf.get("ru"):
-            en = str(gf["en"]).strip()
-            ru = str(gf["ru"]).strip()
-            if en and ru:
-                gloss = ModpackGlossary(modpack_root)
-                if en not in gloss.terms:
-                    gloss.terms[en] = ru
-                    gloss.save()
-                    _QA_COUNTERS["glossary"] += 1
-                    qa_log(f"[QA] glossary + {en} = {ru}")
-                else:
-                    qa_log(f"[QA] glossary term '{en}' already pinned — kept the existing translation")
+        _qa_add_glossary_pins(pin_candidates, pid, qa_log, update_glossary, modpack_root,
+                              allow_correction=category == "GLOSSARY_AWKWARD")
+        if not applied and severity != "hard":
+            pass  # counters/логи выше уже покрыли все исходы
     return retranslated
 
 
 def _qa_reset_counters():
     _QA_COUNTERS.clear()
-    _QA_COUNTERS.update({"hard": 0, "soft_fixed": 0, "warnings": 0, "glossary": 0})
+    _QA_COUNTERS.update({"hard": 0, "soft_fixed": 0, "warnings": 0, "soft_changed_pairs": {},
+                         "glossary": 0, "unresolved": 0})
 
 
 # Categories the TOOL escalates to hard regardless of what the model said
@@ -4288,9 +6236,12 @@ def _qa_normalize_problems(raw: List[dict], batch: List[dict],
     - coerce verdict ids: "574" (str) / 573.0 (float) -> int (ТЗ2.1-3).
 
     drop_stats (optional out-param) counts WHY each raw object was dropped:
-    invalid_id (id not in this batch even after coercion), duplicate
-    (same id+category seen before), no_category, and not_object — so the
-    caller can log a per-batch breakdown instead of a black box.
+    invalid_id (id not in this batch even after coercion) and duplicate
+    (same id+category seen before) — so the caller can log a per-batch
+    breakdown instead of a black box. ТЗ2.2-2: no-category verdicts are
+    NOT drops anymore; they are demoted to warning-level entries with the
+    raw issue text and reach _qa_apply_problems, which logs them as
+    warnings (nothing is applied).
     """
     by_id = {p["id"]: p for p in batch}
     seen = set()
@@ -4300,6 +6251,10 @@ def _qa_normalize_problems(raw: List[dict], batch: List[dict],
             if drop_stats is not None:
                 drop_stats["not_object"] = drop_stats.get("not_object", 0) + 1
             continue
+        # ТЗ3.1-1: one synonym-tolerant canonicalizer for EVERY phase —
+        # main / arb / repair / pass-2 all flow through this single point,
+        # so the floating-schema whack-a-mole is dead here once and for all.
+        item = _qa_canonical_keys(item)
         pid_raw = item.get("id")
         pid = _qa_coerce_pid(pid_raw)
         if pid not in by_id:
@@ -4311,8 +6266,24 @@ def _qa_normalize_problems(raw: List[dict], batch: List[dict],
             continue
         category = str(item.get("category") or "").strip().upper()
         if not category:
-            if drop_stats is not None:
-                drop_stats["no_category"] = drop_stats.get("no_category", 0) + 1
+            # ТЗ2.2-2: the finding must not die because the model omitted
+            # the category. Demote to a warning-level entry carrying the raw
+            # issue text; _qa_apply_problems logs it and applies nothing
+            # (suggested/glossary_fix are discarded — without a category
+            # there is no telling what they would even fix).
+            key = (pid, "")
+            if key in seen:
+                if drop_stats is not None:
+                    drop_stats["duplicate"] = drop_stats.get("duplicate", 0) + 1
+                continue
+            seen.add(key)
+            issue = str(item.get("issue") or "").strip()
+            if not issue:
+                pair = by_id[pid]
+                issue = (f"uncategorized verdict: source=\"{str(pair.get('source'))[:60]}\" "
+                         f"translation=\"{str(pair.get('translation'))[:60]}\"")
+            out.append({"id": pid, "category": "", "severity": "warning",
+                        "issue": issue, "suggested": None, "glossary_fix": None})
             continue
         key = (pid, category)
         if key in seen:

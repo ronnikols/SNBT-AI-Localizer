@@ -146,6 +146,8 @@ class ConfigManager:
         self.qa_update_glossary: bool = True
         self.qa_batch_size: int = 40
         self.qa_temperature: float = 0.0
+        self.qa_dataset: bool = True
+        self.qa_verdict_cache: bool = True
 
         self.load_from_settings()
 
@@ -242,6 +244,8 @@ class ConfigManager:
             self.qa_temperature = max(0.0, min(2.0, float(s.value("qa_temperature", 0.0))))
         except (TypeError, ValueError):
             self.qa_temperature = 0.0
+        self.qa_dataset = (s.value("qa_dataset", True) in (True, "true"))
+        self.qa_verdict_cache = (s.value("qa_verdict_cache", True) in (True, "true"))
         if self.qa_provider and self.qa_provider not in self.AVAILABLE_PROVIDERS and self.qa_provider != "Mixed Providers":
             logging.getLogger("snbt_localizer.cli").warning(
                 f"Unknown saved QA provider '{self.qa_provider}', ignoring it"
@@ -287,6 +291,8 @@ class ConfigManager:
         s.setValue("qa_update_glossary", self.qa_update_glossary)
         s.setValue("qa_batch_size", self.qa_batch_size)
         s.setValue("qa_temperature", self.qa_temperature)
+        s.setValue("qa_dataset", self.qa_dataset)
+        s.setValue("qa_verdict_cache", self.qa_verdict_cache)
         s.setValue("resource_pack_mode", self.resource_pack_mode)
         s.setValue("quest_dir", str(self.quest_dir) if self.quest_dir else "")
         s.sync()
