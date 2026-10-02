@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import json
 import ctypes
 import httpx
 import logging
@@ -1120,9 +1121,11 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     from core import reset_request_timeout
     reset_request_timeout()
     # ТЗ-health: one CLI run = one health window (stats + benching).
-    from core import health_reset, health_mark_start
+    # ТЗ-v4 C7-C9: QA run scope (one dataset + run totals) opens here too.
+    from core import health_reset, health_mark_start, qa_run_start, qa_run_finish
     health_reset()
     health_mark_start()
+    qa_run_start()
     file_progress = {idx: 0.0 for idx in range(total_files)}
     _mp_glossary_terms = None  # pinned by the pre-scan, carried into the JSON5 phase
 
@@ -1135,14 +1138,17 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         if getattr(config, "qa_enabled", False):
             qa_provider = (getattr(config, "qa_provider", "") or
                             getattr(config, "utility_provider", "") or provider)
-            qa_keys = api_keys
-            if qa_provider and qa_provider != "Mixed Providers":
-                pool_keys = config.get_api_keys(qa_provider)
-                if pool_keys:
-                    qa_keys = pool_keys
+            # ТЗ-v4.2 4.1/4.3: ONE pool — the audit runs on the provider
+            # pool, exactly like the translation workerpool. The private QA
+            # key field is gone; extras (a judge's personal key) are ADDED.
+            qa_keys = []
+            extra_qa_keys = []
             qa_model = getattr(config, "qa_model", "") or getattr(config, "utility_model", "") or model or ""
             qa_params = {
+                # 4.3: kept empty for backward compatibility — a non-empty
+                # legacy field is ignored by the phase with a clear log line.
                 "keys": qa_keys,
+                "extra_keys": extra_qa_keys,
                 "provider": qa_provider,
                 "model": qa_model,
                 "custom_base_url": (config.custom_base_url or None) if qa_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None,
@@ -1151,6 +1157,9 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 "temperature": float(getattr(config, "qa_temperature", 0.0) or 0.0),
                 "dataset": bool(getattr(config, "qa_dataset", True)),
                 "verdict_cache": bool(getattr(config, "qa_verdict_cache", True)),
+                "judges": json.loads(getattr(config, "qa_judges", "[]") or "[]"),
+                "jury_threshold": int(getattr(config, "qa_jury_threshold", 2) or 2),
+                "provider_pool": {prov: list(keys) for prov, keys in config.api_keys_pool.items()},
                 "modpack_root": find_modpack_root_from_quest_dir(quest_dirs[0]) if quest_dirs else None,
                 "lang_name": lang_name,
             }
@@ -1295,6 +1304,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         from core import close_shared_httpx_clients
         await close_shared_httpx_clients()
         logging.getLogger("snbt_localizer.cli").error("Критическая ошибка: все ключи невалидны. Перевод прерван.")
+        qa_run_finish(logger=lambda msg: (
+            logging.getLogger("snbt_localizer.cli").info(msg), print(msg)))
         return 1
     # ТЗ-health п.4: per-key [POOL] stats into the console and app.log
     # at the end of the SNBT batch (CLI prints via logging + stdout).
@@ -1354,6 +1365,8 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 )
             except Exception as e:
                 logging.getLogger("snbt_localizer.cli").error(f"JSON translation failed for {base_dir}: {e}")
+                qa_run_finish(logger=lambda msg: (
+                    logging.getLogger("snbt_localizer.cli").info(msg), print(msg)))
                 return 1
 
         if resource_pack_mode:
@@ -1378,6 +1391,15 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         logging.getLogger("snbt_localizer.cli").warning(
             "ВНИМАНИЕ: Флаг -r / --resource-pack передан, но в модпаке не найдена папка KubeJS (kubejs/assets/). Ресурс-пак не был создан."
         )
+
+    # ТЗ-v4 C8/C9: ONE run-wide [QA] total + jury line for the whole run
+    # (SNBT batch AND every JSON/JSON5 lang dir), into the console and
+    # app.log.
+    try:
+        qa_run_finish(logger=lambda msg: (
+            logging.getLogger("snbt_localizer.cli").info(msg), print(msg)))
+    except Exception:
+        pass
 
     from core import close_shared_httpx_clients
     await close_shared_httpx_clients()

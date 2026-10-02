@@ -1,6 +1,8 @@
 PyQt6>=6.5.0
 httpx>=0.25.0
 aiofiles>=23.0.0
+pymorphy3>=2.0.0
+pymorphy3-dicts-ru
 pytest>=7.4.0
 pytest-qt>=4.2.0
 pytest-asyncio>=0.21.0

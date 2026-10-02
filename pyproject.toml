@@ -17,6 +17,8 @@ dependencies = [
     "PyQt6>=6.4.0",
     "httpx>=0.24.0",
     "aiofiles>=23.1.0",
+    "pymorphy3>=2.0.0",
+    "pymorphy3-dicts-ru",
 ]
 
 [project.scripts]

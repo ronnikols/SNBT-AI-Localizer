@@ -464,8 +464,12 @@ def test_normalize_problems():
 # --- 13. БАГ 3a: deterministic glossary-compliance machine -------------------
 def test_glossary_compliance_machine():
     GV = core._qa_glossary_violations
+    # ТЗ-v4.3 B.4: ONLY the modpack glossary is enforced; the vanilla file is
+    # an arbitration witness, never a flag source. The pins live in the
+    # modpack argument now (the `vanilla` dict below is deliberately inert).
     vanilla = {"Lead": "Свинец", "Crafting Table": "Верстак"}
-    modpack = {"Cloche": "Колпак", "Space Parts": "Космические детали"}
+    modpack = {"Lead": "Свинец", "Crafting Table": "Верстак",
+               "Cloche": "Колпак", "Space Parts": "Космические детали"}
     batch = [
         {"id": 0, "source": "Craft the Lead Ingot", "translation": "Создай Свинцовый слиток"},
         {"id": 1, "source": "Simple Cloche farm", "translation": "Простая Колпак ферма"},
@@ -477,6 +481,8 @@ def test_glossary_compliance_machine():
     assert [p["id"] for p in flagged] == [0, 3], flagged
     assert flagged[0]["missed_pins"] == [("Lead", "Свинец")]
     assert flagged[1]["missed_pins"] == [("Space Parts", "Космические детали")]
+    # the vanilla dict alone may not flag anything
+    assert GV(batch, vanilla, {}) == []
     # prompt builds as a JSON array of pairs with int ids + missed_pins
     pr = core._qa_glossary_compliance_prompt(flagged, "Russian")
     assert "Glossary compliance arbitration" in pr and "TERM_INCONSISTENT" in pr
@@ -510,6 +516,7 @@ def test_glossary_arbitration_applies_fix():
     try:
         log, lines = collect_logs(None)
         tr = make_translator_stub()
+        # ТЗ-v4.3 B.4: the pre-check enforces the MODPACK glossary only
         tr.modpack_glossary_terms = {"Lead": "Свинец", "Cloche": "Колпак"}
         cache = FakeCache()
         cfg = qa_config(tempfile.gettempdir())
@@ -961,7 +968,8 @@ def test_tz3_tier_c_repair_end_to_end(tmp_path=None):
             core._qa_send = orig_send
 
         # Speed-pack п.5: tier C repair fixes make pass-2 rescan the changed pairs.
-        assert phases == ["phase1", "main", "arb", "repair", "pass2"], phases
+        # ТЗ-Жюри: phase-1 phase label now carries the judge tag ('phase1-j1').
+        assert phases == ["phase1-j1", "main", "arb", "repair", "pass2"], phases
         assert pairs["Make &lLead&r (2x)"] == "Сделай &lСвинец&r (2x)", pairs
         assert pairs["Strange phrase here"] == "Переформулированная фраза тут", pairs
         assert any("tier C repair" in l for l in logs), logs
@@ -1135,10 +1143,14 @@ def test_dataset_e2e_records(tmp_path):
         llm = [{"id": 1, "category": "STYLE", "severity": "soft",
                 "issue": "style fix", "suggested": "&lИмпортёр подключает&r"}]
 
-        async def fake_send(batch, prompt, keys, provider, model, custom_base_url, logger, check_status, temperature=None, ids_only=False, **kwargs):
+        async def fake_send(batch, prompt, keys, provider, model, custom_base_url, logger, check_status, temperature=None, ids_only=False, phase="main", **kwargs):
             if ids_only:
                 return [{"id": p["id"]} for p in batch]
-
+            # ТЗ-v4 D10: pass-2 rescans the retranslated pair; this legacy
+            # test asserts the retranslate result is the FINAL one, so the
+            # fake answers "clean" for the pass-2 scan.
+            if phase == "pass2":
+                return []
             return llm if any(p["id"] == 1 for p in batch) else []
 
         orig_send = core._qa_send
@@ -1369,6 +1381,7 @@ def test_arb_chunks_of_40_and_parallel_keys():
     try:
         log, lines = collect_logs(None)
         tr = make_translator_stub()
+        # ТЗ-v4.3 B.4: the pre-check enforces the MODPACK glossary only
         tr.modpack_glossary_terms = {"Lead": "Свинец"}
         cache = FakeCache()
         cfg = qa_config(tempfile.gettempdir())
@@ -1418,6 +1431,7 @@ def test_arb_single_chunk_still_works():
     try:
         log, lines = collect_logs(None)
         tr = make_translator_stub()
+        # ТЗ-v4.3 B.4: the pre-check enforces the MODPACK glossary only
         tr.modpack_glossary_terms = {"Lead": "Свинец"}
         cache = FakeCache()
         cfg = qa_config(tempfile.gettempdir())

@@ -436,3 +436,38 @@ def test_key_verifier_worker(qtbot, monkeypatch):
     assert question in gui.TEST_QUESTIONS
 
 # ==================== v1.6.0: Local Contextual RAG Mod Scanner Tests ====================
+
+
+def test_key_verifier_worker_jury(qtbot, monkeypatch):
+    """Жюри-ключи тестируются с моделью каждого судьи; judge_results
+    копится по тегам; теги показываются в строке Judges."""
+    import gui
+
+    calls = []
+
+    async def fake_test(provider, key, model, question, timeout=20.0):
+        calls.append((provider, key, model))
+        if key == "j1k":
+            return ("Active", "Yes")
+        if key == "poolk":
+            return ("Invalid", "")
+        return ("Active", "ok")
+
+    monkeypatch.setattr(gui, "test_key_with_question", fake_test)
+    async def no_balance(provider, key, timeout=15.0):
+        return None
+    monkeypatch.setattr(gui, "fetch_provider_balance", no_balance)
+
+    worker = gui.KeyVerifierWorker(
+        [("main1", "OpenAI", "m")],
+        judge_specs=[("j1k", "Crusoe Cloud", "j1m", "j1"),
+                     ("poolk", "RunInfra", "j2m", "j2")])
+    with qtbot.waitSignal(worker.verification_complete, timeout=5000) as blocker:
+        worker.start()
+    results = blocker.args[0]
+    assert results == {"main1": "Active"}
+    assert worker.judge_results == {"j1": ("Active", "Yes"),
+                                    "j2": ("Invalid", "")}
+    # жюри-спеки ушли с моделями судей, не с моделью главного экрана
+    assert ("Crusoe Cloud", "j1k", "j1m") in calls
+    assert ("RunInfra", "poolk", "j2m") in calls

@@ -39,17 +39,18 @@ def collect_logs():
 
 # --- п.1: timeout ladder ------------------------------------------------------
 
-def test_ladder_90s_base():
-    assert REQUEST_TIMEOUT_LADDER[0] == 90.0
-    assert max(REQUEST_TIMEOUT_LADDER) <= 150.0
+def test_ladder_180s_base():
+    # Юзер m15675: ответ модели ждём 180с, а не 90с.
+    assert REQUEST_TIMEOUT_LADDER[0] == 180.0
+    assert max(REQUEST_TIMEOUT_LADDER) <= 240.0
     assert HTTP_CONNECT_TIMEOUT == 10.0
 
 
 def test_shared_client_timeout():
     client = core.get_shared_httpx_client()
-    assert client.timeout.read == 90.0
+    assert client.timeout.read == 180.0
     assert client.timeout.connect == 10.0
-    assert core._QA_HTTP_TIMEOUT == 90.0
+    assert core._QA_HTTP_TIMEOUT == 180.0
 
 
 # --- п.2: benching ------------------------------------------------------------
@@ -103,7 +104,7 @@ async def test_track_call_timing_line():
         await asyncio.sleep(0.01)
         return "ok"
     res = await health_track_call("k_live_TT01", "translation", "14/33",
-                                 ok, log_fn, timeout_s=90.0)
+                                 ok, log_fn, timeout_s=180.0)
     assert res == "ok"
     timing = [l for l in lines if l.startswith("[TIMING] translation batch 14/33")]
     assert timing, lines
@@ -118,13 +119,13 @@ async def test_track_call_timeout_line():
     # One timeout: logged, key NOT benched yet.
     with pytest.raises(httpx.ReadTimeout):
         await health_track_call("k_hang_HG99", "QA main", "2/5",
-                                hang, log_fn, timeout_s=90.0)
-    assert any(l.startswith("[TIMEOUT] QA main batch 2/5 on key ...HG99 after 90s") for l in lines), lines
+                                hang, log_fn, timeout_s=180.0)
+    assert any(l.startswith("[TIMEOUT] QA main batch 2/5 on key ...HG99 after 180s") for l in lines), lines
     assert not health_is_benched("k_hang_HG99")
     # Second consecutive timeout: bench line appears.
     with pytest.raises(httpx.ReadTimeout):
         await health_track_call("k_hang_HG99", "QA main", "2/5",
-                                hang, log_fn, timeout_s=90.0)
+                                hang, log_fn, timeout_s=180.0)
     assert any("[POOL] key ...HG99 benched" in l for l in lines), lines
     assert health_is_benched("k_hang_HG99")
 
@@ -137,7 +138,7 @@ async def test_track_call_failure_line():
                                    response=httpx.Response(500))
     with pytest.raises(httpx.HTTPStatusError):
         await health_track_call("k_500_BB55", "translation", "3/33",
-                                fail, log_fn, timeout_s=90.0)
+                                fail, log_fn, timeout_s=180.0)
     assert any("— failed" in l for l in lines), lines
 
 

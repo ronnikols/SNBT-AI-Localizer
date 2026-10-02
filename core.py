@@ -176,12 +176,13 @@ def get_temperature() -> float:
     return _TEMPERATURE
 
 
-# Timeout ladder (ТЗ-health п.1): read timeout 90s base; a timeout escalates
-# to 120s, then 150s. The ceiling stays ≤90s ONLY for the base rung by spec;
-# the ladder exists because reasoning models slow down on large batches —
-# the top rung must stay tight (≤150s) so a hanging request can never
-# silence the log for 5 minutes. Connect timeout is a flat 10s everywhere.
-REQUEST_TIMEOUT_LADDER = [90.0, 120.0, 150.0]
+# Timeout ladder: read timeout 180s base (raised from 90s at the user's
+# request — reasoning models routinely need more than 90s on large batches);
+# a timeout escalates to 210s, then 240s. The ladder exists because reasoning
+# models slow down on large batches — the top rung must stay bounded so a
+# hanging request can never silence the log for minutes on end.
+# Connect timeout is a flat 10s everywhere.
+REQUEST_TIMEOUT_LADDER = [180.0, 210.0, 240.0]
 HTTP_CONNECT_TIMEOUT = 10.0
 _timeout_ladder_level = 0
 
@@ -219,8 +220,10 @@ _HEALTH_RESET_LOCK = asyncio.Lock()
 
 def health_reset() -> None:
     """New run: clear all per-key stats, bench state and the wall clock."""
+    global _POOL_SIZE
     _KEY_HEALTH.clear()
     _RUN_WALL_START.clear()
+    _POOL_SIZE = 0
 
 
 def health_mark_start() -> None:
@@ -233,6 +236,109 @@ def _key_suffix(key: str) -> str:
     return key[-4:] if len(key) > 4 else key
 
 
+def _http_error_detail(resp) -> str:
+    """Provider error message from an HTTP error response, for logs/exceptions.
+
+    A bare '404' hides the real cause (bad model id, paused deployment);
+    OpenAI-compatible providers put it in error.message/error.code.
+    """
+    try:
+        body = resp.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "").strip()
+            code = str(err.get("code") or "").strip()
+            if msg:
+                return f"{msg[:180]} (code {code})" if code else msg[:180]
+        if isinstance(body, dict) and body.get("message"):
+            return str(body["message"])[:180]
+    except Exception:
+        try:
+            text = resp.text.strip()
+            if text:
+                return text[:180]
+        except Exception:
+            pass
+    return ""
+
+
+# ТЗ-v4 A1: single sanitation gate for EVERY API key the tool stores or
+# sends. Strip whitespace/newlines; reject non-ASCII outright (a key with a
+# non-ASCII tail like "\nКлюч 2:" serializes into the Authorization header
+# and every request dies with UnicodeEncodeError); warn on odd lengths
+# (Crusoe keys are 82 chars — a common paste error truncates them).
+def sanitize_api_key(key, logger=None, origin: str = "") -> str:
+    """Return the cleaned key, or '' when the key must be rejected.
+
+    Non-ASCII content and embedded newlines are paste errors: the key is
+    dropped (not stored) and the caller is told via logger. Returns ''
+    for rejected/empty keys so callers can simply skip falsy results.
+    """
+    raw = str(key or "")
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    if not cleaned.isascii():
+        tail = cleaned[-10:]
+        msg = (f"[KEYS] rejected non-ASCII API key{f' ({origin})' if origin else ''}: "
+               f"...{tail!r} — paste error, fix the key")
+        logging.getLogger("snbt_localizer.core").warning(msg)
+        if logger:
+            try:
+                logger(msg)
+            except Exception:
+                pass
+        return ""
+    if any(ch in cleaned for ch in ("\n", "\r", "\t")):
+        # inner newlines survived the strip -> a multi-key paste like
+        # "cr_key\nКлюч 2: ..." landed in one field; keep nothing.
+        msg = (f"[KEYS] rejected API key with embedded whitespace{f' ({origin})' if origin else ''}")
+        logging.getLogger("snbt_localizer.core").warning(msg)
+        if logger:
+            try:
+                logger(msg)
+            except Exception:
+                pass
+        return ""
+    if len(cleaned) not in (32, 36, 40, 51, 56, 64, 82, 164) and len(cleaned) < 30:
+        msg = (f"[KEYS] suspicious API key length {len(cleaned)}{f' ({origin})' if origin else ''} "
+               f"(...{_key_suffix(cleaned)}) — check the paste")
+        logging.getLogger("snbt_localizer.core").warning(msg)
+        if logger:
+            try:
+                logger(msg)
+            except Exception:
+                pass
+    return cleaned
+
+
+def sanitize_api_keys(keys, logger=None, origin: str = "") -> List[str]:
+    """Sanitize a list of keys, dropping rejects; dedup, order preserved."""
+    seen = set()
+    out = []
+    for k in (keys or []):
+        k = sanitize_api_key(k, logger=logger, origin=origin)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def health_set_pool_size(n: int) -> None:
+    """ТЗ-v4.1 F12.1: remember how many keys this run has.
+
+    With a SINGLE key a timeout must not bench it — that turns 'slow but
+    working' into 'no keys at all'. The key goes on a short cooldown
+    instead and is retried.
+
+    ТЗ-v4.2 4.4: ONE pool for the whole run (translation + QA share the
+    provider pool), so the size is a single number again — the F12.2
+    per-role split is gone with the separate QA pool.
+    """
+    global _POOL_SIZE
+    _POOL_SIZE = max(0, int(n or 0))
+
+
 def health_note_request(key: str, duration: float, timed_out: bool = False,
                         failed: bool = False) -> None:
     """Record one finished request on a key.
@@ -240,12 +346,16 @@ def health_note_request(key: str, duration: float, timed_out: bool = False,
     ТЗ-health п.2: TWO consecutive timeouts OR hard failures (5xx / 402 /
     403-level errors) on the same key bench it for the rest of the run.
     A success resets the consecutive counter.
+
+    ТЗ-v4.1 F12.1: when the run has a pool of ONE key, a timeout never
+    benches — it sets a 2-minute cooldown instead (unbench + continue).
     """
     entry = _KEY_HEALTH.setdefault(key, {
         "requests": 0, "total": 0.0, "max": 0.0,
         "timeouts": 0, "fails": 0, "benched": False,
-        "consec": 0,
+        "consec": 0, "cooldown_until": 0.0,
     })
+    entry.setdefault("cooldown_until", 0.0)
     entry["requests"] += 1
     entry["total"] += max(0.0, duration)
     entry["max"] = max(entry["max"], max(0.0, duration))
@@ -257,13 +367,40 @@ def health_note_request(key: str, duration: float, timed_out: bool = False,
         entry["consec"] += 1
     else:
         entry["consec"] = 0
-    if not entry["benched"] and entry["consec"] >= 2:
-        entry["benched"] = True
+        entry["cooldown_until"] = 0.0
+    if entry["benched"]:
+        return
+    if entry["consec"] < 2:
+        return
+    if _POOL_SIZE == 1 and timed_out and entry["consec"] < _SINGLE_KEY_MAX_TIMEOUTS:
+        # Single-key run: cooldown, never bench (F12.1) — 'slow, not dead'.
+        # _POOL_SIZE == 0 means "unknown" and keeps the classic benching.
+        # The consecutive counter KEEPS growing, so an endpoint that never
+        # answers at all still dies by the cap below (12.4б) instead of
+        # looping on cooldowns forever.
+        entry["cooldown_until"] = time.time() + _SINGLE_KEY_COOLDOWN
+        return
+    entry["benched"] = True
+
+
+def health_cooldown_remaining(key: str) -> float:
+    """Seconds this key is still cooling down (F12.1); 0 when ready."""
+    entry = _KEY_HEALTH.get(key)
+    if not entry:
+        return 0.0
+    return max(0.0, float(entry.get("cooldown_until") or 0.0) - time.time())
 
 
 def health_is_benched(key: str) -> bool:
+    """Is this key out of rotation?
+
+    ТЗ-v4.2 4.4: ONE pool — a benched key is benched everywhere (translation
+    and QA share the provider pool), so the F12.2 role-scoped bench is gone.
+    """
     entry = _KEY_HEALTH.get(key)
-    return bool(entry and entry["benched"])
+    if not entry:
+        return False
+    return bool(entry["benched"])
 
 
 def health_bench_now(key: str, reason: str = "consecutive failures") -> None:
@@ -271,7 +408,7 @@ def health_bench_now(key: str, reason: str = "consecutive failures") -> None:
     entry = _KEY_HEALTH.setdefault(key, {
         "requests": 0, "total": 0.0, "max": 0.0,
         "timeouts": 0, "fails": 0, "benched": False,
-        "consec": 0,
+        "consec": 0, "cooldown_until": 0.0,
     })
     if not entry["benched"]:
         entry["benched"] = True
@@ -287,7 +424,8 @@ def health_summary_lines() -> List[str]:
     for key, e in _KEY_HEALTH.items():
         total_requests += e["requests"]
         total_timeouts += e["timeouts"]
-        benched += 1 if e["benched"] else 0
+        if e["benched"]:
+            benched += 1
         avg = (e["total"] / e["requests"]) if e["requests"] else 0.0
         parts = [f"[POOL] key ...{_key_suffix(key)}: {e['requests']} request(s)"]
         if e["requests"]:
@@ -321,6 +459,13 @@ def health_totals() -> dict:
 
 _KEY_HEALTH: Dict[str, dict] = {}
 _RUN_WALL_START: Dict[str, float] = {}
+# ТЗ-v4.1 F12.1: one-key pools are "slow, not dead". Size 0/unknown keeps the
+# old benching; 1 switches timeouts to a cooldown+unbench cycle.
+_POOL_SIZE: int = 0
+_SINGLE_KEY_COOLDOWN: float = 120.0
+# 12.4б: how many consecutive timeouts a LONE endpoint may accumulate before
+# even a single-key run gives up honestly ("all timeouts → abort").
+_SINGLE_KEY_MAX_TIMEOUTS: int = 4
 
 
 def _health_log(logger, message: str) -> None:
@@ -361,9 +506,15 @@ def health_track_call(key: str, phase_label: str, batch_label: str,
             health_note_request(key, dt, timed_out=True)
             _health_log(logger, f"[TIMEOUT] {phase_label} batch {batch_label} "
                          f"on key ...{_key_suffix(key)} after {ceiling:.0f}s")
+            # F12.1: a single-key pool cools the key down instead of benching.
             if health_is_benched(key):
                 _health_log(logger, f"[POOL] key ...{_key_suffix(key)} benched "
                              "(2 consecutive timeouts)")
+            else:
+                cd = health_cooldown_remaining(key)
+                if cd:
+                    _health_log(logger, f"[POOL] key ...{_key_suffix(key)} cooling down "
+                                 f"{cd:.0f}s (single-key pool — not benched)")
             raise
         except httpx.HTTPStatusError:
             dt = time.time() - t0
@@ -377,7 +528,7 @@ def health_track_call(key: str, phase_label: str, batch_label: str,
     return _wrapped()
 
 
-def get_shared_httpx_client(timeout: float = 90.0) -> httpx.AsyncClient:
+def get_shared_httpx_client(timeout: float = 180.0) -> httpx.AsyncClient:
     global _shared_httpx_client_no_loop
     try:
         loop = asyncio.get_running_loop()
@@ -870,6 +1021,12 @@ async def test_key_with_question(provider: str, api_key: str, model: str, questi
             err_code, err_msg = "", ""
         if err_code == "hosted_model_paused" or "paused" in err_msg.lower():
             return "Model Paused", err_msg[:120]
+        if code == 404:
+            # Deterministic model-id problem (unknown reasoning suffix like
+            # '/max' kept glued to the model, paused deployment, typo):
+            # surface the provider's own message instead of a bare
+            # 'Unreachable' the user cannot act on.
+            return "Model Unavailable", (_http_error_detail(e.response) or "model not available")
         return "Unreachable", ""
     except ValueError:
         return "Active", ""
@@ -1816,7 +1973,10 @@ def get_default_model(provider: str) -> str:
 # Reasoning-effort levels accepted in the "model/level" suffix syntax.
 # "off"/"none"/"disable" disable thinking, "default" sends no params,
 # anything else is passed through as reasoning_effort (provider-specific).
-REASONING_EFFORT_LEVELS = ["off", "none", "disable", "minimal", "low", "medium", "high", "xhigh", "default"]
+# "max" is a real level on some backends (RunInfra/DeepSeek): without it here
+# the suffix stays glued to the model id and the provider answers 404
+# ("not available as a verified deployment in this workspace").
+REASONING_EFFORT_LEVELS = ["off", "none", "disable", "minimal", "low", "medium", "high", "xhigh", "max", "default"]
 
 # Reasoning budget for Anthropic models when a level is requested:
 # the Anthropic API needs budget_tokens, not effort levels.
@@ -1975,13 +2135,9 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
 
 class UnifiedTranslator:
     def __init__(self, api_keys: List[str], provider: str, model: str, custom_context: str = "", target_lang_name: str = "Russian", target_lang_code: str = "ru_ru", mixed_pool: List[dict] = None, batch_size: int = 50, min_batch_size: int = 1, max_concurrent_requests: int = 10, custom_base_url: Optional[str] = None, modpack_root: Optional[Path] = None):
-        cleaned = []
-        seen = set()
-        for k in api_keys:
-            k = k.strip()
-            if k and k not in seen:
-                cleaned.append(k)
-                seen.add(k)
+        # ТЗ-v4 A1: the main pool passes the central sanitizer too — a
+        # non-ASCII key is dropped HERE, before it can poison requests.
+        cleaned = sanitize_api_keys(api_keys, origin=f"main/{provider}")
         self.api_keys = cleaned
         self.api_key = cleaned[0] if cleaned else ""
         self.provider = provider
@@ -1993,10 +2149,10 @@ class UnifiedTranslator:
         self.target_lang_name = target_lang_name
         self.target_lang_code = target_lang_code
         self.free_google = GoogleFreeTranslator()
-        # ТЗ-health п.1: per-request ceiling 90s for every provider (the
-        # attribute is informational; the real timeout flows through the
-        # shared client / ladder).
-        self.timeout = 90.0
+        # Per-request ceiling 180s for every provider (the attribute is
+        # informational; the real timeout flows through the shared client /
+        # ladder).
+        self.timeout = 180.0
         self.key_index = 0
         self.key_cooldown_until = {}
         self.key_backoff = {}
@@ -2063,6 +2219,14 @@ class UnifiedTranslator:
             "Glossary pins translate ONLY their matching source terms — never insert a pinned term into other positions. "
             "Keep the word spacing of untranslated Latin names exactly as in the source: if the source says 'Toms Storage' as two words, write 'Toms Storage', never merge it into one word."
         )
+        # ТЗ-v4 B6: one consistent register for the whole modpack. The user
+        # measured 633 вы vs 185 ты across the pack — a mixed register reads
+        # as sloppiness. Formal вы unless the string is explicitly casual.
+        if "рус" in (target_lang_name or "").lower() or "russ" in (target_lang_name or "").lower():
+            self.prompt += (
+                " Use one consistent register throughout the modpack: the formal "
+                "вы-form (unless the source text is explicitly casual speech)."
+            )
         if mod_context:
             self.prompt += mod_context
         self.provider_instances = {}
@@ -2277,6 +2441,12 @@ class UnifiedTranslator:
         if not self.mixed_pool:
             raise AbortException("No providers configured in mixed pool")
 
+        # ТЗ-v4.1 F12.1: declare the pool width here so a single-key run
+        # cools down instead of benching its only key. ТЗ-v4.2 4.4: there is
+        # ONE pool for the whole run — QA reuses these very keys, so this
+        # width is the QA width too.
+        health_set_pool_size(len(self.mixed_pool))
+
         # Lighter retry curve: quick first retries for transient errors, capped
         # hard so one bad chunk can no longer stall the run for minutes.
         BACKOFF_DELAYS = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0]
@@ -2298,6 +2468,17 @@ class UnifiedTranslator:
                 # are excluded from rotation for the rest of the run.
                 pool = [e for e in self.mixed_pool
                         if not health_is_benched(e["api_key"])]
+                if not pool and self.mixed_pool:
+                    # F12.1: a one-key pool never benches on timeouts — it
+                    # cools down. Wait out the cooldown instead of dying.
+                    cd = max((health_cooldown_remaining(e["api_key"])
+                              for e in self.mixed_pool), default=0.0)
+                    if cd > 0:
+                        if check_status:
+                            await check_status()
+                        logger(f"[POOL] single-key pool cooling down {cd:.0f}s — waiting")
+                        await asyncio.sleep(min(cd, 180.0))
+                        continue
                 if not pool:
                     raise AbortException(
                         "All API keys are benched (2+ consecutive timeouts/failures each). "
@@ -2365,9 +2546,9 @@ class UnifiedTranslator:
                     old_timeout = get_request_timeout()
                     new_timeout = escalate_request_timeout()
                     if new_timeout is None:
-                        # Ladder exhausted: even 500s was not enough. There is no
-                        # point rotating keys - the batch is simply too heavy for
-                        # this model. Abort with a clear explanation.
+                        # Ladder exhausted: even the top rung was not enough.
+                        # There is no point rotating keys - the batch is simply
+                        # too heavy for this model. Abort with a clear message.
                         logging.getLogger("snbt_localizer.core").error(
                             f"[{context}] Timeout exceeded even at {old_timeout:.0f}s on key ...{key_suffix}. Aborting."
                         )
@@ -2506,14 +2687,8 @@ class SNBTManager:
         self.cache.close()
 
     def count_translatable_strings(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool) -> int:
-        count = 0
         with open(filepath, 'r', encoding='utf-8') as f:
-            for line in f:
-                strings = _find_all_snbt_strings(line)
-                for s in strings:
-                    if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
-                        count += 1
-        return count
+            return self._count_translatable_in_content(f.read(), t_titles, t_subs, t_desc)
 
     def _is_translatable_key(self, key: str, t_titles: bool, t_subs: bool, t_desc: bool) -> bool:
         if key is None:
@@ -2527,18 +2702,52 @@ class SNBTManager:
         return False
 
     def _count_translatable_in_content(self, content: str, t_titles: bool, t_subs: bool, t_desc: bool) -> int:
-        strings = _find_all_snbt_strings(content)
-        count = 0
-        for s in strings:
-            if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
-                count += 1
-        return count
+        """Count the strings process_file will ACTUALLY translate.
+
+        Must mirror its collection exactly: whole-content scan (a line scan
+        loses the key of a multi-line "description: [ ... ]" block), the same
+        translatable-key filter, and the same is_valid gate — the counter is
+        the denominator of the progress bar, so anything counted here but not
+        translated (or vice versa) shows up as "8/7" and pins the bar at 100%.
+        Unique values, because process_file translates a set of values.
+        """
+        seen = set()
+        for s in _find_all_snbt_strings(content):
+            if not self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
+                continue
+            if self.is_valid(s['value']):
+                seen.add(s['value'])
+        return len(seen)
 
     def is_valid(self, text: str) -> bool:
         return len(text) > 1 and not ID_PATTERN.match(text) and not UUID_PATTERN.match(text) and not text.startswith('{')
 
     def find_quests_dir(self, start_path: Path) -> Path:
         return find_quests_dir(start_path)
+
+    def _make_prefetch(self, logger, check_status):
+        """ТЗ-v4.4: build the translation-time audit pipeline for this file.
+
+        Returns None whenever an overlap is impossible or unsafe — no QA
+        config, a skipped phase, no keys, an unsupported provider, or a
+        one-chunk file (nothing to overlap with). A None here simply means
+        the audit runs after the translation, exactly as it did before.
+        """
+        if not self.qa_params or self.skip_mode:
+            return None
+        qa_params = dict(self.qa_params)
+        qa_params.setdefault("modpack_root", self.modpack_root)
+        qa_params.setdefault("lang_name", self.translator.target_lang_name)
+        try:
+            pf = _QAPrefetch(qa_params, self.translator, logger, check_status,
+                             qa_params.get("lang_name"), self.batch_size)
+        except Exception as e:
+            logger(f"[QA] pipeline unavailable ({repr(e)[:100]}) — "
+                   f"the audit runs after the translation")
+            return None
+        if not pf.ready:
+            return None
+        return pf
 
     async def process_file(self, filepath: Path, t_titles: bool, t_subs: bool, t_desc: bool, logger=print, check_status=None, policy="complement", progress_callback=None) -> int:
         policy_banner = policy.lower().split('(')[0].strip()
@@ -2696,6 +2905,7 @@ class SNBTManager:
                 logger(f"Cache: {cache_hits} string(s) from cache")
             translated_ok = len(texts) - len(to_trans)
 
+        prefetch = None
         try:
             chunk_size = 5 if "Ollama" in self.provider else self.batch_size
             chunks_list = [to_trans[i:i+chunk_size] for i in range(0, len(to_trans), chunk_size)]
@@ -2712,6 +2922,24 @@ class SNBTManager:
                 chunk_queue.put_nowait(bi)
             pool_for_workers = list(getattr(self.translator, 'mixed_pool', []) or [None])
             requeued: set = set()
+            # Chunk-level progress state: chunks finish out of order but are
+            # still APPLIED in original order, so this only drives the bar.
+            progress_done = 0
+            progress_strings = 0
+            progress_lock = asyncio.Lock()
+
+            # ТЗ-v4.4: the audit starts DURING the translation. Every chunk
+            # that completes hands its pairs to the pipeline; the tail phase
+            # adopts whatever is ready when the file is done.
+            prefetch = self._make_prefetch(logger, check_status)
+            if prefetch is not None:
+                prefetch.start()
+                # Cache hits are audited by the tail phase today, so they
+                # must enter the pipeline too: adoption is all-or-nothing,
+                # and an unfed cache hit would throw the whole overlap away
+                # on any incremental (second) run.
+                if mapping:
+                    prefetch.feed((o, t) for o, t in mapping.items() if o and t)
 
             async def _translate_chunk(ci: int) -> Dict[str, str]:
                 chunk = chunks_list[ci]
@@ -2742,13 +2970,28 @@ class SNBTManager:
                 return new_map
 
             async def _translation_worker() -> None:
+                nonlocal progress_done, progress_strings
                 while True:
                     try:
                         ci = chunk_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
                     try:
-                        chunk_results[ci] = await _translate_chunk(ci)
+                        new_map = await _translate_chunk(ci)
+                        chunk_results[ci] = new_map
+                        # ТЗ-v4.4: completed batch -> audit pipeline.
+                        if prefetch is not None and new_map:
+                            prefetch.feed((o, t) for o, t in new_map.items() if o and t)
+                        # Progress fires as each chunk COMPLETES (not at the
+                        # end): with several keys the bar keeps moving while
+                        # the network is busy. Output order is unchanged —
+                        # chunks are still applied in original order below.
+                        async with progress_lock:
+                            progress_done += 1
+                            progress_strings += sum(1 for o, t in new_map.items() if o != t)
+                            if progress_callback:
+                                progress_callback(progress_done, total_chunks,
+                                                  translated_ok + progress_strings, len(to_trans))
                     except AbortException:
                         chunk_queue.put_nowait(ci)
                         raise
@@ -2762,6 +3005,7 @@ class SNBTManager:
                             logging.getLogger("snbt_localizer.core").warning(f"Chunk {ci+1} failed twice ({repr(e)[:120]}) — leaving its strings untranslated")
 
             async def _drain_chunks() -> None:
+                nonlocal progress_done, progress_strings
                 # Fallback: a worker died; finish the remaining chunks with all keys.
                 while True:
                     try:
@@ -2769,7 +3013,18 @@ class SNBTManager:
                     except asyncio.QueueEmpty:
                         return
                     try:
-                        chunk_results[ci] = await _translate_chunk(ci)
+                        new_map = await _translate_chunk(ci)
+                        chunk_results[ci] = new_map
+                        # ТЗ-v4.4: a chunk finished by the fallback drain is
+                        # just as completed as one finished by a worker.
+                        if prefetch is not None and new_map:
+                            prefetch.feed((o, t) for o, t in new_map.items() if o and t)
+                        async with progress_lock:
+                            progress_done += 1
+                            progress_strings += sum(1 for o, t in new_map.items() if o != t)
+                            if progress_callback:
+                                progress_callback(progress_done, total_chunks,
+                                                  translated_ok + progress_strings, len(to_trans))
                     except AbortException:
                         raise
                     except Exception as e:
@@ -2793,15 +3048,11 @@ class SNBTManager:
 
             # Apply + log in the ORIGINAL order (byte-identical output).
             for ci, new_map in enumerate(chunk_results):
-                if progress_callback:
-                    progress_callback(ci, total_chunks, translated_ok, len(to_trans))
                 if new_map is None:
                     continue
                 mapping.update(new_map)
                 self.cache.save_batch({o: t for o, t in new_map.items() if o != t}, modpack=self.modpack)
                 translated_ok += sum(1 for orig, trans in new_map.items() if orig != trans)
-                if progress_callback:
-                    progress_callback((ci + 1), total_chunks, translated_ok, len(to_trans))
                 for orig, trans in new_map.items():
                     if orig != trans:
                         provider_name = self.translator.provider
@@ -2814,20 +3065,37 @@ class SNBTManager:
             reason = f" ({e})" if str(e) else ""
             logger(f"Aborted processing of {filepath.name}{reason}.")
             logging.getLogger("snbt_localizer.core").warning(f"Aborted processing of {filepath.name}{reason}.")
+            # ТЗ-v4.4: a stopped file must not leave audit workers running.
+            if prefetch is not None:
+                prefetch.abort()
             raise
 
         # --- QA phase: audit the finished pairs BEFORE writing the file ----
         # Mutates `mapping` in place; a hard problem retranslates through the
         # main translator, a validated soft suggestion replaces the string.
         # Best-effort: any failure skips the phase (see _run_qa_phase_async).
+        # ТЗ-v4.4: the translation-time pipeline is drained first — its
+        # phase-1/phase-2 results are handed to the audit phase, which
+        # adopts them only when the coverage is complete.
         if self.qa_params and mapping and not self.skip_mode:
             qa_pairs = {s: t for s, t in mapping.items() if s and t}
             if qa_pairs:
                 qa_params = dict(self.qa_params)
                 qa_params.setdefault("modpack_root", self.modpack_root)
                 qa_params.setdefault("lang_name", self.translator.target_lang_name)
+                if prefetch is not None:
+                    await prefetch.finish()
+                    qa_params["prefetch"] = prefetch
                 await run_qa_phase_async(qa_pairs, qa_params, self.translator,
                                          self.cache, logger, check_status)
+            elif prefetch is not None:
+                # Nothing to audit here — the workers must not linger.
+                prefetch.abort()
+        elif prefetch is not None:
+            # QA disabled for this file, or nothing translated: the audit
+            # never runs, so the pipeline is shut down rather than left
+            # holding live workers.
+            prefetch.abort()
 
         final_content = apply_mapping_to_content(content)
 
@@ -2866,6 +3134,21 @@ class SNBTManager:
 
         return translated_ok
 
+def _json_source_of(key: str, source_data: dict):
+    """Recover the original source string behind a JSON translation key.
+
+    Mirrors the tail phase's lookup exactly: a plain key reads straight from
+    source_data; a json5 list item ("key[N]") reads element N of its list.
+    """
+    src = source_data.get(key)
+    if src is None and key.endswith("]"):
+        base, _, idx_s = key[:-1].rpartition("[")
+        base_val = source_data.get(base)
+        if isinstance(base_val, list) and idx_s.isdigit() and int(idx_s) < len(base_val):
+            src = base_val[int(idx_s)]
+    return src
+
+
 class JSONManager:
     def __init__(
         self,
@@ -2902,6 +3185,28 @@ class JSONManager:
             mod_context = build_mod_context(self.modpack_root)
             if mod_context:
                 self.translator.prompt += f" {mod_context}"
+
+    def _make_prefetch(self, logger, check_status):
+        """ТЗ-v4.4: build the translation-time audit pipeline for this file.
+
+        The JSON twin of SNBTManager._make_prefetch — same contract: None
+        means the audit runs after the translation, exactly as before.
+        """
+        if not self.qa_params:
+            return None
+        qa_params = dict(self.qa_params)
+        qa_params.setdefault("modpack_root", self.modpack_root)
+        qa_params.setdefault("lang_name", self.translator.target_lang_name)
+        try:
+            pf = _QAPrefetch(qa_params, self.translator, logger, check_status,
+                             qa_params.get("lang_name"), self.batch_size)
+        except Exception as e:
+            logger(f"[QA] pipeline unavailable ({repr(e)[:100]}) — "
+                   f"the audit runs after the translation")
+            return None
+        if not pf.ready:
+            return None
+        return pf
 
     async def _translate_with_recovery(self, texts, log_callback, check_status, context):
         if not texts:
@@ -2967,8 +3272,15 @@ class JSONManager:
         reset_request_timeout()
         # ТЗ-health: one JSON run = one health window; the summary is
         # emitted right before the shared clients close.
+        # ТЗ-v4 C7-C9: QA run scope (dataset + run totals) opens here too.
         health_reset()
         health_mark_start()
+        # ТЗ-v4.1 F12.1: tell the health module how wide this run's pool is.
+        # A one-key pool turns repeated timeouts into a cooldown+retry cycle
+        # instead of benching the only key the run has.
+        health_set_pool_size(len(getattr(self.translator, "mixed_pool", None) or [])
+                             or len(getattr(self.translator, "api_keys", None) or []))
+        qa_run_start()
         log_callback(f"Strategy: {self.policy.upper()}"
                      f"{' — cache BYPASSED (all strings re-translated)' if self.policy == 'overwrite' else ''}")
         lang_dirs = self._find_lang_dirs()
@@ -2978,6 +3290,11 @@ class JSONManager:
 
         total_translated = 0
         total_strings = 0
+        # ТЗ-v4.4: the audit pipeline of the file being translated RIGHT NOW.
+        # Pre-bound because the run-level finally() below consults it — a
+        # first-iteration failure must not raise NameError instead of the
+        # real error.
+        prefetch = None
 
         try:
             for lang_dir in lang_dirs:
@@ -3085,6 +3402,16 @@ class JSONManager:
                     if not strings_to_translate:
                         continue
 
+                    # ТЗ-v4.4: the audit starts DURING this file's translation.
+                    # Each finished batch hands its pairs over on the same
+                    # terms the tail will use (the pairs it would have
+                    # audited), so the tail can adopt the result instead of
+                    # re-scanning. None -> the audit runs afterwards as before.
+                    prefetch = self._make_prefetch(log_callback, check_status) \
+                        if policy_normalized != "skip" else None
+                    if prefetch is not None:
+                        prefetch.start()
+
                     all_keys = list(strings_to_translate.keys())
                     all_values = list(strings_to_translate.values())
                     total_strings += len(all_values)
@@ -3147,6 +3474,20 @@ class JSONManager:
                                 if cache_hits[key] != source_data.get(key):
                                     total_translated += 1
 
+                        # ТЗ-v4.4: hand this finished batch to the pipeline on
+                        # the same terms the tail will audit it — same pairs,
+                        # same source recovery for json5 list items ("key[N]"),
+                        # same empty-translation filter. The tail adopts only
+                        # when EVERY pair it audits was fed here.
+                        if prefetch is not None:
+                            prefetch.feed(
+                                (src, cache_hits[key])
+                                for key in batch_keys
+                                if key in cache_hits and cache_hits[key]
+                                for src in (_json_source_of(key, source_data),)
+                                if isinstance(src, str) and src
+                            )
+
                         processed_strings += len(batch_values)
                         log_callback(f"Translating JSON: {processed_strings}/{total_strings} strings ({(processed_strings / total_strings) * 100:.1f}%)")
                         if self.progress_callback:
@@ -3175,6 +3516,13 @@ class JSONManager:
                             qa_params = dict(self.qa_params)
                             qa_params.setdefault("modpack_root", self.modpack_root)
                             qa_params.setdefault("lang_name", self.translator.target_lang_name)
+                            # ТЗ-v4.4: drain the translation-time pipeline and
+                            # hand it over — the audit phase adopts its results
+                            # only when the coverage is complete, and otherwise
+                            # scans exactly as it did before.
+                            if prefetch is not None:
+                                await prefetch.finish()
+                                qa_params["prefetch"] = prefetch
                             await run_qa_phase_async(qa_pairs, qa_params, self.translator,
                                                      self.cache, log_callback, check_status)
                         # Write possibly-fixed translations back
@@ -3232,6 +3580,20 @@ class JSONManager:
                         raise
 
         finally:
+            # ТЗ-v4.4: this file's audit pipeline (if any) is done with — an
+            # aborted file or a file with nothing to audit must not leave
+            # workers spending tokens in the background. Idempotent after a
+            # normal finish().
+            if prefetch is not None:
+                prefetch.abort()
+            # ТЗ-v4 C8/C9: run-wide [QA] totals + jury lines for every JSON
+            # file of this run, into the GUI console and app.log.
+            try:
+                qa_run_finish(logger=lambda msg: (
+                    log_callback(msg),
+                    logging.getLogger("snbt_localizer.core").info(msg)))
+            except Exception:
+                pass
             # ТЗ-health п.4: per-key [POOL] stats into the GUI console and
             # app.log at the end of the run, before the shared clients close.
             try:
@@ -3478,6 +3840,163 @@ def _qa_ru_inflect_pattern(word: str) -> str:
     return pat + "(?:[а-я]{0,3})?"
 
 
+# ---------------------------------------------------------------------------
+# ТЗ-v4.3 A.1: real morphology for the glossary pre-check.
+#
+# The regex above is a *stem* heuristic: it tolerates at most three trailing
+# case letters, so «Незерного» (пин «Незер», 4-letter tail) was reported as a
+# violation while the pinned Russian WAS right there in the translation.
+# Production run 02.10 13:37: 185 flagged pairs, ~99% of them this exact
+# class of false positive — the soft channel delivered nothing.
+#
+# pymorphy3 gives the dictionary normal form; comparing normal forms of the
+# pin's words against the normal forms of the translation's words is
+# case-tolerant by construction (Незерного -> незерный). It is optional:
+# when the dictionary is missing the old regex stays as the fallback.
+# ---------------------------------------------------------------------------
+_QA_MORPH = None
+_QA_MORPH_TRIED = False
+_QA_MORPH_LOCK = threading.Lock()
+# normal form of one word -> frozenset of normal forms (module cache; the
+# pre-check runs over every pair and pymorphy3 parsing is the hot spot)
+_QA_MORPH_CACHE: Dict[str, frozenset] = {}
+_QA_MORPH_POS: Dict[str, frozenset] = {}
+_QA_WORD_RE = re.compile(r'[А-Яа-яЁё\-]{2,}')
+
+
+def _qa_morph_analyzer():
+    """Lazy, optional pymorphy3 analyzer (None when unavailable)."""
+    global _QA_MORPH, _QA_MORPH_TRIED
+    if _QA_MORPH_TRIED:
+        return _QA_MORPH
+    with _QA_MORPH_LOCK:
+        if not _QA_MORPH_TRIED:
+            try:
+                import pymorphy3
+                _QA_MORPH = pymorphy3.MorphAnalyzer()
+            except Exception:
+                _QA_MORPH = None
+            _QA_MORPH_TRIED = True
+    return _QA_MORPH
+
+
+def _qa_normal_forms(word: str) -> frozenset:
+    """Dictionary normal forms of one Russian word (empty without pymorphy)."""
+    key = word.lower().replace('ё', 'е')
+    cached = _QA_MORPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    morph = _qa_morph_analyzer()
+    if morph is None:
+        # no dictionary: the caller falls back to the prefix/morpheme tiers
+        _QA_COUNTERS["morph_fallback"] = _QA_COUNTERS.get("morph_fallback", 0) + 1
+        forms = frozenset()
+    else:
+        try:
+            forms = frozenset(p.normal_form for p in morph.parse(key))
+        except Exception:
+            forms = frozenset()
+    _QA_MORPH_CACHE[key] = forms
+    return forms
+
+
+def _qa_has_pos(word: str, pos: str) -> bool:
+    """Does pymorphy read this word as the given part of speech?"""
+    key = word.lower().replace('ё', 'е')
+    cached = _QA_MORPH_POS.get(key)
+    if cached is None:
+        morph = _qa_morph_analyzer()
+        if morph is None:
+            cached = frozenset()
+        else:
+            try:
+                cached = frozenset(p.tag.POS or '' for p in morph.parse(key))
+            except Exception:
+                cached = frozenset()
+        _QA_MORPH_POS[key] = cached
+    return pos in cached
+
+
+def _qa_word_in_text(word: str, text_words: List[str]) -> bool:
+    """Is `word` (any inflection) one of the words of `text_words`?
+
+    Three tiers, cheapest first:
+    1. pymorphy3 normal-form equality (Незерного == Незер, Кусочков == Кусочки);
+    2. a >=5-character prefix match (латиница/незнакомые словари);
+    3. a >=5-character morpheme containment for long Russian words
+       (Специфичный vs «специфических»).
+    Short words (<5) never match on a prefix: 'Свет' must not hit «светло».
+    """
+    key = word.lower().replace('ё', 'е')
+    if len(key) < 2:
+        return True
+    forms = _qa_normal_forms(key)
+    if forms:
+        for w in text_words:
+            if _qa_normal_forms(w) & forms:
+                return True
+    lowered = [(w, w.lower().replace('ё', 'е')) for w in text_words]
+    if len(key) >= 5:
+        pref = key[:5]
+        for _, lw in lowered:
+            if lw.startswith(pref):
+                return True
+    for nf in forms:
+        if len(nf) >= 6:
+            stem = nf[:-1]
+            if len(stem) >= 5 and any(stem in lw for _, lw in lowered):
+                return True
+    return False
+
+
+def _qa_ru_pin_present(term_ru: str, translation: str) -> bool:
+    """Morphology-tolerant presence of a pinned Russian term in a translation.
+
+    ТЗ-v4.3 A.1: EVERY word of the pin must be present in some inflected
+    form; a word is skipped only when it carries no letters (a stray token).
+
+    Two pragmatic widening rules keep the check honest without turning it
+    back into the false-positive machine it replaced:
+
+    - a verb pin also accepts a participle/gerund of the same root
+      («Специфичный» vs «специфических» is a different word; «Улучшить» vs
+      «улучшенный» is the same one);
+    - when the translation has fewer tokens than the pin has words, the pin
+      may be packed into fewer Russian words (compounds like 'Ore Pieces'
+      -> «руда»): at least one pin word must still be there, so «Вся мощь»
+      against 'Power' -> «Сила» stays a violation.
+    """
+    if not term_ru or not translation:
+        return False
+    words = _QA_WORD_RE.findall(translation)
+    if not words:
+        return False
+    parts = [p.strip(' .,;:!?()[]{}"\'') for p in re.split(r'\s+', term_ru.strip())]
+    parts = [p for p in parts if len(p) >= 2 and re.search(r'[А-Яа-яЁё]', p)]
+    if not parts:
+        return False
+    missing = 0
+    matched_any = False
+    for part in parts:
+        if _qa_word_in_text(part, words):
+            matched_any = True
+            continue
+        if _qa_has_pos(part, 'INFN') or _qa_has_pos(part, 'VERB'):
+            # same root in a participial/gerund form?
+            forms = _qa_normal_forms(part)
+            stems = [f[:-1] for f in forms if len(f) >= 6]
+            lowered = [w.lower().replace('ё', 'е') for w in words]
+            if any(st and any(st in lw for lw in lowered) for st in stems):
+                matched_any = True
+                continue
+        missing += 1
+    if missing == 0:
+        return True
+    if matched_any and len(words) < len(parts):
+        return True
+    return False
+
+
 # ТЗ3.1-1: models emit nested verdict arrays under different key names
 # (problems / issues / findings / flags / errors — production dumps show
 # all of them across runs). The unwrapper must accept ALL of them once,
@@ -3585,6 +4104,119 @@ def _qa_canonical_keys(item: dict) -> dict:
         base = out.get("issue") if isinstance(out.get("issue"), str) else ""
         extra_txt = " ".join(extras)
         out["issue"] = f"{base} [{extra_txt}]" if base else extra_txt
+    return out
+
+
+def _qa_repair_answer(candidates: List[dict], content) -> List[dict]:
+    """ТЗ-v4.3 C.7: turn ANY repair answer into usable verdicts.
+
+    The 02.10 run proved the strict path wrong: the model answered the repair
+    prompt with a plain ECHO of the candidate array ({id, note, source,
+    translation}) — no category, no severity — and the main-path filter
+    («id» + «category»/«severity») dropped all 185 records, so the repair
+    channel reported '0 re-issued' while holding 185 usable translations.
+
+    Three tiers, cheapest first:
+    1. a full verdict (id + category/severity) passes through untouched;
+    2. an object with an id but no category is read as a plain REPLACEMENT:
+       any changed string under translation/suggested/fix/... becomes a
+       TERM_INCONSISTENT/soft verdict (or, failing that, the object is kept
+       so _qa_normalize_problems can demote it to a warning with its issue
+       text — never a silent drop);
+    3. bare fix strings, positionally aligned with the candidates.
+
+    Every tier-2/3 suggested string still has to pass
+    _qa_validate_suggestion (codes/numbers/tags) before it may replace
+    anything, so a junk echo cannot damage a pair.
+
+    `content` is the raw answer text, or an already-parsed list (the caller
+    may hand over the unfiltered parse of _qa_send).
+    """
+    out: List[dict] = []
+    if isinstance(content, list):
+        parsed = content
+        texts: List[str] = [x for x in parsed if isinstance(x, str)]
+    elif isinstance(content, str) and content.strip():
+        parsed = extract_qa_problems_array(content) or []
+        texts = [x for x in (extract_json_array(content) or []) if isinstance(x, str)]
+    else:
+        return out
+    by_id = {_qa_coerce_pid(c.get("id")): c for c in candidates}
+    sources = {c.get("source"): _qa_coerce_pid(c.get("id")) for c in candidates}
+    taken: set = set()
+    leftovers: List[dict] = []
+    idless_schema: List[dict] = []
+    for item in _qa_flatten_raw_verdicts([x for x in parsed if isinstance(x, dict)]):
+        if not isinstance(item, dict):
+            continue
+        pid = _qa_coerce_pid(item.get("id"))
+        has_schema = bool(item.get("category") or item.get("severity"))
+        if has_schema or (pid is not None and pid not in by_id):
+            if pid is None:
+                # a verdict with no id at all: either positional (handled
+                # below when the WHOLE answer is id-less and counts match)
+                # or unusable — never appended as a raw junk record
+                idless_schema.append(item)
+                continue
+            out.append(item)
+            if pid in by_id:
+                taken.add(pid)
+            continue
+        if pid is None:
+            continue        # a {source: fix} map — tier 3 owns it
+        # tier 2: no schema — read it as a replacement for THIS pair
+        fix = None
+        for key in ("suggested", "translation", "fix", "text", "result",
+                    "corrected", "corrected_translation"):
+            v = item.get(key)
+            if isinstance(v, str) and v.strip():
+                fix = v.strip()
+                break
+        old = by_id[pid].get("translation") or ""
+        if fix and fix != old and not _qa_norm_same(fix, old):
+            out.append({"id": pid, "category": "TERM_INCONSISTENT", "severity": "soft",
+                        "issue": "repair pass returned a replacement string",
+                        "suggested": fix})
+            taken.add(pid)
+        else:
+            # an echo (or an answer with no usable string): keep it so the
+            # issue text still surfaces as a warning downstream
+            leftovers.append(item)
+    # a FULLY id-less schema answer in exact candidate order: the model
+    # answered the whole batch without ids — trust the position once
+    if idless_schema and not taken and len(idless_schema) == len(candidates):
+        for cand, item in zip(candidates, idless_schema):
+            out.append({**item, "id": _qa_coerce_pid(cand.get("id"))})
+        return out
+    out.extend(leftovers)
+    # tier 3: a bare {source: translation} map, then positional bare strings
+    for item in parsed:
+        if not isinstance(item, dict) or item.get("id") is not None:
+            continue
+        for k, v in list(item.items())[:1]:
+            if isinstance(v, str) and v.strip() and k in sources:
+                pid = sources[k]
+                if pid in taken:
+                    continue
+                old = by_id[pid].get("translation") or ""
+                if v.strip() == old or _qa_norm_same(v.strip(), old):
+                    continue
+                out.append({"id": pid, "category": "TERM_INCONSISTENT", "severity": "soft",
+                            "issue": "repair pass returned a replacement string",
+                            "suggested": v.strip()})
+                taken.add(pid)
+    if texts and len(texts) <= len(candidates):
+        for cand, fix in zip(candidates, texts):
+            pid = _qa_coerce_pid(cand.get("id"))
+            if pid in taken or pid is None:
+                continue
+            old = cand.get("translation") or ""
+            if fix == old or _qa_norm_same(fix, old):
+                continue
+            out.append({"id": pid, "category": "TERM_INCONSISTENT", "severity": "soft",
+                        "issue": "repair pass returned a bare replacement string",
+                        "suggested": fix})
+            taken.add(pid)
     return out
 
 
@@ -3710,42 +4342,90 @@ def extract_qa_fix_map(content: str) -> Dict[int, str]:
 # batch re-compiled ~5600 patterns (one per glossary term per pair) and
 # burned tens of seconds in re._compile.
 _QA_GLOSSARY_PATTERN_CACHE: Dict[Tuple[str, str], Tuple[object, object]] = {}
+# ТЗ-v4.3 B.4 (witness half): compiled «longer official term containing pin»
+# probes, keyed by the pin — built lazily from the vanilla glossary.
+_QA_VANILLA_WITNESS_CACHE: Dict[str, List[object]] = {}
+
+
+def _qa_vanilla_covers(term_en: str, src_clean: str,
+                       vanilla_terms: List[Tuple[str, str]]) -> bool:
+    """Is this pin only a fragment of a LONGER official (vanilla) term?
+
+    The flags that survived the morphology rewrite were mostly of this shape:
+    the modpack pins 'Table'/'Stone'/'Light' fired on «Crafting Table»,
+    «End Stone», «White Light» — vanilla items whose official translation is
+    already in the string, so nothing was actually missed. The vanilla file
+    is not an enforcer (it must never create a flag) but it is a competent
+    WITNESS: if a vanilla term (a) contains the pin as a whole word, (b) is
+    longer than it, and (c) is present in this very source, the match is
+    explained and the pin is skipped.
+    """
+    key = term_en.lower()
+    probes = _QA_VANILLA_WITNESS_CACHE.get(key)
+    if probes is None:
+        low = key
+        probes = []
+        for en, ru in vanilla_terms:
+            if len(en) <= len(low):
+                continue
+            if not re.search(r'(?<![A-Za-z])' + re.escape(low) + r'(?![A-Za-z])',
+                             en, re.IGNORECASE):
+                continue
+            if en.lower() == low:
+                continue
+            body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in en.split())
+            probes.append(re.compile(r"(?<![A-Za-z])" + body + r"(?![A-Za-z])",
+                                     re.IGNORECASE))
+        _QA_VANILLA_WITNESS_CACHE[key] = probes
+    if not probes:
+        return False
+    return any(p.search(src_clean) for p in probes)
 
 
 def _qa_glossary_violations(batch: List[dict], vanilla_gloss: Dict[str, str],
                             modpack_terms: Dict[str, str]) -> List[dict]:
     """Deterministic glossary-compliance pre-check (zero tokens).
 
-    For every pair in the batch: if a pinned glossary term (vanilla or
-    modpack, lenient match) occurs in the SOURCE but its pinned Russian
-    translation does NOT occur in the translation, flag the pair. The
+    For every pair in the batch: if a pinned term occurs in the SOURCE but
+    its pinned Russian does NOT occur in the translation, flag the pair. The
     auditor then gets a MINI-BATCH of only these pairs with the missed
     pins spelled out — it decides: (a) a real violation -> TERM_INCONSISTENT
     with a suggested fix, (b) a wrong pin (homonym: metal 'Lead' vs wire
     'lead') -> report nothing.
 
+    ТЗ-v4.3 B.4: ONLY the curated modpack glossary is enforced. Vanilla
+    terminology stays a prompt-side hint (build_glossary_context) and an
+    arbitration witness — never a flag source. The vanilla file is a raw
+    1:1 dump of the official translation ('Power': 'Сила', 'Lead':
+    'Поводок'): enforcing it produced 131 of the 230 false flags in the
+    02.10 run while the modpack's own terms were never the problem.
+
     Codes/tags/hex colors are stripped before matching so a pin is never
-    'missed' merely because the model kept the markup.
+    'missed' merely because the model kept the markup, and so a #namespace
+    resource tag ('#techopolis:nether_planks') is not read as prose.
     """
     if not batch:
         return []
-    glossaries = []
-    if modpack_terms:
-        glossaries.append(modpack_terms)
-    if vanilla_gloss:
-        glossaries.append(vanilla_gloss)
-    if not glossaries:
+    if not modpack_terms:
         return []
+    glossaries = [("modpack", modpack_terms)]
+    # ТЗ-v4.3 B.4: the vanilla file never FLAGS, but it still testifies —
+    # when a longer official term contains the modpack pin and that longer
+    # term is what the source actually says, the short pin is an artefact of
+    # it ('Table' inside «Crafting Table», 'Stone' inside «End Stone»).
+    vanilla_terms = [(en, ru) for en, ru in (vanilla_gloss or {}).items()
+                     if len(en) >= 4 and ru]
     flagged = []
     for pair in batch:
         src = pair.get("source") or ""
         tr = pair.get("translation") or ""
         if not src or not tr:
             continue
-        src_clean = FMT_CODE_PATTERN.sub('', src)
+        src_clean = _QA_TAG_RE.sub(' ', FMT_CODE_PATTERN.sub('', src))
         tr_clean = FMT_CODE_PATTERN.sub('', tr)
         missed = []
-        for gloss in glossaries:
+        matched: List[tuple] = []
+        for gname, gloss in glossaries:
             for term_en, term_ru in gloss.items():
                 if len(term_en) < 3 or not term_ru:
                     continue
@@ -3753,29 +4433,68 @@ def _qa_glossary_violations(batch: List[dict], vanilla_gloss: Dict[str, str],
                 if cached is None:
                     body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in term_en.split())
                     pat = re.compile(r"(?<![A-Za-z])" + body + r"(?![A-Za-z])", re.IGNORECASE)
+                    # case-sensitive, plural-tolerant: used to tell a real
+                    # term ('Crafting Table', «Crafting Tables») from the
+                    # same words written as prose ('Crafting table')
+                    cs_pat = re.compile(r"(?<![A-Za-z])"
+                                        + r"\s+".join(re.escape(w) for w in term_en.split())
+                                        + r"(?:es|s)?(?![A-Za-z])")
                     # the pin IS in the source: the pinned Russian must be
-                    # in the translation — EVERY word is inflection-tolerant
-                    # (ТЗ2.2-4: 'Лунный камень' must hit 'Лунного камня',
-                    # 'Свинец' must hit 'Свинцовому'; was last-word-only,
-                    # which flooded the arbitration with false positives)
-                    ru_body = r"\s+".join(_qa_ru_inflect_pattern(w) for w in term_ru.split())
-                    ru_pat = re.compile(r"(?<![А-Яа-яЁёA-Za-z])" + ru_body + r"(?![А-Яа-яЁёA-Za-z])", re.IGNORECASE)
-                    _QA_GLOSSARY_PATTERN_CACHE[(term_en, term_ru)] = (pat, ru_pat)
-                    cached = (pat, ru_pat)
-                pat, ru_pat = cached
+                    # in the translation — EVERY word, any inflection
+                    # (ТЗ-v4.3 A.1: not a regex stem guess any more)
+                    _QA_GLOSSARY_PATTERN_CACHE[(term_en, term_ru)] = (pat, cs_pat)
+                    cached = (pat, cs_pat)
+                pat, cs_pat = cached
                 if not pat.search(src_clean):
                     continue
-                if not ru_pat.search(tr_clean):
-                    missed.append((term_en, term_ru))
+                m = pat.search(src_clean)
+                if m and gname == "modpack":
+                    # ТЗ-v4.3 A: a pin inside a longer capitalised phrase is
+                    # not a term reference ('Light' in «White Light»,
+                    # 'Stone' in «End Stone», 'Table' in «Extended Crafting
+                    # table»). Lowercase prose is left alone on purpose:
+                    # 'fuel the Jet Suit' really does use the pin 'Fuel'.
+                    # A capitalised word that IS the sentence's first word is
+                    # no evidence of a phrase — «Make Lead Ingots» must keep
+                    # flagging 'Lead'.
+                    before = src_clean[:m.start()].rstrip()
+                    prev = before.rsplit(' ', 1)[-1] if before else ''
+                    mid_sentence = ' ' in before
+                    if mid_sentence and re.fullmatch(r"[A-Z][A-Za-z'\-]*", prev):
+                        continue
+                matched.append((gname, term_en, term_ru, cs_pat))
+        # ТЗ-v4.3 A: munching — the longest matching pin represents the term,
+        # a pin contained in it is an artefact ('Table' must not add a flag
+        # next to 'Crafting Table').
+        for gname, term_en, term_ru, cs_pat in matched:
+            low = term_en.lower()
+            if any(low != other[1].lower()
+                   and re.search(r'(?<![A-Za-z])' + re.escape(low) + r'(?![A-Za-z])',
+                                 other[1], re.IGNORECASE)
+                   for other in matched):
+                continue
+            # a term the translator deliberately kept in English is not a
+            # missed pin (mod names and 'Toms Storage' style names)
+            if cs_pat.search(tr_clean):
+                continue
+            # official witness: a longer vanilla term containing this pin,
+            # present in the source, explains the match away — «Crafting
+            # Table» is a vanilla item, not a use of the modpack pin 'Table'.
+            if _qa_vanilla_covers(term_en, src_clean, vanilla_terms):
+                continue
+            if not _qa_ru_pin_present(term_ru, tr_clean):
+                missed.append((term_en, term_ru, gname))
         if missed:
             # longest English terms first, dedup
             seen = set()
             uniq = []
-            for en, ru in sorted(missed, key=lambda p: len(p[0]), reverse=True):
-                if en not in seen:
-                    seen.add(en)
-                    uniq.append((en, ru))
-            flagged.append({**pair, "missed_pins": uniq[:8]})
+            for en, ru, gname in sorted(missed, key=lambda p: len(p[0]), reverse=True):
+                if en in seen:
+                    continue
+                seen.add(en)
+                uniq.append((en, ru, gname))
+            flagged.append({**pair, "missed_pins": [(en, ru) for en, ru, _ in uniq[:8]],
+                            "pin_origins": {en: g for en, _, g in uniq[:8]}})
     return flagged
 
 
@@ -3832,6 +4551,39 @@ def _qa_glossary_compliance_prompt(flagged: List[dict], lang_name: str) -> str:
         f"Pairs to arbitrate (id, source, translation, missed_pins):\n{pairs_json}\n"
     )
 
+
+# ТЗ-v4.3 B.5: a pre-check that flags more than this many pairs in one run is
+# not finding violations, it is describing its own blindness. The flags are
+# NOT dropped (they stay arbitration candidates) — the line is there so the
+# next log reader sees the smell immediately instead of after 40 minutes.
+_QA_FLAG_SUSPICIOUS = 50
+
+
+def _qa_log_pin_origins(flagged: List[dict], logger) -> None:
+    """ТЗ-v4.3 B.3: every flag says WHERE its pin came from.
+
+    Only the curated modpack glossary is enforced now (B.4), so in practice
+    the answer is 'modpack' — but the log line keeps a bad glossary
+    recognizable without re-reading the code that produced the flag.
+    """
+    if not flagged:
+        return
+    counts: Dict[str, int] = {}
+    for fp in flagged:
+        for origin in (fp.get("pin_origins") or {}).values():
+            counts[origin] = counts.get(origin, 0) + 1
+    if not counts:
+        return
+    detail = ", ".join(f"{name}: {n} pin(s)" for name, n in sorted(counts.items()))
+    logger(f"[QA] flagged {len(flagged)} pair(s) — pin sources: {detail}")
+    seen = set()
+    for fp in flagged:
+        for en, origin in (fp.get("pin_origins") or {}).items():
+            if en in seen:
+                continue
+            seen.add(en)
+            logger(f"[QA] pin '{en}' from: {origin}")
+
 class PartialResponseError(ValueError):
     """Provider returned a parseable JSON array of the WRONG length.
 
@@ -3870,6 +4622,276 @@ _GLOSSARY_STOPWORDS = frozenset({
     "End", "Top", "Bottom", "Side", "Front", "Back", "Next", "Previous",
 })
 
+# ТЗ-v4.5 п.3: high-frequency English words that are NEVER a mod term.
+# The extractor only sees CAPITALISED words, so every sentence-initial common
+# word ('Time for Chess', 'Making Clay', 'Taste the Rainbow') looked like a
+# candidate and became a pin — and a pin on a common word flags a violation in
+# EVERY file that uses the word as prose (Taste->Вкус, Time->Время,
+# Making->Создание, Industrial->Индустриальный on Liminal Industries).
+# A single word from this list is rejected; a MULTI-WORD term is always
+# allowed, so 'Carpet' stays pinned by design (the pack's own term) while
+# 'Time'/'Making' never pin at all.
+_GLOSSARY_COMMON_WORDS = frozenset({
+    "time", "times", "year", "years", "day", "days", "week", "weeks",
+    "month", "months", "hour", "hours", "minute", "minutes", "second",
+    "seconds", "moment", "moments", "morning", "evening", "night", "today",
+    "tomorrow", "yesterday", "now", "then", "always", "never", "often",
+    "sometimes", "again", "once", "twice", "soon", "later", "early", "late",
+    "people", "person", "man", "men", "woman", "women", "child", "children",
+    "thing", "things", "way", "ways", "life", "world", "place", "places",
+    "part", "parts", "side", "sides", "kind", "kinds", "lot", "lots",
+    "making", "make", "makes", "made", "doing", "does", "done", "going",
+    "goes", "gone", "getting", "gets", "got", "giving", "gives", "given",
+    "taking", "takes", "taken", "coming", "comes", "using", "used", "uses",
+    "keeping", "keeps", "kept", "putting", "puts", "running", "runs",
+    "working", "works", "worked", "playing", "plays", "looking", "looks",
+    "seeing", "sees", "seen", "saying", "says", "said", "trying", "tries",
+    "starting", "starts", "started", "ending", "ends", "ended", "turning",
+    "turns", "turned", "moving", "moves", "moved", "adding", "adds", "added",
+    "picking", "picks", "picked", "placing", "places", "placed", "holding",
+    "holds", "held", "leaving", "leaves", "left", "finding", "finds",
+    "found", "learning", "learns", "learned", "thinking", "thinks", "thought",
+    "knowing", "knows", "known", "wanting", "wants", "wanted", "needing",
+    "needs", "needed", "helping", "helps", "helped", "showing", "shows",
+    "shown", "meaning", "means", "meant", "including", "includes", "included",
+    "building", "building's", "industrial", "residential", "commercial",
+    "taste", "tastes", "tasting", "flavor", "flavour", "smell", "smells",
+    "look", "looks", "feel", "feels", "sound", "sounds", "touch",
+    "good", "better", "best", "bad", "worse", "worst", "great", "greater",
+    "greatest", "small", "smaller", "smallest", "large", "larger", "largest",
+    "big", "bigger", "biggest", "little", "long", "longer", "longest",
+    "short", "shorter", "shortest", "high", "higher", "highest", "low",
+    "lower", "lowest", "fast", "faster", "fastest", "slow", "slower",
+    "slowest", "easy", "easier", "easiest", "hard", "harder", "hardest",
+    "simple", "simpler", "simplest", "strong", "stronger", "strongest",
+    "weak", "weaker", "weakest", "heavy", "heavier", "heaviest", "light",
+    "lighter", "lightest", "dark", "darker", "darkest", "bright", "brighter",
+    "brightest", "hot", "hotter", "hottest", "cold", "colder", "coldest",
+    "warm", "warmer", "warmest", "cool", "cooler", "coolest", "deep",
+    "deeper", "deepest", "wide", "wider", "widest", "thin", "thinner",
+    "thick", "thicker", "full", "fuller", "empty", "cheap", "cheaper",
+    "expensive", "free", "faster", "useful", "useless", "important",
+    "different", "same", "similar", "special", "normal", "common", "rare",
+    "unique", "simple", "complex", "basic", "advanced", "improved",
+    "ultimate", "final", "initial", "original", "additional", "extra",
+    "more", "most", "less", "least", "much", "many", "few", "fewer",
+    "several", "various", "multiple", "every", "each", "both", "either",
+    "neither", "some", "any", "all", "none", "other", "others", "another",
+    "such", "same", "very", "quite", "rather", "really", "actually",
+    "simply", "just", "only", "even", "also", "too", "enough", "almost",
+    "nearly", "about", "around", "over", "under", "above", "below",
+    "inside", "outside", "within", "without", "between", "among", "through",
+    "during", "before", "after", "while", "until", "since", "because",
+    "however", "therefore", "instead", "otherwise", "besides", "finally",
+    "first", "second", "third", "next", "last", "previous", "following",
+    "note", "notes", "warning", "info", "information", "tip", "tips",
+    "guide", "guides", "help", "recipe", "recipes", "quest", "quests",
+    "chapter", "chapters", "reward", "rewards", "task", "tasks", "item",
+    "items", "block", "blocks", "machine", "machines", "tool", "tools",
+    "material", "materials", "resource", "resources", "energy", "power",
+    "speed", "size", "amount", "number", "numbers", "level", "levels",
+    "type", "types", "mode", "modes", "stage", "stages", "step", "steps",
+    "start", "starting", "end", "ending", "begin", "beginning", "continue",
+    "stop", "stopping", "wait", "waiting", "remember", "forget", "check",
+    "checking", "try", "keep", "avoid", "consider", "consult", "read",
+    "reading", "see", "look", "watch", "watching", "notice", "ensure",
+    "make", "making", "create", "creating", "build", "building", "craft",
+    "crafting", "produce", "producing", "generate", "generating", "obtain",
+    "obtaining", "collect", "collecting", "gather", "gathering", "find",
+    "finding", "discover", "unlock", "unlocking", "complete", "completing",
+    "finish", "finishing", "reach", "reaching", "enter", "entering",
+    "welcome", "congratulations", "enjoy", "enjoying", "goodbye",
+    "wonderful", "amazing", "awesome", "incredible", "fantastic",
+    "beautiful", "perfect", "excellent", "terrible", "horrible", "dangerous",
+    "safe", "careful", "carefully", "quickly", "slowly", "easily", "simply",
+    "together", "alone", "everywhere", "anywhere", "somewhere", "nowhere",
+    "something", "anything", "everything", "nothing", "someone", "anyone",
+    "everyone", "no one", "somebody", "anybody", "everybody", "nobody",
+    "here", "there", "where", "when", "why", "how", "what", "which", "who",
+    "they", "their", "theirs", "them", "themselves", "we", "our", "ours",
+    "us", "ourselves", "you", "your", "yours", "yourself", "yourselves",
+    "he", "him", "his", "himself", "she", "her", "hers", "herself", "it",
+    "its", "itself", "this", "that", "these", "those", "i", "me", "my",
+    "mine", "myself", "one", "ones", "someone's", "something's",
+})
+
+
+# ТЗ-v4.6 п.1: words that read as nouns yet are ordinary prose or bare verbs.
+# Measured offenders from live runs (Liminal Industries / Applied Energistics):
+# 'Space' -> «Космос» (16 false glossary flags), 'Generates' -> «Генерирует»
+# (13), 'Fuel', 'Pack', 'Base', 'Magic', 'Range', 'Tank', 'Fluid', 'Press'.
+# The generic stop-list above already covers time/making/taste/industrial;
+# this set adds the rest. Legitimate Minecraft nouns (lead, light, power,
+# stone, copper, gold, water, frame, carpet) are deliberately NOT here — they
+# are protected by the rarity rule instead.
+_GLOSSARY_PROSE_WORDS = frozenset({
+    "space", "spaces", "spaced",
+    "generates", "generate", "generated", "generating", "generation",
+    "fuel", "fuels", "fueled", "fuelled",
+    "pack", "packs", "packed", "packing",
+    "base", "bases", "based", "basing",
+    "magic", "magical", "magics",
+    "range", "ranges", "ranged", "ranging",
+    "tank", "tanks", "tanked",
+    "fluid", "fluids",
+    "press", "presses", "pressed", "pressing",
+    "spawn", "spawns", "spawned", "spawning", "spawner", "spawners",
+    "charm", "charms", "charmed",
+    "mushroom", "mushrooms",
+    "adds", "added", "adding", "allows", "allowed", "allowing",
+    "gives", "given", "giving", "makes", "made", "uses", "using",
+    "takes", "taken", "taking", "provides", "provided", "requires",
+    "required", "contains", "contained", "produces", "produced",
+    "creates", "created", "creating", "holds", "held", "holding",
+    "works", "worked", "turned", "comes", "goes", "gets", "getting",
+    "places", "placed", "placing", "things", "ways", "parts", "pieces",
+    "kinds", "sorts", "types", "forms", "sides", "areas", "spots",
+    "points", "cases", "facts", "ideas", "reasons", "results",
+    "effects", "chances", "lots", "bits", "sets", "lines", "layers",
+    "rows", "columns", "sizes", "shapes", "colors", "colours",
+    "names", "lists", "orders", "groups", "teams", "roles", "games",
+    "worlds", "players", "users", "people", "friends", "enemies",
+    "creatures", "animals", "monsters", "mobs", "foods", "drinks",
+    "costs", "prices", "values", "amounts", "totals", "numbers",
+    "counts", "starts", "started", "ending", "stops", "stopped",
+    "begins", "began", "finishes", "finished", "continues", "continued",
+    "keeps", "kept", "leaves", "enters", "entered", "exits", "exited",
+    "moves", "moved", "moving", "returns", "returned", "follows",
+    "followed", "needs", "needed", "wants", "wanted", "likes", "liked",
+    "loves", "loved", "hates", "hated", "helps", "helped", "cares",
+    "cared", "watches", "watched", "looks", "looked", "looking",
+    "sees", "seen", "shows", "showed", "shown", "finds", "found",
+    "search", "searches", "searched", "checks", "checked", "tests",
+    "tested", "tries", "tried", "attempts", "learns", "learned",
+    "teaches", "taught", "knows", "knew", "known", "thinks", "thought",
+    "feels", "felt", "seems", "seemed", "becomes", "became", "grows",
+    "grew", "grown", "builds", "crafts", "crafted", "crafting",
+    "mines", "mined", "mining", "digs", "dug", "breaks", "broke",
+    "broken", "fixes", "fixed", "repairs", "repaired", "kills",
+    "killed", "dies", "died", "lives", "lived", "sleeps", "slept",
+    "wakes", "woke", "eats", "eaten", "drank", "drunk", "runs",
+    "walks", "walked", "jumps", "jumped", "flies", "flew", "swims",
+    "falls", "fell", "fallen", "rises", "rose", "risen", "drops",
+    "dropped", "pushes", "pushed", "pulls", "pulled", "throws",
+    "threw", "thrown", "catches", "caught", "hits", "strikes",
+    "struck", "cuts", "cutting", "washes", "washed", "cleans",
+    "cleaned", "fills", "filled", "empties", "emptied", "carries",
+    "carried", "wears", "wore", "worn", "stores", "stored", "saves",
+    "saved", "loads", "loaded", "sends", "sent", "receives",
+    "received", "buys", "bought", "sells", "sold", "pays", "paid",
+    "spends", "spent", "earns", "earned", "wins", "loses", "losing",
+    "misses", "missed", "joins", "joined", "meets", "calls", "called",
+    "asks", "asked", "answers", "answered", "tells", "told", "says",
+    "said", "speaks", "spoke", "spoken", "talks", "talked", "writes",
+    "wrote", "written", "reads", "listens", "listened", "hears",
+    "heard", "sounds", "sounded", "smells", "tastes", "tasted",
+    "touches", "touched", "chooses", "chose", "chosen", "picks",
+    "picked", "selects", "selected", "applies", "applied", "removes",
+    "removed", "inserts", "inserted", "deletes", "deleted",
+    "replaces", "replaced", "changes", "changed", "improves",
+    "improved", "increases", "increased", "decreases", "decreased",
+    "reduces", "reduced", "boosts", "boosted", "unlocks", "unlocked",
+    "locks", "locked", "activates", "activated", "enables", "enabled",
+    "disables", "disabled", "connects", "connected", "attaches",
+    "attached", "installs", "installed", "upgrades", "upgraded",
+    "combines", "combined", "merges", "merged", "splits", "spreads",
+    "covers", "covered", "hides", "hidden", "reveals", "revealed",
+    "discovers", "discovered", "explores", "explored", "travels",
+    "traveled", "visits", "visited", "reaches", "reached", "arrives",
+    "arrived", "collects", "collected", "gathers", "gathered",
+    "harvests", "harvested", "plants", "planted", "feeds", "breeds",
+    "bred", "hunts", "hunted", "fishes", "fished", "cooks", "cooked",
+    "boils", "boiled", "burns", "burned", "burning", "freezes",
+    "froze", "frozen", "melts", "melted", "mixes", "mixed", "mixing",
+    "separates", "separated", "filters", "filtered", "sorts",
+    "sorted", "counted", "measures", "measured", "weighs", "weighed",
+    "compares", "compared", "matches", "matched", "fits", "fitted",
+    "belongs", "belonged", "includes", "included", "excludes",
+    "excluded", "prevents", "prevented", "protects", "protected",
+    "damages", "damaged", "destroys", "destroyed", "attacks",
+    "attacked", "defends", "defended", "fights", "fought", "escapes",
+    "escaped", "avoids", "avoided", "ignores", "ignored", "notices",
+    "noticed", "realizes", "realized", "expects", "expected", "hopes",
+    "hoped", "wishes", "wished", "dreams", "dreamed", "plans",
+    "planned", "decides", "decided", "agrees", "agreed", "refuses",
+    "refused", "accepts", "accepted", "offers", "offered", "shares",
+    "shared", "lends", "lent", "borrows", "borrowed", "owes", "owed",
+    "thanks", "thanked", "greets", "greeted", "welcomes", "welcomed",
+    "enjoys", "enjoyed", "celebrates", "celebrated", "survives",
+    "survived", "suffers", "suffered", "recovers", "recovered",
+    "heals", "healed", "hurts", "wounds", "wounded", "rescues",
+    "rescued", "risks", "warns", "warned", "warnings", "notes",
+    "noted", "tips", "hints", "clues", "secrets", "mysteries",
+    "puzzles", "riddles", "tricks", "traps", "rewards", "rewarded",
+    "prizes", "gifts", "trades", "traded", "deals", "dealt",
+    "quests", "tasks", "missions", "objectives", "goals", "targets",
+    "challenges", "levels", "stages", "phases", "steps", "tiers",
+    "ranks", "scores", "bonuses", "penalties", "limits", "limited",
+    "options", "settings", "configs", "parameters", "properties",
+    "attributes", "features", "functions", "methods", "modes",
+    "states", "conditions", "requirements", "rules", "laws",
+    "policies", "systems", "processes", "procedures", "actions",
+    "activities", "events", "situations", "problems", "issues",
+    "errors", "mistakes", "faults", "bugs", "glitches", "failures",
+    "successes", "victories", "defeats", "battles", "wars",
+    "conflicts", "troubles", "difficulties", "efforts", "trial",
+    "trials", "experiences", "skills", "abilities", "weaknesses",
+    "distances", "moments", "seconds", "minutes", "hours", "days",
+    "weeks", "months", "years", "decades", "centuries", "eras",
+    "ages", "periods", "durations", "delays", "intervals",
+    "schedules", "cycles", "loops", "repeats", "repeated",
+})
+# ТЗ-v4.6 п.1: a SINGLE word may be pinned only when it is rare in the
+# strings it was extracted from — prose repeats, a proper name does not.
+# Measured on the Liminal Industries pre-scan strings (202 titles/subtitles):
+# kept   Carpet 3, Dust 3, Lead 3, Cobblestone 3, Summoning 3, Poolrooms 2,
+#        Frame 2, Reality 2, Liquid 2, Gold 2, Copper 2
+# dropped Renewable 12, Furnace 6, Liminal 5, Wood 4 (and every phrase stays).
+_GLOSSARY_PIN_MAX_FREQ = 3
+
+
+def _glossary_pin_allowed(term: str) -> bool:
+    """ТЗ-v4.5 п.3: may this extracted candidate become a glossary PIN?
+
+    Single common English words may not: they are prose, and a pin on them
+    turns every prose use into a false glossary violation. Multi-word terms
+    are always allowed — a phrase carries its own context ('Time in a Bottle',
+    'Industrial Mixer') and the extractor's own capitalisation filter already
+    rejects glue words inside it.
+    """
+    t = (term or "").strip()
+    if not t:
+        return False
+    if " " in t:
+        return True
+    low = t.casefold()
+    # ТЗ-v4.6 п.1: prose nouns/verbs that pinned themselves on live runs
+    # ('Space' -> «Космос» 16 false flags, 'Generates' -> «Генерирует» 13,
+    # 'Fuel', 'Pack', 'Base', 'Magic') — ordinary English words, not names.
+    return low not in _GLOSSARY_COMMON_WORDS and low not in _GLOSSARY_PROSE_WORDS
+
+
+def _glossary_pin_verdict(term: str, freq: int) -> tuple:
+    """ТЗ-v4.6 п.1: (allowed, reason) for one extracted candidate.
+
+    The rule from the live run: a SINGLE word may be pinned only when it is
+    RARE in the strings it was extracted from — prose repeats, a proper name
+    or a machine name does not. Measured on Liminal Industries titles:
+    'Carpet' 3 / 'Dust' 3 / 'Lead' 3 (kept) vs 'Renewable' 12 / 'Furnace' 6 /
+    'Liminal' 5 / 'Wood' 4 (prose). Multi-word phrases are always allowed.
+    """
+    t = (term or "").strip()
+    if not t:
+        return False, "empty"
+    if " " in t:
+        return True, "phrase"
+    if not _glossary_pin_allowed(t):
+        return False, "common word"
+    if int(freq or 0) > _GLOSSARY_PIN_MAX_FREQ:
+        return False, "frequent prose"
+    return True, f"rare name, freq {int(freq or 0)}"
+
+
 def _glossary_id(modpack_root) -> str:
     """Stable per-modpack id: sanitized name + path hash (renames don't collide)."""
     root = Path(modpack_root) if modpack_root else Path(".")
@@ -3877,7 +4899,8 @@ def _glossary_id(modpack_root) -> str:
     h = hashlib.md5(str(root.resolve()).encode('utf-8')).hexdigest()[:10]
     return f"{name}_{h}"
 
-def extract_glossary_candidates(texts: List[str], min_occurrences: int = 2, limit: int = 200) -> List[str]:
+def extract_glossary_candidates(texts: List[str], min_occurrences: int = 2, limit: int = 200,
+                                log_pins=None) -> List[str]:
     """Recurring Capitalized multi-word/known-mod phrases from quest strings.
 
     Heuristic, pre-LLM: a phrase must appear >= min_occurrences times across
@@ -3916,14 +4939,27 @@ def extract_glossary_candidates(texts: List[str], min_occurrences: int = 2, limi
 
     vanilla = load_vanilla_glossary()
     candidates = []
+    rejected_pins: List[str] = []
     for term, cnt in counter.items():
         if cnt < min_occurrences:
             continue
         if term in vanilla:
             continue
+        # ТЗ-v4.5 п.3 / ТЗ-v4.6 п.1: a single common or frequent word is
+        # prose, not a term — never pin it.
+        ok, reason = _glossary_pin_verdict(term, cnt)
+        if not ok:
+            rejected_pins.append(f"'{term}' rejected ({reason}, freq {cnt})")
+            continue
         candidates.append(term)
+    if log_pins and rejected_pins:
+        for line in rejected_pins:
+            log_pins(f"[Glossary] pin {line}")
     # most frequent first, longest phrase as a tie-breaker
     candidates.sort(key=lambda t: (-counter[t], -len(t)))
+    if log_pins:
+        for term in candidates[:limit]:
+            log_pins(f"[Glossary] pin '{term}' accepted (freq {counter[term]})")
     return candidates[:limit]
 
 class ModpackGlossary:
@@ -3936,6 +4972,10 @@ class ModpackGlossary:
     def __init__(self, modpack_root=None):
         self.modpack_root = modpack_root
         self.terms: Dict[str, str] = {}
+        # Everything that lives on disk, including pins the stop-list
+        # suppresses. save() merges against it, so a filtered pin is never
+        # destroyed by a later write (see load()).
+        self._stored: Dict[str, str] = {}
         self.path = GLOSSARY_DIR / f"{_glossary_id(modpack_root)}.json"
         self.load()
 
@@ -3948,14 +4988,48 @@ class ModpackGlossary:
                     self.terms = {str(k).strip(): str(v).strip() for k, v in data.get("terms", {}).items() if k and v}
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             logging.getLogger("snbt_localizer.core").warning(f"Failed to load modpack glossary {self.path}: {e}")
+        self._stored = dict(self.terms)
+        # ТЗ-v4.5 п.3: the pin stop-list also filters what is ALREADY stored.
+        # The pre-scan is additive forever, so a junk pin learned by an older
+        # version ('Time' -> «Время», 'Making' -> «Создание», 'Taste' ->
+        # «Вкус») would otherwise keep flagging prose until the end of time.
+        # This is a READ-TIME VIEW only: _stored keeps the file's real
+        # content and save() merges against it, so suppressing a pin here
+        # never deletes it from the user's glossary.
+        if self.terms:
+            allowed = {k: v for k, v in self.terms.items() if _glossary_pin_allowed(k)}
+            if len(allowed) != len(self.terms):
+                dropped = len(self.terms) - len(allowed)
+                logging.getLogger("snbt_localizer.core").info(
+                    f"Modpack glossary: {dropped} common-word pin(s) ignored "
+                    f"(stop-list), {len(allowed)} enforced")
+                self.terms = allowed
 
     def save(self):
+        # Additive by construction: whatever is already on disk is re-read and
+        # kept unless this instance changed it, so a pin hidden by the
+        # stop-list (or any pin this instance never saw) survives the write.
+        merged = {}
+        try:
+            if self.path.exists():
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    merged = {str(k).strip(): str(v).strip()
+                              for k, v in data.get("terms", {}).items() if k and v}
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            merged = {}
+        for k, v in getattr(self, "_stored", {}).items():
+            merged.setdefault(k, v)
+        merged.update(self.terms)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump({"terms": self.terms}, f, ensure_ascii=False, indent=2)
+                json.dump({"terms": merged}, f, ensure_ascii=False, indent=2)
         except (OSError, UnicodeDecodeError) as e:
             logging.getLogger("snbt_localizer.core").warning(f"Failed to save modpack glossary {self.path}: {e}")
+        else:
+            self._stored = dict(merged)
 
     def untranslated_terms(self, candidates: List[str]) -> List[str]:
         return [t for t in candidates if t not in self.terms]
@@ -4048,7 +5122,9 @@ async def ensure_modpack_glossary(
     compatibility with the GUI/CLI call sites and IGNORED.
     """
     glossary = ModpackGlossary(modpack_root)
-    candidates = extract_glossary_candidates(texts)
+    # ТЗ-v4.6 п.1: report every accept/reject so a false pin is visible in
+    # app.log instead of being discovered as a glossary flag three runs later.
+    candidates = extract_glossary_candidates(texts, log_pins=logger)
     missing = glossary.untranslated_terms(candidates)
     if not missing:
         if glossary.terms:
@@ -4224,8 +5300,8 @@ Screen EVERY pair for translation problems:
 - Terminology consistency: the same source term translated differently
   across pairs; violations of the pinned glossaries; wrong vanilla terms.
 - UNTRANSLATED (English left in the translation, or the translation equals
-  the source), broken grammar, meaning flips, wrong-domain homonyms
-  (Lead the metal vs a leash), SOURCE_GARBAGE typos, truncated strings.
+  the source), broken grammar, meaning flips, wrong-domain homonyms,
+  SOURCE_GARBAGE typos, truncated strings.
 - Formatting codes / numbers / tags mismatching the source.
 - Glue artifacts, calques, invented words, awkward style.
 
@@ -4241,12 +5317,62 @@ included. No objects, no explanations, no text outside the JSON array."""
 # batch up to this many times with backoff — never split it.
 _QA_MAX_RETRIES = 10
 
+# ТЗ-Жюри п.4: phase-2.5 foreman prompt. Disputed pairs (a SPLIT verdict:
+# one judge flagged, another passed) are re-asked to the PRIMARY judge
+# with this prompt and an effort one step above the judges (see
+# _qa_bump_effort). The foreman verdict is FINAL: confirmed -> the
+# standard apply pipeline, cleared -> the pair stays clean.
+_QA_FOREMAN_PROMPT_TEMPLATE = """You are the foreman of a translation audit jury for Minecraft modpack quest
+files (SNBT, FTB Quests). You will receive pairs that produced a SPLIT
+VERDICT in automated screening: one screening flagged the pair as possibly
+problematic, another passed it. Examine each pair yourself, from scratch,
+and issue the final verdict.
+
+Each object has: "id" — pair identifier, "source" (original English string),
+"translation" (the {target_language} translation produced by another model).
+An aggregated term map may be attached.
+
+Minecraft formatting codes (&l, &r, &0-&f, &#RRGGBB) are markup, not text.
+Tags like #minecraft:logs are technical identifiers. Mod names (AE2, JEI,
+Mekanism) and @-handles / recipe IDs / NBT paths stay in English BY DESIGN —
+never report them as UNTRANSLATED. Pinned modpack glossary and official
+vanilla terms are MANDATORY and authoritative.
+
+Judge meaning, not style preferences. A split verdict often means the issue
+is subtle or borderline: check for terminology drift against the term map,
+wrong-domain homonyms, meaning flips, broken
+grammar, untranslated fragments, code/number mismatches. Borderline style
+taste is NOT a problem — if the translation is faithful, natural, and
+terminologically correct, it passes.
+
+Output ONLY a JSON array. For each pair with a REAL problem output one
+object:
+{"id": <id>, "category": "<from: UNTRANSLATED|WRONG_DOMAIN|GRAMMAR|
+MEANING_FLIP|SOURCE_GARBAGE|TRUNCATED|CODES_MISMATCH|NUMBERS_MISMATCH|
+GLUE_ARTIFACT|CALQUE|INVENTED_WORD|VANILLA_TERM|GLOSSARY_VIOLATION|
+GLOSSARY_AWKWARD|PROPER_NOUN|TERM_INCONSISTENT|STYLE>",
+"severity": "hard|soft",
+"issue": "<one-line non-empty explanation>",
+"suggested": "<the full corrected translation, or null if genuinely
+impossible>",
+"glossary_fix": {"en": "<term>", "ru": "<canonical ru>"}}
+Pairs without problems are never mentioned. Empty array if all pairs pass.
+No text outside the JSON array."""
+
+# ТЗ-Жюри: foreman disputed-batch chunk (same chunking discipline as the
+# arbitration — one call per chunk keeps the response under the ceiling).
+_QA_FOREMAN_CHUNK = 40
+
+# Transient HTTP codes (rate limit / overloaded server) retry the SAME
+# batch up to this many times with backoff — never split it.
+_QA_MAX_RETRIES = 10
+
 # The auditor uses its own fixed-timeout client: the main translation's
 # timeout ladder (main run) must not leak into the QA phase — the QA
-# auditor has its own fixed ceiling (ТЗ-health п.1: read 90s, connect 10s).
+# auditor has its own fixed ceiling (read 180s, connect 10s).
 # Recreating the SHARED client at a different timeout mid-run would disturb
 # the main translation. Separate cache, same pattern as the shared one.
-_QA_HTTP_TIMEOUT = 90.0
+_QA_HTTP_TIMEOUT = 180.0
 
 # RAW DUMP (ТЗ2.1-1): with SNBT_QA_DEBUG=1 every raw auditor response
 # (main scan / arbitration / pass-2, including every split half) is
@@ -4295,6 +5421,134 @@ def _qa_temperature_value(value) -> float:
 DATASET_DIR = Path.home() / ".snbt-tr" / "datasets"
 _DATASET_FLUSH_EVERY = 200
 
+# ТЗ-v4 C7: ONE dataset jsonl per RUN, not per file. A run (one SNBT batch
+# or one CLI invocation) spans N files; each _run_qa_phase_async call
+# APPENDS its records to the same file. The id is minted by qa_run_start()
+# at the start of the run (GUI Worker.process / CLI / JSONManager) and
+# cleared by qa_run_finish().
+_QA_RUN_STATE: dict = {}
+
+
+def qa_run_start() -> str:
+    """Open a new QA run scope; returns the run id (also stored in
+    _QA_RUN_STATE['dataset_path'] writer-agnostic)."""
+    _QA_RUN_STATE.clear()
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    _QA_RUN_STATE["run_id"] = run_id
+    _QA_RUN_STATE["started"] = time.time()
+    # C8/C9: run-level QA aggregation over every file of the run.
+    _QA_RUN_STATE["qa_scanned"] = 0
+    _QA_RUN_STATE["qa_passed_through"] = 0
+    _QA_RUN_STATE["qa_counters"] = {}
+    _QA_RUN_STATE["qa_files"] = 0
+    _QA_RUN_STATE["qa_jury"] = []
+    return run_id
+
+
+def _qa_jury_run_line(stats: dict) -> str:
+    """ТЗ-v4.5 п.4: ONE aggregate [JURY] line for the whole run.
+
+    The per-file line is already printed live while each file is audited;
+    replaying all of them at the end left the run without a single summary.
+    """
+    if not stats or not stats.get("files"):
+        return ""
+    judges = int(stats.get("judges") or 1)
+    findings = stats.get("findings") or {}
+    total = sum(int(v or 0) for v in findings.values())
+    if judges >= 2:
+        per = ", ".join(f"{_qa_judge_label(int(ji))} {int(n or 0)} finding(s)"
+                        for ji, n in sorted(findings.items()))
+        judged = int(stats.get("judged") or 0)
+        agreed = int(stats.get("agreed") or 0)
+        pct = (100.0 * agreed / judged) if judged else 100.0
+        line = (f"[JURY] run total: {stats['files']} file(s), {total} finding(s) ({per})"
+                f" | agreement {pct:.0f}% | threshold {int(stats.get('threshold') or 0)}/"
+                f"{int(stats.get('live') or 0)} | confirmed {int(stats.get('confirmed') or 0)}, "
+                f"disputed {int(stats.get('disputed') or 0)}")
+    else:
+        line = (f"[JURY] run total: {stats['files']} file(s), {total} finding(s), "
+                f"threshold {int(stats.get('threshold') or 0)}/1, "
+                f"confirmed {int(stats.get('confirmed') or 0)}")
+    if stats.get("disputed"):
+        line += (f" | foreman confirmed {int(stats.get('foreman_confirmed') or 0)}, "
+                 f"cleared {int(stats.get('foreman_cleared') or 0)}")
+    return line
+
+
+def qa_run_finish(logger=None) -> Optional[dict]:
+    """Close the run scope; returns and (optionally) logs the aggregate.
+
+    ТЗ-v4 C8/C9: one final [QA] line + one jury line for the WHOLE run
+    (across every SNBT/JSON file the run processed).
+    """
+    totals = dict(_QA_RUN_STATE)
+    _QA_RUN_STATE.clear()
+    if not totals or not totals.get("run_id"):
+        return totals
+    scanned = totals.get("qa_scanned", 0)
+    passed = totals.get("qa_passed_through", 0)
+    files = totals.get("qa_files", 0)
+    cnt = totals.get("qa_counters") or {}
+    line = (f"[QA] run total: {files} file(s), scanned {scanned} pair(s)"
+            f"{f', {passed} passed through (already in the target language)' if passed else ''}"
+            f" — hard {int(cnt.get('hard', 0))}, soft-fixed {int(cnt.get('soft_fixed', 0))}, "
+            f"warnings {int(cnt.get('warnings', 0))}, glossary +{int(cnt.get('glossary', 0))}, "
+            f"unresolved {int(cnt.get('unresolved', 0))}")
+    if logger:
+        logger(line)
+        agg_line = _qa_jury_run_line(totals.get("qa_jury_stats") or {})
+        if agg_line:
+            logger(agg_line)
+        else:
+            # legacy path: only pre-formatted per-file strings were recorded
+            for jl in (totals.get("qa_jury") or []):
+                logger(jl)
+    return totals
+
+
+def qa_run_note_file(scanned: int, passed_through: int, counters: dict,
+                     jury_line: str = "", jury_stats: Optional[dict] = None) -> None:
+    """Accumulate one file's QA outcome into the run aggregate (C8/C9)."""
+    st = _QA_RUN_STATE
+    if not st:
+        return
+    st["qa_scanned"] = st.get("qa_scanned", 0) + int(scanned or 0)
+    st["qa_passed_through"] = st.get("qa_passed_through", 0) + int(passed_through or 0)
+    st["qa_files"] = st.get("qa_files", 0) + 1
+    cnt = st.setdefault("qa_counters", {})
+    for k, v in (counters or {}).items():
+        if isinstance(v, (int, float)):
+            cnt[k] = cnt.get(k, 0) + v
+    if jury_line:
+        st.setdefault("qa_jury", []).append(jury_line)
+    if jury_stats:
+        # ТЗ-v4.5 п.4: numeric accumulation -> ONE aggregate line at finish.
+        agg = st.setdefault("qa_jury_stats", {})
+        agg["files"] = agg.get("files", 0) + 1
+        agg["judges"] = max(agg.get("judges", 0), int(jury_stats.get("judges") or 0))
+        agg["live"] = max(agg.get("live", 0), int(jury_stats.get("live") or 0))
+        agg["threshold"] = max(agg.get("threshold", 0), int(jury_stats.get("threshold") or 0))
+        for k in ("judged", "agreed", "confirmed", "disputed",
+                  "foreman_confirmed", "foreman_cleared"):
+            agg[k] = agg.get(k, 0) + int(jury_stats.get(k) or 0)
+        f = agg.setdefault("findings", {})
+        for ji, n in (jury_stats.get("findings") or {}).items():
+            f[int(ji)] = f.get(int(ji), 0) + int(n or 0)
+
+
+def _qa_run_dataset_path(modpack_root) -> Optional[Path]:
+    """One dataset file per run: run_id keeps every file of the same run
+    appending into the same jsonl (C7). None → per-file legacy naming."""
+    run_id = _QA_RUN_STATE.get("run_id")
+    if not run_id:
+        return None
+    try:
+        pack = _glossary_id(modpack_root)
+    except Exception:
+        return None
+    return DATASET_DIR / pack / f"run_{run_id}.jsonl"
+
 
 class QADataSetWriter:
     """Buffered JSONL writer for one QA run (one file, append per file batch).
@@ -4307,7 +5561,7 @@ class QADataSetWriter:
     of the run — the translation pipeline must never feel it.
     """
 
-    def __init__(self, modpack_root, meta: dict, logger=None):
+    def __init__(self, modpack_root, meta: dict, logger=None, path: Optional[Path] = None):
         self._records: List[dict] = []
         self._count = 0
         self._failed = False
@@ -4316,18 +5570,29 @@ class QADataSetWriter:
         self._path: Optional[Path] = None
         self._meta_written = False
         try:
-            pack = _glossary_id(modpack_root)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            self._path = DATASET_DIR / pack / f"{ts}.jsonl"
-            # Two runs started in the same second must not mix records:
-            # append _1/_2/... until the name is free.
-            seq = 0
-            while self._path.exists():
-                seq += 1
-                self._path = DATASET_DIR / pack / f"{ts}_{seq}.jsonl"
+            # ТЗ-v4 C7: one jsonl per RUN (qa_run_start id) unless a legacy
+            # caller passes its own path. The meta line is written only when
+            # the file does not exist yet (the first file of the run).
+            self._path = path or (DATASET_DIR / _glossary_id(modpack_root)
+                                  / f"{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+            if path is None:
+                run_path = _qa_run_dataset_path(modpack_root)
+                if run_path is not None:
+                    self._path = run_path
+                else:
+                    # legacy per-file mode: two writers in the same second
+                    # must not mix records — bump the seq suffix.
+                    seq = 0
+                    while self._path.exists() and self._path.stat().st_size > 0:
+                        seq += 1
+                        self._path = self._path.with_name(
+                            f"{time.strftime('%Y%m%d_%H%M%S')}_{seq}.jsonl")
             self._meta = dict(meta or {})
             self._meta["meta"] = True
             self._meta["ts"] = self._meta.get("ts") or time.strftime("%Y-%m-%d %H:%M:%S")
+            # Append mode: a run file may already hold earlier files' records.
+            self._append = self._path.exists() and self._path.stat().st_size > 0
+            self._meta_written = self._append
         except Exception as e:
             self._fail(e)
 
@@ -4385,7 +5650,7 @@ _qa_httpx_clients: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
 
 def _get_qa_httpx_client() -> httpx.AsyncClient:
-    """Per-loop cached httpx client for the QA phase (read 90s / connect 10s)."""
+    """Per-loop cached httpx client for the QA phase (read 180s / connect 10s)."""
     loop = asyncio.get_running_loop()
     client = _qa_httpx_clients.get(loop)
     if client is None or client.is_closed:
@@ -4554,6 +5819,14 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
             parsed = extract_qa_problems_array(content)
             if not isinstance(parsed, list):
                 raise ValueError("auditor response is not a JSON array")
+            if phase == "repair":
+                # ТЗ-v4.3 C.7: the repair pass must NOT lose a usable answer
+                # to the strict «id + category/severity» filter — production
+                # run 02.10 echoed the candidate array back and all 185
+                # records were dropped here ('0 re-issued'). Everything with
+                # an id goes through _qa_repair_answer/normalize instead.
+                return [item for item in parsed
+                        if isinstance(item, dict) and "id" in item]
             problems = []
             for item in parsed:
                 if isinstance(item, dict) and "id" in item and ("category" in item or "severity" in item):
@@ -4590,11 +5863,29 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
                 # nothing will succeed on it — fail loudly instead of
                 # hammering the broken server with more requests.
                 raise RuntimeError(f"auditor HTTP {code} on benched key ...{_key_suffix(key)}")
-            raise RuntimeError(f"auditor HTTP error: {code}")
+            detail = _http_error_detail(e.response)
+            if code == 404:
+                # A 404 on /chat/completions is a model-id problem (an
+                # unknown reasoning suffix like '/max' kept glued to the
+                # model, a paused deployment, a typo). Deterministic for
+                # this model — never a batch-size problem.
+                raise RuntimeError(f"auditor HTTP 404 (model '{model_text}'): {detail or 'model not available'}")
+            raise RuntimeError(f"auditor HTTP error: {code}" + (f" — {detail}" if detail else ""))
         except httpx.TimeoutException:
             # Read timeouts ARE size-related: re-raise so _qa_scan_pairs
             # can split the batch (smaller prompt -> faster answer).
             raise
+        except UnicodeEncodeError:
+            # ТЗ-v4 A2: a non-ASCII key cannot serialize into the
+            # Authorization header — the client fails BEFORE any request
+            # goes out. Deterministic, key-local: bench the key and fail
+            # the call so the jury/scanner treats it as a dead key, never
+            # as a size problem (no BinarySplit waterfall).
+            health_note_request(key, 0.0, failed=True)
+            if not health_is_benched(key):
+                health_bench_now(key, "invalid key (non-ASCII)")
+            _health_log(logger, f"[POOL] key ...{_key_suffix(key)} benched (invalid key: non-ASCII)")
+            raise RuntimeError(f"invalid API key (non-ASCII) on key ...{_key_suffix(key)} — keys failed")
 
 
 async def _qa_retry_send(candidates: List[dict], prompt: str, api_keys: List[str], provider: str,
@@ -4681,7 +5972,10 @@ async def _qa_retry_send(candidates: List[dict], prompt: str, api_keys: List[str
                 await asyncio.sleep(pause)
                 key_idx += 1
                 continue
-            raise RuntimeError(f"auditor HTTP error: {code}")
+            detail = _http_error_detail(e.response)
+            if code == 404:
+                raise RuntimeError(f"auditor HTTP 404 (model '{model_text}'): {detail or 'model not available'}")
+            raise RuntimeError(f"auditor HTTP error: {code}" + (f" — {detail}" if detail else ""))
         except httpx.TimeoutException:
             # size-related: let the splitter below halve the candidate list
             raise
@@ -4690,8 +5984,28 @@ async def _qa_retry_send(candidates: List[dict], prompt: str, api_keys: List[str
 # Speed-pack п.1: candidates per ONE batch-retry call (15-20 by the spec).
 _QA_RETRY_CHUNK = 20
 
+# ТЗ-v4.1 F12.1: a one-key run retries a timed-out batch on the SAME keys
+# before any splitting, pausing this long between attempts.
+_QA_TIMEOUT_PAUSE = 30.0
+_QA_TIMEOUT_ATTEMPTS = 3
+
+
+def _qa_cooldown_wait(api_keys: List[str]) -> float:
+    """Pause before retrying a timed-out QA batch (F12.1).
+
+    At least the base pause; longer when the key is on a single-key
+    cooldown, so the retry does not hit the endpoint while it is still
+    recovering.
+    """
+    wait = _QA_TIMEOUT_PAUSE
+    for k in api_keys or []:
+        remaining = health_cooldown_remaining(k)
+        if remaining:
+            wait = max(wait, min(remaining, 180.0))
+    return wait
+
 # Нит 1 (m11236): pairs per ONE arbitration call — chunked parallel arb
-# keeps every request under the 90s read-timeout ceiling.
+# keeps every request under the read-timeout ceiling.
 _QA_ARB_CHUNK = 40
 
 async def _qa_scan_retries(candidates: List[dict], prompt: str, api_keys: List[str], provider: str,
@@ -4714,7 +6028,11 @@ async def _qa_scan_retries(candidates: List[dict], prompt: str, api_keys: List[s
         msg = str(e)
         if ("keys failed" in msg or "keys unavailable" in msg
                 or "server unavailable" in msg
-                or "no API keys" in msg or "no base URL" in msg):
+                or "no API keys" in msg or "no base URL" in msg
+                or "auditor HTTP 404" in msg):
+            # 404 is a deterministic model-id problem: splitting the batch
+            # cannot fix it, it only turns one error into a request waterfall
+            # (30 -> 15 -> 7 -> 3 -> 2 -> per-pair failures).
             raise
         if len(candidates) == 1:
             logger(f"[QA] retry-batch failed for candidate id {candidates[0].get('id')}: "
@@ -4768,32 +6086,66 @@ async def _qa_scan_pairs(pairs: List[dict], prompt: str, api_keys: List[str], pr
             sources, modpack_terms, limit=60,
             label="Pinned modpack glossary (MANDATORY)", lenient=True)
     full_prompt = prompt + vanilla_ctx + modpack_ctx + _qa_aggregate_term_map(pairs)
-    try:
-        return await _qa_send(pairs, full_prompt, api_keys, provider, model_text,
-                              custom_base_url, logger, check_status, temperature,
-                              phase=phase, batch_label=batch_label, ids_only=ids_only)
-    except AbortException:
-        raise
-    except Exception as e:
-        # Fatal (auth / exhausted retries / config) errors must NOT split
-        # the batch — splitting a dead-key error recreates the waterfall.
-        msg = str(e)
-        if ("keys failed" in msg or "keys unavailable" in msg
-                or "server unavailable" in msg
-                or "no API keys" in msg or "no base URL" in msg):
+    # ТЗ-v4.1 F12.1: a timeout is not death. Pause, retry the batch, and for
+    # a multi-pair batch split it in half (each half gets its own attempts) —
+    # a one-key run must never end at "no keys at all".
+    timeout_attempt = 0
+    while True:
+        try:
+            return await _qa_send(pairs, full_prompt, api_keys, provider, model_text,
+                                  custom_base_url, logger, check_status, temperature,
+                                  phase=phase, batch_label=batch_label, ids_only=ids_only)
+        except AbortException:
             raise
-        if len(pairs) == 1:
-            logger(f"[QA] scan failed for pair id {pairs[0].get('id')}: {repr(e)[:120]} — kept the existing translation")
-            return []
-        mid = len(pairs) // 2
-        logger(f"[QA] {phase}: batch of {len(pairs)} split in halves after: {repr(e)[:80]}")
-        left = await _qa_scan_pairs(pairs[:mid], prompt, api_keys, provider, model_text,
-                                    custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
-                                    temperature, phase, batch_label + "L", ids_only)
-        right = await _qa_scan_pairs(pairs[mid:], prompt, api_keys, provider, model_text,
-                                     custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
-                                     temperature, phase, batch_label + "R", ids_only)
-        return left + right
+        except httpx.TimeoutException:
+            timeout_attempt += 1
+            if timeout_attempt > _QA_TIMEOUT_ATTEMPTS:
+                raise
+            wait = _qa_cooldown_wait(api_keys)
+            logger(f"[QA] {phase}: timeout on batch of {len(pairs)} — "
+                   f"pausing {wait:.0f}s then retry {timeout_attempt}/{_QA_TIMEOUT_ATTEMPTS}")
+            if check_status:
+                await check_status()
+            await asyncio.sleep(wait)
+            if len(pairs) > 1:
+                mid = len(pairs) // 2
+                logger(f"[QA] {phase}: batch of {len(pairs)} split in halves after the timeout")
+                left = await _qa_scan_pairs(pairs[:mid], prompt, api_keys, provider, model_text,
+                                            custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
+                                            temperature, phase, batch_label + "L", ids_only)
+                right = await _qa_scan_pairs(pairs[mid:], prompt, api_keys, provider, model_text,
+                                             custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
+                                             temperature, phase, batch_label + "R", ids_only)
+                return left + right
+            continue
+        except Exception as e:
+            # Fatal (auth / exhausted retries / config) errors must NOT split
+            # the batch — splitting a dead-key error recreates the waterfall.
+            msg = str(e)
+            if ("keys failed" in msg or "keys unavailable" in msg
+                    or "server unavailable" in msg
+                    or "no API keys" in msg or "no base URL" in msg
+                    or "auditor HTTP 404" in msg):
+                # 404 is a deterministic model-id problem: splitting the batch
+                # cannot fix it, it only turns one error into a request waterfall
+                # (30 -> 15 -> 7 -> 3 -> 2 -> per-pair failures).
+                raise
+            if len(pairs) == 1:
+                logger(f"[QA] scan failed for pair id {pairs[0].get('id')}: {repr(e)[:120]} — kept the existing translation")
+                # F12.3: nobody ever audited this pair — flag it, do not let
+                # the empty answer read as a clean verdict.
+                if pairs[0].get("id") is not None:
+                    _QA_SCAN_FAILED_IDS.add(pairs[0]["id"])
+                return []
+            mid = len(pairs) // 2
+            logger(f"[QA] {phase}: batch of {len(pairs)} split in halves after: {repr(e)[:80]}")
+            left = await _qa_scan_pairs(pairs[:mid], prompt, api_keys, provider, model_text,
+                                        custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
+                                        temperature, phase, batch_label + "L", ids_only)
+            right = await _qa_scan_pairs(pairs[mid:], prompt, api_keys, provider, model_text,
+                                         custom_base_url, logger, check_status, vanilla_gloss, modpack_terms,
+                                         temperature, phase, batch_label + "R", ids_only)
+            return left + right
 
 
 def _qa_target_script(qa_params: dict, pairs: List[dict]) -> str:
@@ -4817,6 +6169,28 @@ def _qa_target_script(qa_params: dict, pairs: List[dict]) -> str:
         elif tr:
             other += 1
     return "cyrillic" if cyr > other else "latin"
+
+
+def _qa_source_is_cyrillic(source: str) -> bool:
+    """ТЗ-v4.1 B5: True when the SOURCE string is already Russian.
+
+    A partially-translated modpack feeds ru→ru pairs to a Russian run: the
+    source is target-language text, so any audit/retry of them is waste
+    (and the retry can only damage them).
+
+    Criterion (v4.1): >=60% of the LETTERS are cyrillic, not 50% of the
+    words — a mostly-English line that carries one Russian word used to
+    pass the word-majority test and was wrongly skipped.
+    """
+    if not source:
+        return False
+    stripped = MC_CODE.sub('', source)
+    cyr = len(CYRILLIC_CHARS.findall(stripped))
+    lat = len(LATIN_CHARS.findall(stripped))
+    total = cyr + lat
+    if total == 0:
+        return False
+    return cyr / total >= 0.6
 
 
 def _qa_script_violations(pairs: List[dict], target_script: str) -> List[Tuple[dict, str]]:
@@ -4965,6 +6339,449 @@ def _qa_machine_problems(pairs: List[dict]) -> List[dict]:
     return out
 
 
+def _qa_resolve_pool(qa_params: dict, translator, logger) -> List[str]:
+    """ТЗ-v4.4: the ONE key resolution shared by the pipeline AND the audit.
+
+    ТЗ-v4.2 4.1/4.3/4.4: the audit runs on the provider pool — the very keys
+    the translation workerpool used — and never on a private "QA pool". The
+    legacy QA-keys field is used only as a last-resort degradation for
+    CLI/library callers that never plumb a provider pool in.
+    """
+    provider = qa_params.get("provider") or ""
+    legacy_keys = sanitize_api_keys(qa_params.get("keys") or [], logger,
+                                    origin=f"qa/{provider}")
+    api_keys = sanitize_api_keys((qa_params.get("provider_pool") or {}).get(provider) or [],
+                                 logger, origin=f"qa-pool/{provider}")
+    if not api_keys and provider == "Mixed Providers":
+        # The mixed pool lives on the translator, not in the config pools.
+        api_keys = sanitize_api_keys(
+            [e.get("api_key") for e in (getattr(translator, "mixed_pool", None) or [])
+             if isinstance(e, dict) and e.get("api_key")],
+            logger, origin="qa-mixed")
+    if api_keys:
+        if legacy_keys:
+            logger(f"[QA] legacy QA key field ignored — using provider pool "
+                   f"({len(api_keys)} keys)")
+    elif legacy_keys:
+        # No provider pool plumbed in at all (CLI/library callers, tests):
+        # degrade to the old field instead of skipping the phase.
+        api_keys = legacy_keys
+        logger(f"[QA] provider pool unavailable — falling back to the legacy "
+               f"QA key field ({len(api_keys)} key(s))")
+    # ТЗ-v4.2 4.2: a personal key typed in a judge row joins the shared
+    # pool — it never shrinks the audit to a serial single-key run.
+    extra_keys = sanitize_api_keys(qa_params.get("extra_keys") or [], logger,
+                                   origin="qa-extra")
+    if extra_keys:
+        before = len(api_keys)
+        api_keys = sanitize_api_keys(list(api_keys) + extra_keys, logger,
+                                     origin="qa-shared")
+        if len(api_keys) > before:
+            logger(f"[QA] {len(api_keys) - before} personal judge key(s) joined "
+                   f"the shared pool")
+    if not api_keys:
+        api_keys = sanitize_api_keys(getattr(translator, "api_keys", None) or [],
+                                     logger, origin=f"qa-main/{provider}")
+    return api_keys
+
+
+# ТЗ-v4.4: pipeline pair ids start far above any real pair index so that a
+# stray id leaking into the module-level failure registry can never collide
+# with a tail-phase pair id (the registry is cleared per phase anyway).
+_QA_PIPELINE_ID_BASE = 1000000
+
+
+class _QAPrefetch:
+    """ТЗ-v4.4: run the audit WHILE the file is still being translated.
+
+    The translator hands every COMPLETED batch of {source: translation} to
+    feed(); background workers run the SAME phase-1 (ids-only) scan the tail
+    phase would run later — same judge roster, same shared pool, same
+    prompts. Phase 2 is pipelined the same way: as soon as every live judge
+    has looked at a pair and the votes reach the consensus threshold, the
+    full verdict scan is issued for it.
+
+    The tail phase ADOPTS whatever is ready when the translation ends. The
+    join is keyed by SOURCE STRING (the two sides number their ids
+    independently) and adoption happens ONLY when every live judge covered
+    every pair with no failed batch; anything else makes the tail fall back
+    to its own synchronous scan. The pipeline is therefore pure
+    optimization: totals, apply order and survival rules are decided by the
+    tail exactly as before.
+    """
+
+    def __init__(self, qa_params: dict, translator, logger, check_status,
+                 lang_name: str, batch_size: int):
+        self.log = logger
+        self.check_status = check_status
+        self.qa_params = qa_params
+        # The batch width MUST match the tail phase's, since it feeds the
+        # verdict-cache config hash: a different width would silently stop
+        # matching every verdict the tail wrote. Same clamp as core.py:6446.
+        try:
+            _qa_batch = int(qa_params.get("batch_size") or 40)
+        except (TypeError, ValueError):
+            _qa_batch = 40
+        self.BATCH = max(10, min(200, _qa_batch))
+        self.provider = qa_params.get("provider") or ""
+        self.model_text = qa_params.get("model") or ""
+        self.base_url = qa_params.get("custom_base_url")
+        self.temperature = qa_params.get("temperature")
+        self.lang_name = lang_name or "Russian"
+        self.jury_cfg = qa_params.get("jury_threshold") or 2
+        self.vanilla = load_vanilla_glossary()
+        self.modpack = getattr(translator, "modpack_glossary_terms", None) or {}
+        self.ids_prompt = _QA_IDS_PROMPT_TEMPLATE.replace("{target_language}", self.lang_name)
+        self.qa_prompt = QA_PROMPT_TEMPLATE.replace("{target_language}", self.lang_name)
+        self.api_keys = _qa_resolve_pool(qa_params, translator, logger)
+        self.judges = parse_qa_judges(qa_params)
+        if self.judges:
+            # Judge #1 audits on the SHARED pool (ТЗ-v4.2 4.2), exactly like
+            # the tail phase does; j2+ keep their own keys and those keys
+            # also join the pool (added, never replacing).
+            self.judges[0]["api_keys"] = list(self.api_keys)
+            extra = [k for j in self.judges[1:] for k in (j.get("api_keys") or []) if k]
+            if extra:
+                merged = sanitize_api_keys(list(self.api_keys) + extra, logger,
+                                           origin="jury-pool")
+                if len(merged) > len(self.api_keys):
+                    self.api_keys = merged
+        # Speed-pack п.4 / ТЗ-v4.4 п.2: the verdict cache is consulted BEFORE
+        # a pair enters the queue — a cached-clean pair costs no tokens.
+        self.vcache = None
+        self.cfg_hash = ""
+        if qa_params.get("verdict_cache", True):
+            try:
+                self.vcache = QAVerdictCache()
+                self.cfg_hash = QAVerdictCache.config_hash(
+                    self.model_text, self.temperature, batch_size, self.qa_prompt)
+            except Exception:
+                self.vcache = None
+        self.ready = bool(self.judges and self.api_keys and self.model_text
+                          and not any(u in self.provider for u in _QA_UNSUPPORTED_PROVIDERS))
+        n = len(self.judges)
+        self._flags: List[set] = [set() for _ in range(n)]
+        self._scanned: List[set] = [set() for _ in range(n)]
+        self._failed: List[set] = [set() for _ in range(n)]
+        # Per-judge keys that were rejected during the run: a judge rotates
+        # to another live key instead of dying on the first 401/402/403.
+        self._rejected: List[set] = [set() for _ in range(n)]
+        self._dead: set = set()
+        self._dead_reasons: Dict[int, str] = {}
+        self._votes: Dict[str, set] = {}
+        self._p2: Dict[str, List[dict]] = {}
+        self._p2_claimed: set = set()
+        self._source_of: Dict[int, str] = {}
+        self._pair_of: Dict[int, dict] = {}
+        self._fed: set = set()
+        self._cache_clean: set = set()
+        self._queues: List["asyncio.Queue"] = [asyncio.Queue() for _ in range(n)]
+        self.p2_queue: "asyncio.Queue" = asyncio.Queue()
+        self._tasks: List = []
+        self._closed = False
+        self._n = 0
+        self._batch_no = 0
+        if self.ready:
+            self.log(f"[QA] pipeline: audit starts DURING the translation — "
+                     f"{n} judge(s), {len(self.api_keys)} pool key(s), "
+                     f"batches of {self.BATCH}")
+
+    # -- producer ---------------------------------------------------------
+    def feed(self, pairs) -> None:
+        """Hand COMPLETED pairs ({source: translation}) to the pipeline."""
+        if not self.ready or self._closed:
+            return
+        batch: List[dict] = []
+        for source, translation in pairs:
+            if not source or not translation or source in self._fed:
+                continue
+            self._fed.add(source)
+            if self.vcache is not None and self.cfg_hash and self.vcache.get_clean(
+                    QAVerdictCache.key(source, translation, self.cfg_hash)):
+                self._cache_clean.add(source)
+                continue
+            self._n += 1
+            pid = _QA_PIPELINE_ID_BASE + self._n
+            self._source_of[pid] = source
+            pair = {"id": pid, "source": source, "translation": translation}
+            self._pair_of[pid] = pair
+            batch.append(pair)
+            if len(batch) >= self.BATCH:
+                self._push(batch)
+                batch = []
+        if batch:
+            self._push(batch)
+
+    def _push(self, batch: List[dict]) -> None:
+        for ji in range(len(self.judges)):
+            if ji in self._dead:
+                continue
+            self._queues[ji].put_nowait(list(batch))
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self) -> None:
+        if not self.ready or self._tasks:
+            return
+        for ji in range(len(self.judges)):
+            # The primary judge shares the TRANSLATION pool, so it runs ONE
+            # request at a time; judges with their own keys may use two.
+            for _ in range(self._n_workers_for(ji)):
+                self._tasks.append(asyncio.create_task(self._judge_worker(ji)))
+        self._p2_task = asyncio.create_task(self._p2_worker())
+
+    async def finish(self) -> None:
+        """No more input; let the workers drain, then report what is ready.
+
+        Order matters: the judges are closed and FULLY drained first, since
+        a worker that hits a broken batch requeues it — closing phase 2 too
+        early would strand that work behind the sentinel and silently lose
+        pairs. Only when every judge has stopped can phase 2 be swept.
+        """
+        if not self.ready or self._closed:
+            return
+        self._closed = True
+        # One sentinel per worker: a worker that meets a sentinel while work
+        # still sits behind it re-posts it, so a requeued batch is never
+        # stranded and no worker blocks forever on an empty queue.
+        for ji, q in enumerate(self._queues):
+            for _ in range(self._n_workers_for(ji)):
+                q.put_nowait(None)
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        # A judge can die while the workers run; that death only becomes
+        # final here, so the phase-2 sweep runs after the drain.
+        self._sweep_phase2()
+        if self._p2_task is None or self._p2_task.done():
+            # The phase-2 worker retired (abort) before the sweep fed it;
+            # restart it so the swept pairs are still scanned.
+            self._p2_task = asyncio.create_task(self._p2_worker())
+        self.p2_queue.put_nowait(None)
+        await asyncio.gather(self._p2_task, return_exceptions=True)
+        if self.vcache is not None:
+            try:
+                self.vcache.close()
+            except Exception:
+                pass
+
+    def abort(self) -> None:
+        """Stop the pipeline WITHOUT draining it (aborted file / nothing left).
+
+        Cancelling is the point: a run the user stopped, or a file with no
+        pairs left to audit, must not keep spending tokens in the background.
+        Idempotent — safe to call after a normal finish().
+        """
+        self._closed = True
+        for t in self._tasks:
+            t.cancel()
+        if self._p2_task is not None:
+            self._p2_task.cancel()
+        if self.vcache is not None:
+            try:
+                self.vcache.close()
+            except Exception:
+                pass
+
+    def _n_workers_for(self, ji: int) -> int:
+        """Worker count for one judge (must match start()'s spawn count)."""
+        return min(2 if ji else 1,
+                   max(1, len([k for k in (self.judges[ji].get("api_keys") or []) if k])))
+
+    # -- consumers --------------------------------------------------------
+    async def _judge_worker(self, ji: int) -> None:
+        judge = self.judges[ji]
+        keys = [k for k in (judge.get("api_keys") or []) if k]
+        q = self._queues[ji]
+        k_idx = 0
+        requeued: set = set()
+        try:
+            while True:
+                batch = await q.get()
+                if batch is None:
+                    # Re-post while work still sits behind the sentinel: the
+                    # split-and-retry path requeues a batch AFTER it, and a
+                    # stranded batch is a silently unaudited pair.
+                    if not q.empty():
+                        q.put_nowait(None)
+                        continue
+                    return
+                if ji in self._dead:
+                    continue
+                live = [k for k in keys if not health_is_benched(k)
+                        and k not in self._rejected[ji]]
+                if not live:
+                    self._mark_dead(ji, "slow/hung — keys benched after repeated timeouts/failures")
+                    continue
+                key = live[k_idx % len(live)]
+                k_idx += 1
+                self._batch_no += 1
+                label = f"pipe{self._batch_no}"
+                try:
+                    pseudo = await _qa_scan_pairs(
+                        batch, self.ids_prompt, [key],
+                        judge.get("provider") or self.provider,
+                        judge.get("model") or "", _qa_judge_base_url(judge),
+                        self.log, self.check_status, self.vanilla, self.modpack,
+                        judge.get("temperature"),
+                        phase=f"pipeline1-{_qa_judge_label(ji)}",
+                        batch_label=label, ids_only=True)
+                except AbortException:
+                    return
+                except Exception as e:
+                    msg = str(e)
+                    if ("keys failed" in msg or "keys unavailable" in msg
+                            or "server unavailable" in msg):
+                        # Same survival rule as the tail phase: ONE rejected
+                        # key is not a dead judge — retire that key and
+                        # requeue the batch for the next live one. Only an
+                        # exhausted key set kills the judge.
+                        self._rejected[ji].add(key)
+                        remaining = [k for k in keys if k not in self._rejected[ji]]
+                        if remaining:
+                            q.put_nowait(batch)
+                            continue
+                        self._mark_dead(ji, _qa_death_cause(e))
+                        continue
+                    first = batch[0]["id"]
+                    if first not in requeued and len(batch) > 1:
+                        # Same recovery as the tail phase: split once, then
+                        # give up and let the audit phase rescan the rest.
+                        requeued.add(first)
+                        mid = len(batch) // 2
+                        q.put_nowait(batch[:mid])
+                        q.put_nowait(batch[mid:])
+                        continue
+                    self._failed[ji].update(p["source"] for p in batch)
+                    self.log(f"[QA] pipeline: {_qa_judge_label(ji)} batch scan failed "
+                             f"({repr(e)[:100]}) — {len(batch)} pair(s) stay for the audit phase")
+                    continue
+                flagged = {_qa_coerce_pid(pv.get("id"))
+                           for pv in (pseudo or []) if isinstance(pv, dict)}
+                for p in batch:
+                    s = p["source"]
+                    self._scanned[ji].add(s)
+                    if p["id"] in flagged:
+                        self._flags[ji].add(s)
+                        self._votes.setdefault(s, set()).add(ji)
+                self._maybe_phase2(batch)
+        except AbortException:
+            return
+
+    def _mark_dead(self, ji: int, reason: str) -> None:
+        if ji in self._dead:
+            return
+        self._dead.add(ji)
+        self._dead_reasons[ji] = reason
+        self.log(f"[QA] pipeline: {_qa_judge_label(ji)} "
+                 f"({self.judges[ji].get('name')}) died during the translation-time "
+                 f"scan: {reason} — its votes are excluded")
+
+    def _maybe_phase2(self, batch: List[dict]) -> None:
+        """Queue the full verdict scan as soon as a pair's votes are final."""
+        for p in batch:
+            self._consider_phase2(p)
+
+    def _consider_phase2(self, p: dict) -> None:
+        s = p["source"]
+        if s in self._p2_claimed or s in self._p2:
+            return
+        live = [ji for ji in range(len(self.judges)) if ji not in self._dead]
+        if not live:
+            return
+        if any(s not in self._scanned[ji] for ji in live):
+            return
+        thr = _qa_consensus_threshold(len(live), self.jury_cfg)
+        if len(self._votes.get(s, ())) >= thr:
+            self._p2_claimed.add(s)
+            self.p2_queue.put_nowait([p])
+
+    def _sweep_phase2(self) -> None:
+        """Final pass: pairs whose votes only became complete after a death.
+
+        A judge that died mid-run never scanned the pairs still queued for
+        it, so those pairs can never reach the vote threshold. With that
+        judge excluded from the live list they ARE complete — the sweep
+        re-evaluates them so a death costs coverage, not the whole overlap.
+        """
+        for pid, pair in self._pair_of.items():
+            self._consider_phase2(pair)
+
+    async def _p2_worker(self) -> None:
+        try:
+            while True:
+                item = await self.p2_queue.get()
+                if item is None:
+                    return
+                chunk = list(item)
+                while len(chunk) < self.BATCH:
+                    try:
+                        nxt = self.p2_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:
+                        self.p2_queue.put_nowait(None)
+                        break
+                    chunk.extend(nxt)
+                try:
+                    probs = await _qa_scan_pairs(
+                        chunk, self.qa_prompt, self.api_keys, self.provider,
+                        self.model_text, self.base_url, self.log, self.check_status,
+                        self.vanilla, self.modpack, self.temperature,
+                        phase="pipeline2", batch_label="0")
+                except AbortException:
+                    return
+                except Exception as e:
+                    # Not fatal: the pair stays unclaimed so the tail phase
+                    # scans it itself, exactly as it does today.
+                    for p in chunk:
+                        self._p2_claimed.discard(p["source"])
+                    self.log(f"[QA] pipeline: phase-2 batch of {len(chunk)} failed "
+                             f"({repr(e)[:100]}) — left to the audit phase")
+                    continue
+                for prob in _qa_flatten_raw_verdicts(probs or []):
+                    pid = _qa_coerce_pid(prob.get("id"))
+                    source = self._source_of.get(pid) if pid is not None else None
+                    if source:
+                        self._p2.setdefault(source, []).append(prob)
+        except AbortException:
+            return
+
+    # -- consumer (tail phase) --------------------------------------------
+    def adopt(self, llm_pairs: List[dict]) -> Optional[dict]:
+        """Phase-1 results for these pairs, or None to scan synchronously."""
+        if not self.ready or not self.judges or not self._closed:
+            return None
+        live = [ji for ji in range(len(self.judges)) if ji not in self._dead]
+        if not live:
+            return None
+        if any(self._failed[ji] for ji in live):
+            return None
+        sources = {p["source"] for p in llm_pairs}
+        for ji in live:
+            if not sources <= self._scanned[ji]:
+                return None
+        flags_by_judge = [{s: (s in self._flags[ji]) for s in sources}
+                          for ji in range(len(self.judges))]
+        return {
+            "live": live,
+            "dead": {ji: self._dead_reasons.get(ji, "unknown cause")
+                     for ji in sorted(self._dead)},
+            "flags_by_judge": flags_by_judge,
+            "n": len(sources),
+        }
+
+    def take_phase2(self, source_to_id: Dict[str, int]) -> Dict[int, List[dict]]:
+        """The pipelined phase-2 verdicts, renumbered to the tail's ids."""
+        out: Dict[int, List[dict]] = {}
+        if not self.ready:
+            return out
+        for source, tid in source_to_id.items():
+            probs = self._p2.get(source)
+            if not probs:
+                continue
+            out[tid] = [{**pr, "id": tid} for pr in probs]
+        return out
+
+
 async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, translator,
                               cache, logger, check_status) -> None:
     """Audit-and-fix pass over the finished translations of ONE file.
@@ -4984,6 +6801,21 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         logger(msg)
         file_log.info(msg)
 
+    # ТЗ-v4.1 F12.3: pairs whose scan/arbitration failed stay FLAGGED. They
+    # must reach the unresolved counter and the dataset (action="warning") —
+    # the phase must never end with "skipped, translations kept as is" while
+    # flagged pairs silently disappear.
+    phase_unresolved: set = set()
+    # Pre-initialised so the handler below can never NameError on an early
+    # failure (provider check / key sanitation).
+    scanned = 0
+    passed_through_ids: set = set()
+    scan_failed_ids: set = set()
+    # ТЗ-v4.2 3: pairs the deterministic glossary pre-check flagged BEFORE
+    # the phase died. They were never arbitrated, so they are unresolved —
+    # pre-initialised so the failure handler below can still see them.
+    flagged_all: List[dict] = []
+
     try:
         pairs = [
             {"id": i, "source": s, "translation": t}
@@ -4997,10 +6829,17 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         if any(u in provider for u in _QA_UNSUPPORTED_PROVIDERS):
             qa_log(f"[QA] provider '{provider}' is not supported by the audit phase — skipped.")
             return
-        api_keys = [k for k in (qa_params.get("keys") or []) if k]
+        # ТЗ-v4.2 4.1/4.3/4.4: ONE pool for the whole run — the resolution is
+        # shared with the translation-time pipeline (ТЗ-v4.4).
+        api_keys = _qa_resolve_pool(qa_params, translator, qa_log)
         if not api_keys:
             qa_log("[QA] no live API keys — phase skipped (translations are kept as is).")
             return
+        # ТЗ-v4.1 F12.1: a one-key run must degrade to cooldown+retry, never
+        # to "no keys at all". ТЗ-v4.2 4.4: the size registered here IS the
+        # shared pool width — no per-role bookkeeping, no max() games.
+        health_set_pool_size(len(api_keys))
+        qa_log(f"[POOL] qa pool size = {len(api_keys)}")
         model_text = qa_params.get("model") or ""
         if not model_text:
             qa_log("[QA] no auditor model configured — phase skipped.")
@@ -5033,9 +6872,44 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         ds_action: Dict[int, str] = {}
         ds_retry: Dict[int, dict] = {}
         mt_snapshot: Dict[int, str] = {}
+        # ТЗ-Жюри: judge roster + per-judge phase-1 results + dataset fields.
+        qa_judges = parse_qa_judges(qa_params)
+        # ТЗ-v4.2 4.2: judge #1 (the primary auditor) ALWAYS runs on the
+        # shared provider pool — a personal j1 key must not shrink the audit
+        # to one serial key again. Extra judges (j2+) keep their own key for
+        # their OWN votes, but that key joins the shared pool as well
+        # (added, never replacing): the scan keeps its full parallelism even
+        # if a judge's private key dies.
+        if qa_judges:
+            qa_judges[0]["api_keys"] = list(api_keys)
+            extra_judge_keys = [k for j in qa_judges[1:] for k in (j.get("api_keys") or []) if k]
+            if extra_judge_keys:
+                merged = sanitize_api_keys(list(api_keys) + extra_judge_keys, qa_log,
+                                           origin="jury-pool")
+                if len(merged) > len(api_keys):
+                    api_keys = merged
+                    health_set_pool_size(len(api_keys))
+                    qa_log(f"[JURY] judge key(s) joined the shared pool — "
+                           f"[POOL] qa pool size = {len(api_keys)}")
+        jury_threshold_cfg = qa_params.get("jury_threshold") or 2
+        judge_findings: Dict[int, int] = {i: 0 for i in range(len(qa_judges))}
+        # ТЗ-v4 C9: the jury line (built after consensus) is folded into the
+        # run aggregate at the end of the phase.
+        jury_stats_line = ""
+        # ТЗ-v4.5 п.4: numeric jury statistics of THIS file — accumulated by
+        # qa_run_note_file and rendered once as the run's aggregate line.
+        jury_run_stats: dict = {}
+        ds_consensus: Dict[int, str] = {}
+        ds_foreman: Dict[int, str] = {}
+        jury_meta: List[dict] = [
+            {"name": j.get("name") or _qa_judge_label(i), "model": j.get("model") or ""}
+            for i, j in enumerate(qa_judges)
+        ]
+
         try:
             if qa_params.get("dataset", True):
                 ds_writer = QADataSetWriter(modpack_root, {
+                    "jury": jury_meta,
                     "pack": (Path(modpack_root).name if modpack_root else None),
                     "model": getattr(translator, "model", None) or qa_params.get("model"),
                     "temp": get_temperature(),
@@ -5046,6 +6920,10 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                     "lang": lang_name,
                     # ТЗ-health п.4: request-health aggregate for the run.
                     "health": health_totals(),
+                    # ТЗ-v4 C7: run scope (same file for every QA'd file of
+                    # the run when qa_run_start() opened one).
+                    "run_id": _QA_RUN_STATE.get("run_id") or None,
+                    "file": _QA_RUN_STATE.get("qa_files", 0) + 1,
                 }, logger=qa_log)
         except Exception as e:
             qa_log(f"[QA] dataset writer disabled: {repr(e)[:120]} — the run is unaffected")
@@ -5069,6 +6947,32 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         scanned = 0
         retranslated_pairs: List[dict] = []
         crippled_all: List[dict] = []
+
+        # ТЗ-v4 B5: ru→ru pass-through. A partially-translated modpack
+        # feeds pairs whose SOURCE is already target-language text — the
+        # audit/retry machinery can only damage them, so they are dropped
+        # from every tier (machine scan included) and counted as
+        # pass-through, not scanned. File-level gate: when >50% of the
+        # file's pairs are cyrillic-source, the WHOLE file passes through.
+        passed_through_ids: set = set()
+        passed_pairs: List[dict] = []
+        if _qa_target_script(qa_params, pairs) == "cyrillic":
+            ru_source = [p for p in pairs if _qa_source_is_cyrillic(p["source"])]
+            if ru_source and len(ru_source) > len(pairs) * 0.5:
+                passed_through_ids = {p["id"] for p in pairs}
+                passed_pairs = list(pairs)
+                qa_log(f"[QA] {len(pairs)} pair(s) are already in the target language — "
+                       f"the whole file passes through without an audit")
+                for p in pairs:
+                    ds_action.setdefault(p["id"], "passed_through")
+                pairs = []
+            elif ru_source:
+                passed_through_ids = {p["id"] for p in ru_source}
+                passed_pairs = list(ru_source)
+                qa_log(f"[QA] {len(ru_source)} pair(s) already in the target language — passed through")
+                for p in ru_source:
+                    ds_action.setdefault(p["id"], "passed_through")
+                pairs = [p for p in pairs if p["id"] not in passed_through_ids]
 
         # Deterministic script-artifact pre-check (zero tokens): glue
         # artifacts like 'Sсейчас' (mixed-script token) or 'S&lnow' (latin
@@ -5156,25 +7060,91 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         n_batches = len(batches)
         pair_batch_of = {p["id"]: bi for bi, batch in enumerate(batches) for p in batch}
 
-        # Phase 1: ids-only routing scan over the pairs the machine did not
-        # catch. Same workerpool (per-key), same BinarySplit recovery; the
-        # answer per batch is a bare id array -> [{"id": N}] pseudo-verdicts.
+        # Phase 1 (ТЗ-Жюри): ids-only routing scan over the pairs the
+        # machine did not catch. EVERY enabled judge scans the SAME batches
+        # with the SAME ids prompt (identical prompt by design), each with
+        # its own keys, in parallel. A judge = (model, api_keys, base_url,
+        # temperature); judge #1 is the current QA config (primary). Single
+        # judge -> exactly today's behavior (backward compatibility).
         ids_prompt = _QA_IDS_PROMPT_TEMPLATE.replace("{target_language}", lang_name)
         llm_batches = [llm_pairs[i:i + BATCH] for i in range(0, len(llm_pairs), BATCH)]
         n_ids_batches = len(llm_batches)
-        ids_results: List[List[dict]] = [[] for _ in range(n_ids_batches)]
-        if n_ids_batches:
+        # per-judge raw pseudo-verdict grids: [judge][batch] -> [{id}]
+        judge_ids_results: List[List[List[dict]]] = [
+            [[] for _ in range(n_ids_batches)] for _ in qa_judges]
+        # ТЗ-v4.5 п.1: the ids grid above is sized by the LLM batches, which
+        # are NARROWER than the full-batch grid whenever the machine scan or
+        # the verdict cache dropped pairs — indexing it with pair_batch_of
+        # (built over every pair) raised IndexError on exactly those runs.
+        llm_batch_of = {p["id"]: bi for bi, batch in enumerate(llm_batches) for p in batch}
+        dead_judges: set = set()
+        # ТЗ-v4 E11: human-readable cause per dead judge ('dead key' for
+        # auth failures vs 'slow/hung' for timeouts) in the death lines.
+        dead_reasons: Dict[int, str] = {}
+        # ТЗ-v4.4: phase-1/phase-2 results the translation-time pipeline
+        # already produced. Adoption is all-or-nothing: unless EVERY live
+        # judge covered EVERY llm_pair with no failed batch, the pipeline
+        # output is discarded and the scan below runs exactly as before.
+        pipeline = qa_params.get("prefetch")
+        adopted = None
+        if pipeline is not None:
+            try:
+                adopted = pipeline.adopt(llm_pairs)
+            except Exception as e:
+                qa_log(f"[QA] pipeline: adopting its phase-1 results failed "
+                       f"({repr(e)[:100]}) — rescanning as usual")
+                adopted = None
+        if adopted is not None:
+            dead_judges.update(adopted["dead"])
+            dead_reasons.update(adopted["dead"])
+            # The ids-only grid is [judge][batch] -> [{id}]; the pipeline
+            # answers per SOURCE (its ids are file-local and mean nothing
+            # here), so each flag is mapped onto this phase's id and dropped
+            # into the batch that owns the pair. The grid is only ever read
+            # as a flat per-judge stream during vote aggregation.
+            adopted_findings = 0
+            for p in llm_pairs:
+                bi = llm_batch_of.get(p["id"])
+                if bi is None:
+                    continue
+                # flags_by_judge is POSITIONAL (list indexed by judge), not a
+                # mapping — adopt() builds it with a comprehension over the
+                # judge roster.
+                for ji, flags in enumerate(adopted["flags_by_judge"]):
+                    if ji >= len(judge_ids_results):
+                        continue
+                    if flags.get(p["source"]):
+                        judge_ids_results[ji][bi].append({"id": p["id"]})
+                        adopted_findings += 1
+            qa_log(f"[QA] pipeline: adopted the translation-time phase-1 scan — "
+                   f"{adopted_findings} finding(s) over {len(llm_pairs)} pair(s), "
+                   f"{len(adopted['live'])}/{len(qa_judges)} judge(s) alive, no rescan")
+
+        async def judge_ids_scan(judge_idx: int):
+            """One judge's phase-1 scan: workerpool over its own keys."""
+            judge = qa_judges[judge_idx]
+            j_keys = [k for k in (judge.get("api_keys") or []) if k]
+            if not j_keys:
+                dead_judges.add(judge_idx)
+                qa_log(f"[JURY] {_qa_judge_label(judge_idx)} ({judge.get('name')}): no keys — excluded")
+                return
+            j_model = judge.get("model") or ""
+            if not j_model:
+                dead_judges.add(judge_idx)
+                qa_log(f"[JURY] {_qa_judge_label(judge_idx)}: no model — excluded")
+                return
+            j_base = _qa_judge_base_url(judge)
+            j_temp = judge.get("temperature")
+            j_results = judge_ids_results[judge_idx]
             ids_queue: "asyncio.Queue[int]" = asyncio.Queue()
             for bi in range(n_ids_batches):
                 ids_queue.put_nowait(bi)
             ids_requeued: set = set()
-            n_ids_workers = min(n_ids_batches, len(api_keys))
+            n_ids_workers = min(n_ids_batches, len(j_keys))
 
             async def ids_worker(worker_idx: int):
                 while True:
-                    # ТЗ-health п.2: worker keys are re-selected per batch so
-                    # a benched key hands its queue items to live workers.
-                    candidates = [k for k in api_keys if not health_is_benched(k)]
+                    candidates = [k for k in j_keys if not health_is_benched(k)]
                     if not candidates:
                         raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
                     key = candidates[worker_idx % len(candidates)]
@@ -5183,32 +7153,34 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                     except asyncio.QueueEmpty:
                         return
                     batch = llm_batches[bi]
-                    qa_log(f"[QA] phase 1 (ids): scanning {len(batch)} pairs (batch {bi + 1}/{n_ids_batches}, key ...{key[-4:]})...")
+                    qa_log(f"[JURY] {_qa_judge_label(judge_idx)} phase 1 (ids): scanning {len(batch)} pairs "
+                           f"(batch {bi + 1}/{n_ids_batches}, key ...{key[-4:]})...")
                     try:
                         pseudo = await _qa_scan_pairs(
-                            batch, ids_prompt, [key], provider, model_text,
-                            custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
-                            qa_temperature, phase="phase1", batch_label=str(bi + 1), ids_only=True)
-                        ids_results[bi] = pseudo
+                            batch, ids_prompt, [key], judge.get("provider") or provider,
+                            j_model, j_base, qa_log, check_status, vanilla_gloss, modpack_terms,
+                            j_temp, phase=f"phase1-{_qa_judge_label(judge_idx)}",
+                            batch_label=str(bi + 1), ids_only=True)
+                        j_results[bi] = pseudo
                     except AbortException:
                         raise
                     except Exception as e:
                         if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
-                            qa_log(f"[QA] phase-1 worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
+                            qa_log(f"[JURY] {_qa_judge_label(judge_idx)} phase-1 worker stopped "
+                                   f"(key ...{key[-4:]} rejected): {str(e)[:120]}")
                             ids_queue.put_nowait(bi)
                             return
                         if health_is_benched(key):
-                            # benched mid-flight: hand the batch to the queue
-                            # (another worker / the fallback drain picks it up)
-                            qa_log(f"[QA] phase-1 worker key ...{key[-4:]} benched — requeueing batch {bi + 1}")
+                            qa_log(f"[JURY] {_qa_judge_label(judge_idx)} phase-1 worker key ...{key[-4:]} "
+                                   f"benched — requeueing batch {bi + 1}")
                             ids_queue.put_nowait(bi)
                             return
                         if bi not in ids_requeued:
                             ids_requeued.add(bi)
                             ids_queue.put_nowait(bi)
                         else:
-                            _QA_COUNTERS["warnings"] += 1
-                            qa_log(f"[QA] phase-1 batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
+                            qa_log(f"[JURY] {_qa_judge_label(judge_idx)} phase-1 batch {bi + 1} scan failed twice "
+                                   f"({repr(e)[:120]}) — kept the existing translations")
                         return
 
             try:
@@ -5219,42 +7191,179 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                 aborts = [e for e in eg.exceptions if isinstance(e, AbortException)]
                 if aborts:
                     raise aborts[0]
+                non_abort = [e for e in eg.exceptions if not isinstance(e, AbortException)]
+                if non_abort:
+                    # the judge's whole scan is dead (all its keys) — exclude
+                    # its votes; the jury continues with the survivors
+                    dead_judges.add(judge_idx)
+                    dead_reasons[judge_idx] = _qa_death_cause(non_abort[0])
+                    qa_log(f"[JURY] {_qa_judge_label(judge_idx)} ({judge.get('name')}) died in phase 1: "
+                           f"{dead_reasons[judge_idx]} — its votes are excluded")
+                    return
                 raise
-            # fallback drain over live (non-benched) keys
+            # fallback drain over the judge's live keys
             while not ids_queue.empty():
                 bi = ids_queue.get_nowait()
                 batch = llm_batches[bi]
-                qa_log(f"[QA] phase 1 (ids): scanning {len(batch)} pairs (batch {bi + 1}/{n_ids_batches}, fallback all keys)...")
+                qa_log(f"[JURY] {_qa_judge_label(judge_idx)} phase 1 (ids): scanning {len(batch)} pairs "
+                       f"(batch {bi + 1}/{n_ids_batches}, fallback all keys)...")
                 try:
-                    live_keys = [k for k in api_keys if not health_is_benched(k)]
+                    live_keys = [k for k in j_keys if not health_is_benched(k)]
                     if not live_keys:
                         raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
-                    ids_results[bi] = await _qa_scan_pairs(
-                        batch, ids_prompt, live_keys, provider, model_text,
-                        custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
-                        qa_temperature, phase="phase1", batch_label=str(bi + 1), ids_only=True)
+                    j_results[bi] = await _qa_scan_pairs(
+                        batch, ids_prompt, live_keys, judge.get("provider") or provider,
+                        j_model, j_base, qa_log, check_status, vanilla_gloss, modpack_terms,
+                        j_temp, phase=f"phase1-{_qa_judge_label(judge_idx)}",
+                        batch_label=str(bi + 1), ids_only=True)
                 except AbortException:
                     raise
                 except Exception as e:
                     msg = str(e)
                     if ("keys failed" in msg or "keys unavailable" in msg
                             or "server unavailable" in msg):
-                        raise
-                    _QA_COUNTERS["warnings"] += 1
-                    qa_log(f"[QA] phase-1 batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — kept the existing translations")
-                    ids_results[bi] = []
+                        # the judge's LAST live key just died mid-fallback:
+                        # kill the judge honestly — its votes are excluded,
+                        # the remaining batches drain empty, the jury lives on
+                        dead_judges.add(judge_idx)
+                        dead_reasons[judge_idx] = _qa_death_cause(e)
+                        qa_log(f"[JURY] {_qa_judge_label(judge_idx)} ({judge.get('name')}) died in phase 1 "
+                               f"fallback: {dead_reasons[judge_idx]} — its votes are excluded")
+                        while not ids_queue.empty():
+                            try:
+                                dead_bi = ids_queue.get_nowait()
+                                j_results[dead_bi] = j_results[dead_bi] or []
+                            except asyncio.QueueEmpty:
+                                break
+                        return
+                    qa_log(f"[JURY] {_qa_judge_label(judge_idx)} phase-1 batch {bi + 1} scan failed "
+                           f"on fallback ({repr(e)[:120]}) — kept the existing translations")
+                    j_results[bi] = []
 
+        # ТЗ-v4.4: an adopted pipeline result means phase 1 has ALREADY run
+        # (during the translation) — the scan is skipped, but the survival
+        # bookkeeping below still runs so consensus sees the same shape.
+        if n_ids_batches and adopted is None:
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for ji in range(len(qa_judges)):
+                        tg.create_task(judge_ids_scan(ji))
+            except BaseExceptionGroup as eg:
+                aborts = [e for e in eg.exceptions if isinstance(e, AbortException)]
+                if aborts:
+                    raise aborts[0]
+                raise
+        if n_ids_batches:
+            live_judges = [ji for ji in range(len(qa_judges)) if ji not in dead_judges]
+            if len(qa_judges) >= 2 and not live_judges:
+                raise RuntimeError("all QA judges died in phase 1 — keys failed")
+            if len(qa_judges) >= 2 and len(live_judges) == 1:
+                qa_log(f"[JURY] only {_qa_judge_label(live_judges[0])} survived phase 1 "
+                       f"— switching to single-judge mode")
+            if len(qa_judges) >= 2:
+                qa_log(f"[JURY] phase 1 done: {len(live_judges)}/{len(qa_judges)} judge(s) alive")
+
+        # ТЗ-Жюри п.3: consensus aggregation. Per-pair votes over the
+        # SURVIVING judges; >= threshold -> phase 2; 1..threshold-1 votes ->
+        # disputed -> phase 2.5 foreman. Single judge: its flags ARE the
+        # consensus (threshold 1) — today's behavior.
+        live_judges = [ji for ji in range(len(qa_judges)) if ji not in dead_judges]
+        vote_map: Dict[int, set] = {}
+        for ji in live_judges:
+            for bi in range(n_ids_batches):
+                for pv in judge_ids_results[ji][bi]:
+                    pid = pv.get("id")
+                    if pid is not None and pid not in excluded_ids:
+                        vote_map.setdefault(pid, set()).add(ji)
+                        judge_findings[ji] += 1
+        threshold = _qa_consensus_threshold(len(live_judges), jury_threshold_cfg)
+        jury_buckets = _qa_jury_stats(judge_findings, vote_map, set(), threshold)
+        confirmed_ids: set = jury_buckets["confirmed"]
+        disputed_ids: set = jury_buckets["disputed"]
+        # the old single-judge path used ids_results; keep the phase-2 input
+        # under the same name (union over surviving judges == threshold logic)
         flagged_ids: set = set()
-        for bi in range(n_ids_batches):
-            for pv in ids_results[bi]:
-                pid = pv.get("id")
-                if pid is not None and pid not in excluded_ids:
-                    flagged_ids.add(pid)
+        if len(live_judges) == 1:
+            # single judge (or single survivor): its flags are the consensus
+            ji0 = live_judges[0]
+            flagged_ids = {pid for pid, votes in vote_map.items() if ji0 in votes}
+        else:
+            flagged_ids = set(confirmed_ids)
+        # dataset: consensus field per pair
+        for pid in confirmed_ids:
+            ds_consensus[pid] = "applied"
+        for pid in disputed_ids:
+            ds_consensus[pid] = "disputed"
+        # jury statistics line (ТЗ-Жюри п.5)
+        if len(qa_judges) >= 2:
+            judged_pairs = len(llm_pairs)
+            agree = 0
+            for p in llm_pairs:
+                pid = p["id"]
+                flagged_by = vote_map.get(pid, set())
+                if not flagged_by or len(flagged_by) == len(live_judges):
+                    agree += 1
+            agreement_pct = (100.0 * agree / judged_pairs) if judged_pairs else 100.0
+            findings_str = ", ".join(
+                f"{_qa_judge_label(ji)} {judge_findings[ji]} finding(s)"
+                for ji in range(len(qa_judges)) if ji not in dead_judges)
+            dead_str = (", " + ", ".join(
+                f"{_qa_judge_label(ji)} dead ({dead_reasons.get(ji, 'unknown cause')})"
+                for ji in sorted(dead_judges))) if dead_judges else ""
+            jury_stats_line = (f"[JURY] jury: {findings_str}{dead_str} | agreement {agreement_pct:.0f}% "
+                               f"| threshold {threshold}/{len(live_judges)} | "
+                               f"confirmed {len(confirmed_ids)}, disputed {len(disputed_ids)}")
+            qa_log(jury_stats_line)
+        elif len(qa_judges) == 1 and (confirmed_ids or disputed_ids):
+            jury_stats_line = (f"[JURY] single judge: {judge_findings.get(0, 0)} finding(s), "
+                               f"threshold {threshold}/1, confirmed {len(confirmed_ids)}")
+            qa_log(jury_stats_line)
+        # ТЗ-v4.5 п.4: the numeric side of the same statistics travels to the
+        # run scope — one aggregate [JURY] line at the end of the run instead
+        # of the per-file lines replayed five times.
+        jury_run_stats = {
+            "judges": len(qa_judges),
+            "live": len(live_judges),
+            "threshold": threshold,
+            "findings": {ji: judge_findings.get(ji, 0) for ji in range(len(qa_judges))},
+            "judged": len(llm_pairs),
+            "agreed": sum(1 for p in llm_pairs
+                          if not vote_map.get(p["id"]) or len(vote_map.get(p["id"], set())) == len(live_judges)),
+            "confirmed": len(confirmed_ids),
+            "disputed": len(disputed_ids),
+        }
         by_id_all = {p["id"]: p for p in pairs}
         flagged_pairs = [by_id_all[pid] for pid in sorted(flagged_ids) if pid in by_id_all]
 
+        # ТЗ-v4 A3: pairs whose LLM scan FAILED (dead judge/keys mid-run,
+        # double scan failure) are tracked here — they must stay dirty in
+        # the verdict cache and are NOT counted as scanned, so the next
+        # run re-audits them instead of trusting a phantom clean verdict.
+        # F12.3: failures registered by the scan helpers join this run's set.
+        scan_failed_ids: set = set(_QA_SCAN_FAILED_IDS)
+
         # Phase 2: full verdicts for the flagged pairs only (~10-20%).
         results: List[Optional[List[dict]]] = [None] * n_batches
+        # ТЗ-v4.4: verdicts the translation-time pipeline already produced for
+        # some of these pairs. A pair WITH a pipelined verdict is removed from
+        # the scan below and its verdicts are injected into the same grid the
+        # scan feeds, so the apply pipeline downstream is untouched. A pair
+        # WITHOUT one is scanned exactly as before. Extra verdicts for pairs
+        # the tail did not adopt are dropped on purpose (the tail's own
+        # phase 2 is authoritative).
+        pipelined_probs: Dict[int, List[dict]] = {}
+        if flagged_pairs and pipeline is not None:
+            try:
+                source_to_id = {p["source"]: p["id"] for p in flagged_pairs}
+                pipelined_probs = pipeline.take_phase2(source_to_id)
+            except Exception as e:
+                qa_log(f"[QA] pipeline: its phase-2 verdicts were unusable "
+                       f"({repr(e)[:100]}) — rescanning those pairs")
+                pipelined_probs = {}
+            if pipelined_probs:
+                qa_log(f"[QA] pipeline: {len(pipelined_probs)} flagged pair(s) already "
+                       f"have verdicts from the translation-time scan")
+                flagged_pairs = [p for p in flagged_pairs if p["id"] not in pipelined_probs]
         if flagged_pairs:
             qa_log(f"[QA] phase 2: {len(flagged_pairs)} flagged pair(s) — full verdict scan...")
             p2_batches = [flagged_pairs[i:i + BATCH] for i in range(0, len(flagged_pairs), BATCH)]
@@ -5302,6 +7411,8 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                         else:
                             _QA_COUNTERS["warnings"] += 1
                             qa_log(f"[QA] phase-2 batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
+                            # ТЗ-v4 A3: scan failure — no phantom clean.
+                            scan_failed_ids.update(p["id"] for p in batch)
                         return
 
             try:
@@ -5338,7 +7449,13 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             # distribute phase-2 verdicts back into the ORIGINAL batch grid
             # (ids coerced: models return "574"/573.0 just as often here)
             for bi, batch in enumerate(p2_batches):
-                for prob in (p2_results[bi] or []):
+                # ТЗ-v4 A3: a batch the workers+fallback never answered is
+                # a FAILED scan for every pair in it — the pairs keep their
+                # phase-1 flags (below) and are never marked clean.
+                if p2_results[bi] is None:
+                    scan_failed_ids.update(p["id"] for p in batch)
+                    continue
+                for prob in p2_results[bi]:
                     pid = _qa_coerce_pid(prob.get("id"))
                     if pid is None:
                         continue
@@ -5352,10 +7469,205 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         else:
             qa_log("[QA] two-phase audit: phase 1 flagged nothing — skipping the full verdict scan")
 
+        # ТЗ-v4.4: merge the pipelined verdicts into the SAME grid the phase-2
+        # scan feeds. Done after the scan so the log line above still reports
+        # what the tail itself issued; from here on the apply pipeline cannot
+        # tell the two sources apart.
+        for pid, probs in pipelined_probs.items():
+            obi = pair_batch_of.get(pid)
+            if obi is None:
+                continue
+            if results[obi] is None:
+                results[obi] = []
+            results[obi].extend({**pr, "id": pid} for pr in probs)
+
+        # ТЗ-Жюри п.4: phase 2.5 — the foreman resolves disputed pairs
+        # (votes below the threshold but nonzero, 2+ judges alive). The
+        # PRIMARY judge re-examines each disputed pair with the foreman
+        # prompt and one effort step above its own. Confirmed verdicts
+        # flow into the SAME apply pipeline (merged into the results grid
+        # below); cleared pairs stay clean (ds_consensus cleanup).
+        foreman_confirmed = 0
+        foreman_cleared = 0
+        if disputed_ids and len(live_judges) >= 2 and len(qa_judges) >= 2:
+            disputed_pairs = [by_id_all[pid] for pid in sorted(disputed_ids) if pid in by_id_all]
+            foreman_prompt = _QA_FOREMAN_PROMPT_TEMPLATE.replace("{target_language}", lang_name)
+            primary = qa_judges[0]
+            f_model = _qa_bump_effort(primary.get("model") or model_text)
+            f_base = _qa_judge_base_url(primary)
+            f_temp = primary.get("temperature")
+            qa_log(f"[QA] foreman: {len(disputed_pairs)} disputed pair(s) — primary re-examines "
+                   f"with effort {_qa_bump_effort(primary.get('model') or model_text)}")
+            foreman_batches = [disputed_pairs[i:i + _QA_FOREMAN_CHUNK]
+                               for i in range(0, len(disputed_pairs), _QA_FOREMAN_CHUNK)]
+            foreman_results: List[Optional[List[dict]]] = [None] * len(foreman_batches)
+            f_queue: "asyncio.Queue[int]" = asyncio.Queue()
+            for bi in range(len(foreman_batches)):
+                f_queue.put_nowait(bi)
+            f_requeued: set = set()
+            n_f_workers = min(len(foreman_batches), len(api_keys))
+
+            async def foreman_worker(worker_idx: int):
+                while True:
+                    candidates = [k for k in api_keys if not health_is_benched(k)]
+                    if not candidates:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    key = candidates[worker_idx % len(candidates)]
+                    try:
+                        bi = f_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    chunk = foreman_batches[bi]
+                    qa_log(f"[QA] foreman: examining {len(chunk)} disputed pair(s) "
+                           f"(batch {bi + 1}/{len(foreman_batches)}, key ...{key[-4:]})...")
+                    try:
+                        foreman_results[bi] = await _qa_scan_pairs(
+                            chunk, foreman_prompt, [key], provider, f_model,
+                            f_base, qa_log, check_status, vanilla_gloss, modpack_terms,
+                            f_temp, phase="foreman", batch_label=str(bi + 1))
+                    except AbortException:
+                        raise
+                    except Exception as e:
+                        if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
+                            qa_log(f"[QA] foreman worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
+                            f_queue.put_nowait(bi)
+                            return
+                        if health_is_benched(key):
+                            qa_log(f"[QA] foreman worker key ...{key[-4:]} benched — requeueing batch {bi + 1}")
+                            f_queue.put_nowait(bi)
+                            return
+                        if bi not in f_requeued:
+                            f_requeued.add(bi)
+                            f_queue.put_nowait(bi)
+                        else:
+                            _QA_COUNTERS["warnings"] += 1
+                            qa_log(f"[QA] foreman batch {bi + 1} scan failed twice ({repr(e)[:120]}) — "
+                                   f"disputed pairs stay flagged as warnings")
+                            # ТЗ-v4 A3: the foreman never answered for these
+                            # pairs — a failed scan, not a clean verdict.
+                            scan_failed_ids.update(p["id"] for p in batch)
+                        return
+
+            foreman_ok = True
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for w in range(n_f_workers):
+                        tg.create_task(foreman_worker(w))
+            except BaseExceptionGroup as eg:
+                aborts = [e for e in eg.exceptions if isinstance(e, AbortException)]
+                if aborts:
+                    raise aborts[0]
+                raise
+            while not f_queue.empty():
+                bi = f_queue.get_nowait()
+                chunk = foreman_batches[bi]
+                qa_log(f"[QA] foreman: examining {len(chunk)} disputed pair(s) "
+                       f"(batch {bi + 1}/{len(foreman_batches)}, fallback all keys)...")
+                try:
+                    live_keys_f = [k for k in api_keys if not health_is_benched(k)]
+                    if not live_keys_f:
+                        raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
+                    foreman_results[bi] = await _qa_scan_pairs(
+                        chunk, foreman_prompt, live_keys_f, provider, f_model,
+                        f_base, qa_log, check_status, vanilla_gloss, modpack_terms,
+                        f_temp, phase="foreman", batch_label=str(bi + 1))
+                except AbortException:
+                    raise
+                except Exception as e:
+                    msg = str(e)
+                    if ("keys failed" in msg or "keys unavailable" in msg
+                            or "server unavailable" in msg):
+                        raise
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] foreman batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — "
+                           f"disputed pairs stay flagged as warnings")
+                    foreman_results[bi] = []
+            # Distribute foreman verdicts: confirmed -> the results grid
+            # (the apply pipeline handles them exactly like phase-2 verdicts);
+            # cleared pairs get ds_foreman=cleared and stay clean.
+            foreman_warned = 0
+
+            def _jury_votes_str(pid: int) -> str:
+                # ТЗ-Жюри п.4: "[JURY] #671 disputed (j1 flag, j2 pass)"
+                parts = []
+                for ji in sorted(live_judges):
+                    if ji in vote_map.get(pid, set()):
+                        parts.append(f"{_qa_judge_label(ji)} flag")
+                    else:
+                        parts.append(f"{_qa_judge_label(ji)} pass")
+                return ", ".join(parts)
+
+            for bi, chunk in enumerate(foreman_batches):
+                f_raw = _qa_flatten_raw_verdicts(foreman_results[bi] or [])
+                f_drop: Dict[str, int] = {}
+                f_probs = _qa_normalize_problems(f_raw, chunk, f_drop)
+                for prob in f_probs:
+                    pid = prob.get("id")
+                    if pid is None:
+                        continue
+                    if prob.get("severity") == "warning":
+                        # schema-crippled foreman output: the pair stays
+                        # unresolved (a warning in the apply pipeline),
+                        # NOT marked confirmed/cleared in the dataset.
+                        foreman_warned += 1
+                        obi = pair_batch_of.get(pid)
+                        if obi is not None:
+                            if results[obi] is None:
+                                results[obi] = []
+                            results[obi].append(prob)
+                        continue
+                    ds_foreman[pid] = "confirmed"
+                    foreman_confirmed += 1
+                    qa_log(f"[JURY] #{pid} disputed ({_jury_votes_str(pid)}) -> foreman: confirmed")
+                    obi = pair_batch_of.get(pid)
+                    if obi is not None:
+                        if results[obi] is None:
+                            results[obi] = []
+                        results[obi].append(prob)
+                for pair in chunk:
+                    pid = pair["id"]
+                    confirmed_ids_here = {p.get("id") for p in f_probs
+                                          if p.get("severity") != "warning"}
+                    if pid not in confirmed_ids_here and pid not in ds_foreman:
+                        ds_foreman[pid] = "cleared"
+                        foreman_cleared += 1
+                        qa_log(f"[JURY] #{pid} disputed ({_jury_votes_str(pid)}) -> foreman: cleared")
+            warned_str = f", {foreman_warned} unusable" if foreman_warned else ""
+            qa_log(f"[JURY] foreman: confirmed {foreman_confirmed}, "
+                   f"cleared {foreman_cleared}{warned_str}")
+            # ТЗ-v4.5 п.4: foreman results join the run aggregate too.
+            jury_run_stats["foreman_confirmed"] = foreman_confirmed
+            jury_run_stats["foreman_cleared"] = foreman_cleared
+        elif disputed_ids and len(qa_judges) >= 2:
+            # foreman conditions not met (single judge alive / died):
+            # disputed pairs stay disputed — logged, nothing applied
+            qa_log(f"[JURY] foreman skipped — {len(disputed_ids)} disputed pair(s) stay disputed "
+                   f"(no apply; single-judge fallback or dead foreman)")
+
+
+        # Machine-вердикты применяются в apply-цикле через batch_machine
+        # merge — но merge срабатывает только когда results[bi] активирован
+        # (не None). Батч, где LLM-скан не выдал ни одного вердикта (или все
+        # его пары ушли в machine tier), оставался None — и его machine-пары
+        # (например CODES_MISMATCH) молча терялись и затем помечались clean
+        # в вердикт-кэше. Активируем results для батчей с machine-парами.
+        for bi, batch in enumerate(batches):
+            if results[bi] is None and any(p["id"] in machine_by_id for p in batch):
+                results[bi] = []
+
         # Apply problems batch by batch in the ORIGINAL order (no races:
         # pairs_dict / cache / glossary are touched sequentially here).
         for bi, batch in enumerate(batches):
-            scanned += len(batch)
+            if results[bi] is None:
+                # ТЗ-v4 A3: nobody produced verdicts for this batch — either
+                # the batch was never flagged (all its pairs went through
+                # the machine tier only) or its scan failed. Pairs from a
+                # failed scan stay dirty; a genuinely unflagged batch IS
+                # scanned-clean by phase 1 (ids-only pass over live judges).
+                if all(p["id"] in scan_failed_ids for p in batch):
+                    continue  # failed scan: not scanned, not counted
+                scanned += len(batch)
+                continue
             drop_stats: Dict[str, int] = {}
             probs = _qa_normalize_problems(results[bi] or [], batch, drop_stats)
             summary = _qa_drop_summary(f"batch {bi + 1}", drop_stats, batch)
@@ -5381,8 +7693,11 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             for p in probs:
                 if (p.get("id") is not None and p.get("severity") != "warning"
                         and p["id"] not in machine_by_id):
+                    # ТЗ-Жюри п.5: phase-2 verdicts belong to the primary
+                    # judge (the full scan is primary-only by design).
                     ds_llm.setdefault(p["id"], []).append(
-                        {"category": p.get("category"), "severity": p.get("severity"),
+                        {"judge": "j1",
+                         "category": p.get("category"), "severity": p.get("severity"),
                          "issue": p.get("issue"), "suggested": p.get("suggested")})
             new_retrans = await _qa_apply_problems(
                 probs, batch, pairs_dict, translator, cache, qa_log, check_status,
@@ -5404,13 +7719,18 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             # Нит 1 (m11236): chunk the arbitration — flagged pairs in
             # batches of _QA_ARB_CHUNK through a phase-1-style workerpool
             # (one key per worker, health-aware). One giant 278-pair call
-            # blew the 90s ceiling and crippled verdicts (>5%); chunked
+            # blew the read-timeout ceiling and crippled verdicts (>5%); chunked
             # parallel calls keep the arbitration under the timeout.
             arb_batches = [flagged_all[i:i + _QA_ARB_CHUNK]
                            for i in range(0, len(flagged_all), _QA_ARB_CHUNK)]
             n_arb_batches = len(arb_batches)
             qa_log(f"[QA] glossary pre-check flagged {len(flagged_all)} pair(s) — "
                    f"arbitrating ({n_arb_batches} batch(es) of up to {_QA_ARB_CHUNK})...")
+            _qa_log_pin_origins(flagged_all, qa_log)
+            if len(flagged_all) > _QA_FLAG_SUSPICIOUS:
+                # ТЗ-v4.3 B.5: flags are kept, the smell is reported.
+                qa_log(f"[QA] glossary pre-check flagged {len(flagged_all)} — "
+                       f"SUSPICIOUS (>{_QA_FLAG_SUSPICIOUS})")
             arb_queue: "asyncio.Queue[int]" = asyncio.Queue()
             for bi in range(n_arb_batches):
                 arb_queue.put_nowait(bi)
@@ -5449,10 +7769,12 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                         if "keys failed" in str(e) or "keys unavailable" in str(e) or "server unavailable" in str(e):
                             qa_log(f"[QA] arb worker stopped (key ...{key[-4:]} rejected): {str(e)[:120]}")
                             arb_queue.put_nowait(bi)
+                            scan_failed_ids.update(p["id"] for p in arb_batches[bi])
                             return
                         if health_is_benched(key):
                             qa_log(f"[QA] arb worker key ...{key[-4:]} benched — requeueing batch {bi + 1}")
                             arb_queue.put_nowait(bi)
+                            scan_failed_ids.update(p["id"] for p in arb_batches[bi])
                             return
                         if bi not in arb_requeued:
                             arb_requeued.add(bi)
@@ -5460,6 +7782,10 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                         else:
                             _QA_COUNTERS["warnings"] += 1
                             qa_log(f"[QA] arb batch {bi + 1} scan failed twice ({repr(e)[:120]}) — kept the existing translations")
+                            # ТЗ-v4.1 F12.3: a batch the arbitration could not
+                            # scan stays FLAGGED — its pairs are unresolved,
+                            # never clean (A3: no phantom clean either).
+                            scan_failed_ids.update(p["id"] for p in arb_batches[bi])
                         return
 
             try:
@@ -5499,6 +7825,9 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                     _QA_COUNTERS["warnings"] += 1
                     qa_log(f"[QA] arb batch {bi + 1} scan failed on fallback ({repr(e)[:120]}) — kept the existing translations")
                     arb_results[bi] = []
+                    # ТЗ-v4 A3: failed arbitration = failed scan for these
+                    # pairs — no phantom clean in the verdict cache.
+                    scan_failed_ids.update(p["id"] for p in arb_batches[bi])
             # Нит 1: pre-init so a failure inside the try leaves the pairs
             # flowing to Tier C repair instead of NameError-skipping the phase.
             arb_probs: List[dict] = []
@@ -5597,16 +7926,72 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                 })
             try:
                 repair_prompt = _qa_repair_prompt(candidates, lang_name)
+                # ТЗ-v4.3 C.6: dump the REQUEST too — the answer dump alone
+                # made the 02.10 echo look like the request.
+                _qa_dump_raw("repair_req", "0", repair_prompt)
                 repair_raw = await _qa_scan_pairs(
                     candidates, repair_prompt, api_keys, provider, model_text,
                     custom_base_url, qa_log, check_status, vanilla_gloss, modpack_terms,
                     qa_temperature, phase="repair", batch_label="0")
-                repair_raw = _qa_flatten_raw_verdicts(repair_raw or [])
+                # ТЗ-v4.3 C.7: the answer must NOT be lost to the strict
+                # «id + category/severity» filter — read every shape the
+                # model answers with, and keep a plain replacement usable.
+                repair_raw = _qa_repair_answer(candidates, repair_raw or [])
                 repair_drop: Dict[str, int] = {}
                 repair_probs = _qa_normalize_problems(repair_raw, candidates, repair_drop)
                 repair_summary = _qa_drop_summary("tier C repair", repair_drop, candidates)
                 if repair_summary:
                     qa_log(f"[QA] tier C repair: {repair_summary}")
+                # ТЗ-v4.5 п.2: the audit answer is reliably ANALYSIS and
+                # unreliably SCHEMA — the observed repair reply is the
+                # candidate object echoed back (id/note/source/translation,
+                # no category, no suggested), which the normalizer demotes to
+                # "no category" and the pair then dies as a warning. The
+                # finding itself is real, so the category is recovered from
+                # the note the machine wrote (it knows why the pair was
+                # crippled) and the verdict is re-issued as a soft one: the
+                # main channel's ONE constraint-retry then turns the analysis
+                # into a replacement string under the usual validation gate.
+                by_id_cand = {c["id"]: c for c in candidates if c.get("id") is not None}
+                recovered = 0
+                fixed_probs: List[dict] = []
+                for p in repair_probs:
+                    if p.get("severity") != "warning":
+                        fixed_probs.append(p)
+                        continue
+                    cand = by_id_cand.get(p.get("id"))
+                    if cand is None:
+                        fixed_probs.append(p)
+                        continue
+                    note = str(cand.get("note") or "")
+                    # ONLY a machine-written constraint is recovered. ТЗ2.2-2
+                    # is explicit: a judge verdict that arrived without a
+                    # category is an honest warning and must stay one — the
+                    # repair channel exists to recover the pairs the MACHINE
+                    # crippled, not to launder free-form model prose into a
+                    # forced retranslation.
+                    if "missed_pins=" not in note:
+                        fixed_probs.append(p)
+                        continue
+                    category = "GLOSSARY_VIOLATION"
+                    # ТЗ-v4.5 п.2b: no deterministic synthesis is attempted for
+                    # a missed pin. It would be dead code by construction: a
+                    # "pin variant" the machine could recognise (_qa_word_in_text
+                    # normal form / prefix / stem) is exactly what makes
+                    # _qa_ru_pin_present succeed — so a pair that got the flag
+                    # has no such variant in its translation to replace. The
+                    # canonical form travels inside `note` instead, and the
+                    # constraint retry below puts it into the string.
+                    suggested = p.get("suggested")
+                    recovered += 1
+                    fixed_probs.append({
+                        "id": p.get("id"), "category": category, "severity": "soft",
+                        "issue": p.get("issue") or note, "suggested": suggested,
+                        "glossary_fix": None})
+                repair_probs = fixed_probs
+                if recovered:
+                    qa_log(f"[QA] tier C repair: {recovered} no-category verdict(s) "
+                           f"recovered as constraint retries")
                 # repaired verdicts apply against the candidates batch
                 for p in repair_probs:
                     if p.get("id") is not None and p.get("severity") != "warning":
@@ -5621,11 +8006,18 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                     phase_label="repair-retry")
                 retranslated_pairs.extend(new_retrans)
                 qa_log(f"[QA] tier C repair: {len(repair_probs)} verdict(s) re-issued")
+                if not repair_probs and candidates:
+                    # ТЗ-v4.3 C.8: a silent zero is the failure mode that hid
+                    # this bug for two runs — say it out loud.
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] repair: 0/{len(candidates)} re-issued")
             except AbortException:
                 raise
             except Exception as e:
                 _QA_COUNTERS["warnings"] += 1
                 qa_log(f"[QA] tier C repair failed ({repr(e)[:120]}) — kept the existing translations")
+                if candidates:
+                    qa_log(f"[QA] repair: 0/{len(candidates)} re-issued")
 
         # Pass 2: ONE rescan of the CHANGED strings (hard retranslations +
         # soft fixes — Speed-pack п.5). A problem found here is reported as
@@ -5653,9 +8045,32 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
             p2_summary = _qa_drop_summary("pass-2", p2_drop, refreshed)
             if p2_summary:
                 qa_log(f"[QA] pass-2: {p2_summary}")
+            # ТЗ-v4 D10: pass-2 verdicts are not dead weight anymore — a
+            # soft verdict with a VALID suggested string is applied through
+            # the same deterministic gate ONCE (no third pass); hard
+            # verdicts and anything invalid stay warnings.
+            p2_applied = 0
             for prob in p2_probs:
-                _QA_COUNTERS["warnings"] += 1
-                qa_log(f"[QA] pass-2 warning: {json.dumps(prob, ensure_ascii=False)[:400]}")
+                pid = prob.get("id")
+                pair2 = next((r for r in refreshed if r["id"] == pid), None)
+                if not pair2:
+                    continue
+                severity = (prob.get("severity") or "").lower()
+                suggested = prob.get("suggested")
+                if severity == "soft" and suggested and \
+                        _qa_validate_suggestion(pair2["source"], suggested):
+                    pairs_dict[pair2["source"]] = suggested
+                    if cache is not None:
+                        cache.save_batch({pair2["source"]: suggested})
+                    _QA_COUNTERS["soft_fixed"] += 1
+                    p2_applied += 1
+                    qa_log(f"[QA] pass-2 soft fixed -> \"{str(suggested)[:80]}\" "
+                           f"(source: \"{pair2['source'][:60]}\")")
+                else:
+                    _QA_COUNTERS["warnings"] += 1
+                    qa_log(f"[QA] pass-2 warning: {json.dumps(prob, ensure_ascii=False)[:400]}")
+            if p2_applied:
+                qa_log(f"[QA] pass-2: {p2_applied} soft fix(es) applied from the rescan verdicts")
             if not p2_probs:
                 qa_log("[QA] pass-2: clean — retranslations passed the rescan")
 
@@ -5669,16 +8084,61 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                    f"LLM scanned {len(llm_pairs)} pair(s) in phase 1, flagged {len(flagged_ids)}; "
                    f"{overlap} late LLM verdict(s) on machine pair(s) dropped")
 
+        # ТЗ-v4.1 F12.3: a pair whose scan/arbitration FAILED and which no
+        # later tier resolved stays FLAGGED for good. It is counted as
+        # unresolved and recorded in the dataset with action="warning" — a
+        # failed scan must never read as a clean pair. (The phase-level
+        # handler below does the same when the exception escapes.)
+        # F12.3: pull in the failures the scan helpers registered themselves
+        # (they answer [] on a transport death — "no verdict" is NOT "clean").
+        scan_failed_ids.update(_QA_SCAN_FAILED_IDS)
+        sf_pairs_by_id = {p["id"]: p for p in pairs}
+        newly_flagged = 0
+        for pid in sorted(scan_failed_ids):
+            if pid not in sf_pairs_by_id:
+                continue
+            if ds_action.get(pid) is not None or pid in phase_unresolved:
+                continue
+            phase_unresolved.add(pid)
+            ds_action[pid] = "warning"
+            _QA_COUNTERS["unresolved"] += 1
+            newly_flagged += 1
+        if newly_flagged:
+            qa_log(f"[QA] {newly_flagged} flagged pair(s) left unresolved "
+                   f"(scan/arbitration failed) — kept as is, recorded as warnings")
+
         # --- Dataset final pass (ТЗ-dataset) --------------------------------
         # One record per pair, INCLUDING the clean ones (negative examples
         # calibrate the future decision model). final is written at the END
         # so pass-2 and tier C results are already reflected in pairs_dict.
         if ds_writer is not None:
             try:
+                # ТЗ-v4 B5: pass-through pairs are dataset records too —
+                # the source was already in the target language, nothing
+                # was audited or changed.
+                for p in passed_pairs:
+                    ds_writer.add({
+                        "pair_id": p["id"],
+                        "source": p["source"],
+                        "mt": p["translation"],
+                        "final": None,
+                        "machine": [],
+                        "llm": [],
+                        "action": "passed_through",
+                        "retry": None,
+                        "consensus": "clean",
+                        "foreman": "none",
+                    })
                 for p in pairs:
                     pid = p["id"]
                     mt = mt_snapshot.get(pid)
                     final = pairs_dict.get(p["source"])
+                    # ТЗ-v4.1 F12.3: a pair whose scan never completed is
+                    # flagged, not clean — it goes to the dataset as a
+                    # warning and was already counted as unresolved.
+                    action = ds_action.get(pid)
+                    if action is None and pid in scan_failed_ids:
+                        action = "warning"
                     record = {
                         "pair_id": pid,
                         "source": p["source"],
@@ -5686,15 +8146,37 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                         "final": (final if final != mt else None),
                         "machine": ds_machine.get(pid, []),
                         "llm": ds_llm.get(pid, []),
-                        "action": ds_action.get(pid, "clean"),
+                        "action": action or "clean",
                         "retry": ds_retry.get(pid),
+                        # ТЗ-Жюри п.5: jury fields per pair. consensus =
+                        # applied (>= threshold) / disputed (below threshold)
+                        # / clean (no votes; the default for single judge).
+                        "consensus": ds_consensus.get(pid) or "clean",
+                        "foreman": ds_foreman.get(pid) or "none",
                     }
                     ds_writer.add(record)
                 n = ds_writer.finish()
                 if n:
-                    qa_log(f"[QA] dataset: {ds_writer.path} ({n} records)")
+                    total = n
+                    # ТЗ-v4 C7: in run mode report the WHOLE run file size.
+                    try:
+                        if ds_writer.path and ds_writer.path.exists():
+                            with open(ds_writer.path, encoding="utf-8") as f:
+                                total = sum(1 for line in f if line.strip()
+                                            and not J_meta_line(line))
+                    except Exception:
+                        total = n
+                    qa_log(f"[QA] dataset: {ds_writer.path} (+{n} this file, {total} records in the run)")
             except Exception as e:
                 qa_log(f"[QA] dataset final pass failed: {repr(e)[:120]} — the run is unaffected")
+
+        # ТЗ-v4 C8/C9: fold this file's QA outcome into the run aggregate;
+        # the caller (GUI Worker / CLI) prints the run totals at the end.
+        try:
+            qa_run_note_file(scanned, len(passed_through_ids), dict(_QA_COUNTERS),
+                             jury_line=jury_stats_line, jury_stats=jury_run_stats)
+        except Exception:
+            pass
 
         # Speed-pack п.4: persist the verdict-cache state. A pair whose
         # final action is clean (no tier touched it; the full phase-2 scan
@@ -5704,16 +8186,21 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
         if qa_vcache is not None and qa_cfg_hash:
             try:
                 marked_clean = 0
+                marked_dirty = 0
                 for p in pairs:
                     pid = p["id"]
                     k = QAVerdictCache.key(p["source"], mt_snapshot.get(pid, p["translation"]), qa_cfg_hash)
-                    if ds_action.get(pid) is None:
+                    # ТЗ-v4 A3: a pair whose scan failed is NEVER cached
+                    # clean — no phantom clean verdicts from dead keys.
+                    if ds_action.get(pid) is None and pid not in scan_failed_ids:
                         qa_vcache.mark(k, "clean")
                         marked_clean += 1
                     else:
                         qa_vcache.mark(k, "dirty")
+                        marked_dirty += 1
                 qa_log(f"[QA] verdict cache: {marked_clean} pair(s) marked clean, "
-                       f"{len(pairs) - marked_clean} marked dirty")
+                       f"{marked_dirty} marked dirty"
+                       + (f" ({len(scan_failed_ids)} scan-failed pair(s) kept dirty)" if scan_failed_ids else ""))
             except Exception as e:
                 qa_log(f"[QA] verdict cache mark failed: {repr(e)[:120]} — the run is unaffected")
             finally:
@@ -5721,12 +8208,49 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
 
         qa_log(f"[QA] scanned {scanned} pairs: hard {_QA_COUNTERS['hard']}, "
                f"soft-fixed {_QA_COUNTERS['soft_fixed']}, warnings {_QA_COUNTERS['warnings']}, "
-               f"glossary +{_QA_COUNTERS['glossary']}, unresolved {_QA_COUNTERS['unresolved']}")
+               f"glossary +{_QA_COUNTERS['glossary']}, unresolved {_QA_COUNTERS['unresolved']}"
+               + (f"; {len(passed_through_ids)} passed through (already in the target language)"
+                  if passed_through_ids else ""))
 
     except AbortException:
         raise
     except Exception as e:
-        qa_log(f"[QA] phase skipped: {repr(e)[:200]} — translations are kept as is.")
+        # ТЗ-v4.1 F12.3 + ТЗ-v4.2 3: a phase-level failure is NOT a silent
+        # skip — and it is not allowed to lose the pairs the deterministic
+        # pre-check already flagged either. An ExceptionGroup out of the
+        # arbitration TaskGroup used to end the phase with "0 flagged left
+        # unresolved" while 175 flagged pairs vanished; now every flag that
+        # never got a verdict (scan failure OR pre-crash flag) is counted as
+        # unresolved and recorded in the dataset with action="warning", so
+        # the run total stays truthful instead of collapsing to zero.
+        scan_failed_ids.update(_QA_SCAN_FAILED_IDS)
+        pre_crash = 0
+        for fp in flagged_all:
+            pid = fp.get("id")
+            if pid is None or pid in scan_failed_ids:
+                continue
+            if ds_action.get(pid) is not None or pid in phase_unresolved:
+                continue  # already resolved by an applied verdict
+            scan_failed_ids.add(pid)
+            pre_crash += 1
+        if pre_crash:
+            qa_log(f"[QA] {pre_crash} pair(s) were flagged before the phase "
+                   f"failed — left unresolved (kept as is, recorded as warnings)")
+        if scan_failed_ids:
+            _QA_COUNTERS["unresolved"] += len(scan_failed_ids)
+            for pid in sorted(scan_failed_ids):
+                ds_action[pid] = "warning"
+                phase_unresolved.add(pid)
+        qa_log(f"[QA] phase failed: {repr(e)[:200]} — "
+               f"{len(scan_failed_ids)} flagged pair(s) left unresolved (kept as is, recorded as warnings)")
+        try:
+            qa_run_note_file(scanned, len(passed_through_ids), dict(_QA_COUNTERS),
+                             jury_line=jury_stats_line, jury_stats=jury_run_stats)
+        except Exception:
+            pass
+        qa_log(f"[QA] scanned {scanned} pairs: hard {_QA_COUNTERS['hard']}, "
+               f"soft-fixed {_QA_COUNTERS['soft_fixed']}, warnings {_QA_COUNTERS['warnings']}, "
+               f"glossary +{_QA_COUNTERS['glossary']}, unresolved {_QA_COUNTERS['unresolved']}")
 
 
 def _qa_norm_same(a: str, b: str) -> bool:
@@ -5772,6 +8296,106 @@ async def _qa_constraint_retry(source: str, constraint: str, translator, qa_log,
     return new_tr or None
 
 
+# ТЗ-v4.1 G13: white-list rules for glossary pins harvested from ARBITRATION
+# PROSE. A real incident poisoned the glossary with 22 junk pins, among them
+# "and -> Энтро-пыль" (a conjunction!), "not -> Сделки с жителями отключены",
+# "Created -> <a whole sentence>", "Dimensional Ore -> Размерных р" (a cut
+# fragment), "coal -> Угольного шахтёра" (a declined form) and semantically
+# wrong terms ("Villager -> Крестьянин", "Power -> Сила"). A pin is a
+# long-lived glossary entry, so junk must never be written.
+_QA_PIN_STOPWORDS = frozenset({
+    # function words / conjunctions / prepositions / pronouns
+    "and", "or", "not", "the", "a", "an", "in", "on", "with", "from", "of",
+    "to", "at", "by", "as", "so", "than", "then", "there", "here", "this",
+    "that", "these", "those", "it", "its", "is", "are", "was", "were", "be",
+    "been", "being", "has", "have", "had", "can", "could", "will", "would",
+    "should", "must", "may", "might", "do", "does", "did", "also", "but",
+    "for", "if", "when", "while", "because", "you", "your", "yours", "we",
+    "our", "they", "their", "he", "she", "his", "her", "him", "them", "who",
+    "which", "what", "how", "why", "where", "all", "any", "some", "no",
+    "yes", "very", "just", "only", "more", "most", "much", "many", "new",
+    "old", "one", "two", "three", "first", "last", "never", "always", "well",
+    # verbs that only describe an action/story, never name an item
+    "created", "create", "made", "make", "used", "use", "smelted", "smelt",
+    "obtained", "obtain", "found", "find", "get", "got", "give", "take",
+    "put", "crafted", "craft", "crafting", "built", "build", "added", "add",
+    "requires", "require", "needs", "need", "allows", "allow", "can_be",
+    "should_be", "obtained_by", "used_for", "renamed", "changed", "translate",
+    "translated", "mistranslated", "pinned", "unify", "standardize", "standardized",
+})
+
+# Semantically poisonous (en, ru) PAIRS seen in the incident: a valid-looking
+# Russian noun that translates the WRONG sense of THIS term. Value-only
+# blocking would be wrong — "Коксовая печь" is a fine pin for "Coke Oven" and
+# "Плод хоруса" is the correct Chorus Fruit — so the block list is keyed by
+# the pair. Everything else is caught by the generic rules below.
+_QA_PIN_BAD_PAIRS = frozenset({
+    ("ender crafter", "коксовая печь"),   # Ender Crafter is a machine, not an oven
+    ("villager", "крестьянин"),           # Житель, not a peasant
+    ("power", "сила"),                    # Энергия in the tech sense
+    ("cloches", "колпаки"),               # the canonical pin is Клош
+    ("cloche", "колпаки"),
+    ("lapis", "пал"),                     # truncated Лазурит
+    ("coal", "угольный шахтёр"),
+    ("and", "энтро-пыль"),                # a conjunction can never be a term
+})
+
+# Declined forms: a pin must be the NOMINATIVE dictionary form. These endings
+# catch the incident's "Угольного шахтёра" (-ого), "Доспехам" (-ам),
+# "визеров" (-ов). Checked on every word so multi-word declined terms fail too.
+_QA_PIN_DECLINED_RE = re.compile(
+    r"(?:ого|его|ому|ему|ыми|ими|ами|ями|ах|ях|ам|ям|ов|ев|ей|ых|их|ую|юю|"
+    r"овский|евский)$", re.IGNORECASE)
+
+# A cut fragment ends with a lone letter: "Размерных р".
+_QA_PIN_FRAGMENT_RE = re.compile(r"(?:^|\s)[А-Яа-яЁёA-Za-z]$")
+
+
+def _qa_pin_reject_reason(en: str, ru: str) -> str:
+    """ТЗ-v4.1 G13: why a harvested glossary pin must be REJECTED.
+
+    Returns '' when the pair is a valid pin. Rules (13.1-13.3):
+    - the EN key is a real term, not a stop/function word;
+    - the RU value has >=2 letters and len >=3, is not a fragment
+      ("Размерных р"), not a sentence/clause, and not a declined form;
+    - RU is in the nominative case (heuristic ending check);
+    - RU is not longer than 3x the EN key ("Created" -> a whole sentence);
+    - RU is not on the incident's semantic-poison block list.
+    """
+    en = (en or "").strip()
+    ru = (ru or "").strip()
+    if not en or not ru:
+        return "empty"
+    if not LATIN_CHARS.search(en) or CYRILLIC_CHARS.search(en):
+        return "en not latin"
+    if not CYRILLIC_CHARS.search(ru):
+        return "ru not cyrillic"
+    if len(LATIN_CHARS.findall(ru)) > 3:
+        # ru must be mostly cyrillic; stray latin artifacts (codes) allowed
+        return "ru mostly latin"
+    if en.casefold() in _QA_PIN_STOPWORDS:
+        return f"en is a function word ('{en}')"
+    if len(en) < 3 or len(en) > 60:
+        return "en length"
+    words = ALPHA_WORD.findall(ru)
+    n_letters = sum(len(w) for w in words)
+    if n_letters < 2 or len(ru) < 3:
+        # 'пал' (truncated Лазурит) and 2-letter debris are not terms
+        return "ru too short"
+    if _QA_PIN_FRAGMENT_RE.search(ru):
+        return "ru is a cut fragment"
+    if len(ru) > len(en) * 3:
+        return f"ru longer than 3x en ({len(ru)} > {len(en) * 3})"
+    if len(words) > 3:
+        return "ru is a sentence/clause"
+    if (en.casefold(), ru.casefold()) in _QA_PIN_BAD_PAIRS:
+        return "semantically wrong pair (seen in the incident)"
+    for w in words:
+        if _QA_PIN_DECLINED_RE.search(w):
+            return f"ru is a declined form ('{w}')"
+    return ""
+
+
 def _qa_extract_glossary_pins(issue: str, suggested: Optional[str], source: str) -> List[Tuple[str, str]]:
     """ТЗ3.1-3: harvest (en, ru) glossary candidates from ADVICE TEXT.
 
@@ -5794,10 +8418,11 @@ def _qa_extract_glossary_pins(issue: str, suggested: Optional[str], source: str)
         ru = (ru or "").strip().strip(".,:;!?()").strip()
         if not en or not ru or (en, ru) in seen:
             return
-        if not LATIN_CHARS.search(en) or CYRILLIC_CHARS.search(en):
-            return
-        if not CYRILLIC_CHARS.search(ru) or LATIN_CHARS.search(ru) and len(LATIN_CHARS.findall(ru)) > 3:
-            # ru must be mostly cyrillic; stray latin artifacts (codes) allowed
+        # ТЗ-v4.1 G13.1: white-list the pair BEFORE it can become a pin.
+        reason = _qa_pin_reject_reason(en, ru)
+        if reason:
+            logging.getLogger("snbt_localizer.core").info(
+                f"[QA] glossary pin rejected ({reason}): {en!r} -> {ru!r}")
             return
         # the pin must belong to THIS pair: en lenient-matches the source
         words = en.split()
@@ -5885,6 +8510,14 @@ def _qa_add_glossary_pins(pin_candidates: List[Tuple[str, str]], pid, qa_log,
         en = (en or "").strip()
         ru = (ru or "").strip()
         if not en or not ru:
+            continue
+        # ТЗ-v4.1 G13.2: BOTH fields are re-validated right before the write —
+        # an explicit pin CORRECTION (branch (c)) must not be able to inject a
+        # junk pair that the prose extractor's filters would have rejected.
+        reason = _qa_pin_reject_reason(en, ru)
+        if reason:
+            _QA_COUNTERS["warnings"] += 1
+            qa_log(f"[QA] glossary pin rejected ({reason}): {en} -> {ru} — not written")
             continue
         if en not in gloss.terms:
             gloss.terms[en] = ru
@@ -6177,7 +8810,187 @@ async def _qa_apply_problems(problems: List[dict], batch: List[dict], pairs_dict
     return retranslated
 
 
+# --- ТЗ-Жюри: judge roster parsing + consensus helpers ---------------------
+# A judge entry: {"name": str, "base_url": str, "api_key": str, "model": str,
+# "temperature": float|None, "effort": str|None, "enabled": bool}. The current
+# QA config (keys/provider/model/base_url/temperature) is ALWAYS judge #1
+# (the primary); entries from the "qa_judges" setting extend the roster.
+# With zero extra judges the phase behaves exactly as before (backward
+# compatibility by design).
+
+def _qa_death_cause(err: BaseException) -> str:
+    """ТЗ-v4 E11: one-line honest cause for a judge death — auth/billing
+    reads as a dead key, benching after repeated timeouts reads as slow/
+    hung, anything else keeps its repr."""
+    msg = str(err)
+    if "non-ASCII" in msg:
+        return "dead key (invalid non-ASCII key — paste error)"
+    for code in ("401", "402", "403"):
+        if f"HTTP {code}" in msg or f"auditor HTTP {code}" in msg:
+            return f"dead key (HTTP {code} — auth/billing)"
+    if "benched" in msg:
+        return "slow/hung — keys benched after repeated timeouts/failures"
+    if "keys failed" in msg or "keys unavailable" in msg:
+        return "dead key (all keys failed)"
+    return repr(err)[:120]
+
+
+def _qa_judge_label(index: int) -> str:
+    """0-based index -> 'j1'/'j2'/... (log + dataset field)."""
+    return f"j{index + 1}"
+
+
+def parse_qa_judges(qa_params: dict) -> List[dict]:
+    """Normalize the judge roster from qa_params (ТЗ-Жюри п.1).
+
+    Judge #1 is always the CURRENT QA config (provider/keys/model/base_url/
+    temperature) — the primary. Additional judges come from
+    qa_params["judges"] (list of dicts, at most _QA_MAX_JUDGES - 1 entries);
+    each needs at least api_key + model. base_url defaults to the primary's
+    custom_base_url or the provider's base URL at call time. Returns the
+    list of ENABLED judges; a judge that dies mid-run is removed from the
+    live list only, not from this roster snapshot.
+    """
+    primary_keys = sanitize_api_keys(qa_params.get("keys") or [],
+                                     origin="judge1")
+    # Judge #1 temperature override typed in the judges table (row 0):
+    # None = the QA temperature spin as before.
+    j1_temp = qa_params.get("qa_temperature_override")
+    if not isinstance(j1_temp, (int, float)):
+        j1_temp = None
+    primary = {
+        "name": _qa_judge_label(0),
+        "provider": qa_params.get("provider") or "",
+        "api_keys": list(primary_keys),
+        "model": qa_params.get("model") or "",
+        "custom_base_url": qa_params.get("custom_base_url"),
+        "temperature": (float(j1_temp) if j1_temp is not None
+                        else qa_params.get("temperature")),
+        "effort": None,  # carried inside the model text ("model/high")
+        "enabled": True,
+    }
+    judges = [primary]
+    raw = qa_params.get("judges")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = None
+    if not isinstance(raw, list):
+        raw = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        if len(judges) >= _QA_MAX_JUDGES:
+            break
+        api_key = str(entry.get("api_key") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        enabled = entry.get("enabled", True)
+        enabled = (enabled in (True, "true", "True", 1)) if not isinstance(enabled, bool) else enabled
+        if not model or not enabled:
+            continue
+        name = str(entry.get("name") or "").strip() or _qa_judge_label(len(judges))
+        # Пустой api_key = ключи из пула этого провайдера (воркспейс),
+        # переданного в qa_params["provider_pool"]; пусто и там — primary.
+        provider = str(entry.get("provider") or "").strip() or primary["provider"]
+        if api_key:
+            judge_keys = sanitize_api_keys([api_key], origin=f"judge {name}")
+            if not judge_keys:
+                continue  # non-ASCII/reject — judge dropped, not run dead
+        else:
+            pool = (qa_params.get("provider_pool") or {}).get(provider) or []
+            judge_keys = sanitize_api_keys(pool, origin=f"pool/{provider}") or list(primary_keys)
+        if not judge_keys:
+            continue
+        try:
+            temperature = float(entry.get("temperature")) if entry.get("temperature") is not None else None
+        except (TypeError, ValueError):
+            temperature = None
+        judges.append({
+            "name": name,
+            "provider": provider,
+            "api_keys": judge_keys,
+            "model": model,
+            "custom_base_url": (str(entry.get("base_url") or "").strip()
+                                or primary["custom_base_url"]),
+            "temperature": temperature,
+            "effort": (str(entry.get("effort") or "").strip().lower() or None),
+            "enabled": True,
+        })
+    return judges
+
+
+_QA_MAX_JUDGES = 4
+
+# Effort step-up for the foreman: the foreman is the primary judge asked
+# again with one effort level above the judges' own. "если провайдер
+# поддерживает" — unknown efforts are simply dropped by
+# apply_reasoning_effort's parse (unknown tail = no suffix).
+_QA_EFFORT_STEPS = ["low", "medium", "high", "xhigh"]
+
+
+def _qa_bump_effort(model_text: str, effort_override: str = None) -> str:
+    """Model text with the effort suffix raised one step (ТЗ-Жюри п.4).
+
+    'zai-org/GLM-5.3/high' -> 'zai-org/GLM-5.3/xhigh'; a model without a
+    suffix gets '/high' appended only when effort_override says so (the
+    judges' configured effort); otherwise the text is returned unchanged.
+    """
+    model, effort = parse_model_effort(model_text)
+    if effort is None:
+        return model_text
+    base = model if model else model_text
+    if effort not in _QA_EFFORT_STEPS:
+        return model_text
+    bumped = _QA_EFFORT_STEPS[min(_QA_EFFORT_STEPS.index(effort) + 1,
+                                  len(_QA_EFFORT_STEPS) - 1)]
+    return f"{base}/{bumped}"
+
+
+def _qa_judge_base_url(judge: dict) -> str:
+    """Resolve a judge's base URL at call time (provider default fallback)."""
+    custom = judge.get("custom_base_url")
+    if custom:
+        return custom.rstrip("/")
+    return get_base_url(judge.get("provider") or "").rstrip("/")
+
+
+def _qa_consensus_threshold(n_judges: int, configured: int = 2) -> int:
+    """Votes needed to send a pair to phase 2 (ТЗ-Жюри п.3).
+
+    Default threshold 2 of N; a single judge is its own threshold (1);
+    the configured value is clamped to [1, n_judges].
+    """
+    if n_judges <= 1:
+        return 1
+    try:
+        t = int(configured)
+    except (TypeError, ValueError):
+        t = 2
+    return max(1, min(n_judges, t))
+
+
+def _qa_jury_stats(judge_findings: Dict[int, int], vote_map: Dict[int, set],
+                   flagged: set, threshold: int) -> dict:
+    """Consensus aggregation (ТЗ-Жюри п.3): per-pair votes -> buckets.
+
+    - confirmed: votes >= threshold -> phase 2 (full verdicts, primary)
+    - disputed:  1 <= votes < threshold -> phase 2.5 (foreman)
+    Agreement % is computed over the pairs at least one judge looked at
+    (i.e. all llm_pairs): agreement = pairs where all judges voted the
+    same way / judged pairs.
+    """
+    confirmed, disputed = set(), set()
+    for pid, votes in vote_map.items():
+        if len(votes) >= threshold:
+            confirmed.add(pid)
+        elif votes:
+            disputed.add(pid)
+    return {"confirmed": confirmed, "disputed": disputed}
+
+
 def _qa_reset_counters():
+    _QA_SCAN_FAILED_IDS.clear()
     _QA_COUNTERS.clear()
     _QA_COUNTERS.update({"hard": 0, "soft_fixed": 0, "warnings": 0, "soft_changed_pairs": {},
                          "glossary": 0, "unresolved": 0})
@@ -6337,6 +9150,12 @@ def _qa_drop_summary(batch_label: str, drop_stats: Dict[str, int], batch: List[d
 # runner resets/reads them. The QA phase is awaited sequentially inside the
 # manager's event loop — no reentrancy.
 _QA_COUNTERS = {"hard": 0, "soft_fixed": 0, "warnings": 0, "glossary": 0}
+
+# ТЗ-v4.1 F12.3: pair ids whose scan/arbitration never produced a verdict
+# (transport death, unparseable answer, dead key). "No verdict" is NOT
+# "clean": these ids are drained by run_qa_phase into the unresolved counter
+# and into the dataset as action="warning".
+_QA_SCAN_FAILED_IDS: set = set()
 
 
 def run_qa_phase(pairs_dict: Dict[str, str], qa_params: dict, translator,

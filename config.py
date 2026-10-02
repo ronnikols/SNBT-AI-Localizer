@@ -148,6 +148,11 @@ class ConfigManager:
         self.qa_temperature: float = 0.0
         self.qa_dataset: bool = True
         self.qa_verdict_cache: bool = True
+        self.qa_judges: str = "[]"
+        self.qa_jury_threshold: int = 2
+        # Judge #1 row overrides from the judges table (JSON dict):
+        # api_key / base_url / temperature — empty = pool defaults.
+        self.qa_judge1: str = "{}"
 
         self.load_from_settings()
 
@@ -246,6 +251,18 @@ class ConfigManager:
             self.qa_temperature = 0.0
         self.qa_dataset = (s.value("qa_dataset", True) in (True, "true"))
         self.qa_verdict_cache = (s.value("qa_verdict_cache", True) in (True, "true"))
+        raw_judges = s.value("qa_judges", "[]") or "[]"
+        if isinstance(raw_judges, list):
+            raw_judges = json.dumps(raw_judges, ensure_ascii=False)
+        self.qa_judges = str(raw_judges)
+        raw_j1 = s.value("qa_judge1", "{}") or "{}"
+        if isinstance(raw_j1, dict):
+            raw_j1 = json.dumps(raw_j1, ensure_ascii=False)
+        self.qa_judge1 = str(raw_j1)
+        try:
+            self.qa_jury_threshold = max(1, min(4, int(s.value("qa_jury_threshold", 2))))
+        except (TypeError, ValueError):
+            self.qa_jury_threshold = 2
         if self.qa_provider and self.qa_provider not in self.AVAILABLE_PROVIDERS and self.qa_provider != "Mixed Providers":
             logging.getLogger("snbt_localizer.cli").warning(
                 f"Unknown saved QA provider '{self.qa_provider}', ignoring it"
@@ -293,6 +310,9 @@ class ConfigManager:
         s.setValue("qa_temperature", self.qa_temperature)
         s.setValue("qa_dataset", self.qa_dataset)
         s.setValue("qa_verdict_cache", self.qa_verdict_cache)
+        s.setValue("qa_judges", self.qa_judges or "[]")
+        s.setValue("qa_jury_threshold", self.qa_jury_threshold)
+        s.setValue("qa_judge1", self.qa_judge1 or "{}")
         s.setValue("resource_pack_mode", self.resource_pack_mode)
         s.setValue("quest_dir", str(self.quest_dir) if self.quest_dir else "")
         s.sync()
@@ -424,10 +444,16 @@ class ConfigManager:
         return self.api_keys_pool.get(prov, [])
 
     def set_api_keys(self, provider: str, keys: List[str]):
+        # ТЗ-v4 A1: every stored key passes the central sanitizer
+        # (strip; non-ASCII/embedded-newline rejects with a warning).
+        try:
+            from core import sanitize_api_keys
+            keys = sanitize_api_keys(keys, origin=f"pool/{provider}")
+        except Exception:
+            keys = [k.strip() for k in (keys or []) if k and k.strip()]
         seen = set()
         unique = []
         for k in keys:
-            k = k.strip()
             if k and k not in seen:
                 seen.add(k)
                 unique.append(k)

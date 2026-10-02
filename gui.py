@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QLabel, QComboBox, QListView, QCheckBox, 
                              QCompleter, QStyleFactory, QProgressBar, QMessageBox,
                              QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
-                             QTabWidget, QHeaderView, QFrame)
+                             QTabWidget, QHeaderView, QFrame, QScrollArea)
 from PyQt6.QtCore import QThread, pyqtSignal, QSettings, Qt, QStringListModel, QObject, QTimer, QUrl
 from PyQt6.QtGui import QPalette, QColor, QKeySequence, QShortcut, QIcon, QDesktopServices, QPainter
 import httpx
@@ -968,6 +968,17 @@ class CreditsTab(QWidget):
         card_layout.addLayout(links_layout)
         main_layout.addWidget(card)
 
+def _sanitize_judge_key(key: str, origin: str = "") -> str:
+    """ТЗ-v4 A1: judge-row API keys pass the central core sanitizer at
+    save time; a rejected key becomes empty (= provider pool)."""
+    try:
+        from core import sanitize_api_key
+        cleaned = sanitize_api_key(key, origin=f"judge {origin}" if origin else "judge")
+        return cleaned
+    except Exception:
+        return str(key or "").strip()
+
+
 class SettingsTab(QWidget):
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -994,18 +1005,8 @@ class SettingsTab(QWidget):
         # _on_utility_provider_changed fires via setCurrentIndex above when a
         # non-default provider was saved; the model text is restored after
         # the list loads (see _on_utility_models_loaded).
-        # QA audit phase: restore the saved provider WITHOUT blocking signals.
-        # setCurrentIndex fires _on_qa_provider_changed, which mirrors the
-        # utility flow: with QA on it starts the model loader (the saved
-        # qa_model text is restored in _on_qa_models_loaded); with QA off
-        # the handler only greys the model box and starts nothing. Blocking
-        # the signal here left the model box permanently empty/disabled after
-        # a restart even with QA on and a provider selected.
-        saved_qap = self.settings.value("qa_provider", "") or ""
-        idx_qap = self.qa_provider_combo.findData(saved_qap)
-        if idx_qap < 0:
-            idx_qap = 0
-        self.qa_provider_combo.setCurrentIndex(idx_qap)
+        # QA audit phase: judge #1 (provider + model) is restored in setup_ui
+        # by _judges_load_from_config — row 0 of the judges table.
 
     def setup_ui(self):
         self.layout = QVBoxLayout()
@@ -1152,7 +1153,7 @@ class SettingsTab(QWidget):
         utility_hint = QLabel('After the model you can type "/" for a reasoning level (e.g. gpt-5/low)')
         utility_hint.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 2px;")
         utility_hint.setToolTip('Type "/" after a model id to pick a reasoning level:\n'
-                                '/off /minimal /low /medium /high /xhigh /default\n'
+                                '/off /minimal /low /medium /high /xhigh /max /default\n'
                                 'Controls how much the model "thinks" before answering —\n'
                                 'lower levels are faster and cheaper.')
         utility_layout.addWidget(utility_hint)
@@ -1177,71 +1178,9 @@ class SettingsTab(QWidget):
         qa_top_row.addStretch()
         qa_layout.addLayout(qa_top_row)
 
-        qa_provider_row = QHBoxLayout()
-        qa_provider_row.setSpacing(10)
-        qa_provider_label = QLabel("Auditor provider")
-        self.qa_provider_combo = QComboBox()
-        self.qa_provider_combo.setView(QListView())
-        self.qa_provider_combo.setEditable(False)
-        self.qa_provider_combo.setEnabled(self.cb_qa_enabled.isChecked())
-        self.qa_provider_combo.addItem("Same as utility (default)", "")
-        from config import ConfigManager as _CM
-        for p in _CM.AVAILABLE_PROVIDERS:
-            self.qa_provider_combo.addItem(p, p)
-        self.qa_provider_combo.setToolTip(
-            "Provider used ONLY for the QA audit pass.\n"
-            "Keys are taken from this provider's pool on the main screen.\n"
-            "If the pool is empty, falls back to the utility/main provider."
-        )
-        self.qa_provider_combo.setStyleSheet(
-            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
-            " border-radius: 6px; padding: 6px 10px; color: #f2f4f8; }"
-            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
-            "QComboBox QAbstractItemView { background-color: #171920; color: #f2f4f8;"
-            " selection-background-color: #306fcb; selection-color: #ffffff; }"
-        )
-        qa_provider_row.addWidget(qa_provider_label)
-        qa_provider_row.addWidget(self.qa_provider_combo)
-        qa_provider_row.addStretch()
-        qa_layout.addLayout(qa_provider_row)
-        # connect AFTER the handler exists on the class — safe at runtime
-        self.qa_provider_combo.currentIndexChanged.connect(self._on_qa_provider_changed)
-
-        qa_model_row = QHBoxLayout()
-        qa_model_row.setSpacing(10)
-        qa_model_label = QLabel("Auditor model")
-        self.qa_model_box = QComboBox()
-        self.qa_model_box.setEditable(True)
-        self.qa_model_box.setEnabled(False)
-        self.qa_model_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.qa_model_box.setLineEdit(GhostSuffixLineEdit("/low"))
-        self.qa_model_box.lineEdit().setPlaceholderText("(same as utility model)")
-        self.qa_model_box.setStyleSheet(
-            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
-            " border-radius: 6px; padding: 6px 10px; color: #f2f4f8; }"
-            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
-            "QComboBox QLineEdit { background-color: transparent; color: #f2f4f8; border: none; padding: 0; }"
-            "QLineEdit:disabled { background-color: transparent; color: #4b5263; border: none; }"
-        )
-        self.qa_model_box.lineEdit().textEdited.connect(self._on_qa_model_text_edited)
-        self._qa_orig_completer_model = None
-        self.qa_model_completer = QCompleter(self)
-        self.qa_model_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        self.qa_model_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.qa_model_completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.qa_model_completer.popup().setStyleSheet(STYLE_SHEET)
-        self.qa_model_box.setCompleter(self.qa_model_completer)
-        qa_model_row.addWidget(qa_model_label)
-        qa_model_row.addWidget(self.qa_model_box, 1)
-        qa_layout.addLayout(qa_model_row)
-
-        qa_hint_label = QLabel('After the model you can type "/" for a reasoning level (e.g. gpt-5/low)')
-        qa_hint_label.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 2px;")
-        qa_hint_label.setToolTip('Type "/" after a model id to pick a reasoning level:\n'
-                                 '/off /minimal /low /medium /high /xhigh /default\n'
-                                 'Controls how much the model "thinks" before answering —\n'
-                                 'lower levels are faster and cheaper.')
-        qa_layout.addWidget(qa_hint_label)
+        # (ТЗ-Жюри UX) The separate auditor provider/model rows are gone:
+        # judge #1 row in the table below IS the QA picker — same provider
+        # combo, same live model list, same '/' effort hints per row.
 
         self.cb_qa_update_glossary = QCheckBox("Update modpack glossary from scan results")
         self.cb_qa_update_glossary.setChecked(self.config.qa_update_glossary)
@@ -1313,6 +1252,87 @@ class SettingsTab(QWidget):
         qa_ds_row.addStretch()
         qa_layout.addLayout(qa_ds_row)
 
+        # --- ТЗ-Жюри: jury threshold + judges table --------------------
+        self.jury_threshold_spin = QSpinBox()
+        self.jury_threshold_spin.setRange(1, 4)
+        self.jury_threshold_spin.setValue(int(getattr(self.config, "qa_jury_threshold", 2) or 2))
+        self.jury_threshold_spin.setEnabled(self.cb_qa_enabled.isChecked())
+        self.jury_threshold_spin.setToolTip(
+            "Consensus threshold: how many judges must flag a pair before it goes to phase 2.\n"
+            "Pairs flagged by fewer judges (but at least one) are disputed → the foreman "
+            "re-examines them (phase 2.5).")
+        self.jury_threshold_spin.setStyleSheet(
+            "QSpinBox { background-color: #2d2d33; color: #f2f4f8; border: 1px solid #3a3a42;"
+            " border-radius: 4px; padding: 3px 6px; }"
+            "QSpinBox::up-button, QSpinBox::down-button { width: 16px; }")
+        jury_row = QHBoxLayout()
+        jury_label = QLabel("Consensus threshold (judges)")
+        jury_label.setStyleSheet("color: #b8bfcc; border: none;")
+        jury_row.addWidget(jury_label)
+        jury_row.addWidget(self.jury_threshold_spin)
+        jury_row.addStretch()
+        qa_layout.addLayout(jury_row)
+
+        jury_hint_top = QLabel(
+            "Judges (1..4). Judge #1 = the primary QA auditor and foreman — edit its provider/model "
+            "right in the table (live model list; type '/' after the id for a reasoning level). "
+            "Add extra judges to vote on every flagged pair; a pair is applied only on consensus.")
+        jury_hint_top.setStyleSheet("font-size: 11px; color: #64748b; border: none;")
+        jury_hint_top.setWordWrap(True)
+        qa_layout.addWidget(jury_hint_top)
+
+        self.judges_table = QTableWidget(0, 8)
+        self.judges_table.setHorizontalHeaderLabels(
+            ["Enabled", "Name", "Provider", "Base URL", "API key", "Model", "Temperature", "Test"])
+        _jt_hdr = self.judges_table.horizontalHeader()
+        _jt_hdr.setStretchLastSection(False)
+        self.judges_table.setColumnWidth(0, 46)
+        self.judges_table.setColumnWidth(1, 100)
+        self.judges_table.setColumnWidth(2, 165)
+        self.judges_table.setColumnWidth(3, 110)
+        self.judges_table.setColumnWidth(4, 90)
+        self.judges_table.setColumnWidth(6, 78)
+        self.judges_table.setColumnWidth(7, 86)
+        _jt_hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        _jt_hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        _jt_hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self.judges_table.verticalHeader().setVisible(False)
+        self.judges_table.setAlternatingRowColors(True)
+        self.judges_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.judges_table.setStyleSheet(
+            "QTableWidget { background-color: #1e1e24; alternate-background-color: #232329;"
+            " border: 1px solid #2d2d30; border-radius: 6px; gridline-color: #2d2d30; }"
+            "QHeaderView::section { background-color: #2d2d33; color: #b8bfcc; padding: 4px;"
+            " border: none; }"
+            "QCheckBox { color: #f2f4f8; }")
+        self.judges_table.setMinimumHeight(190)
+        self._judge_loaders = {}
+        self._judge_orig_cmodel = {}
+        self._judges_load_from_config()
+        qa_layout.addWidget(self.judges_table)
+
+        jury_btn_row = QHBoxLayout()
+        self.btn_judge_add = QPushButton("Add judge")
+        self.btn_judge_add.setEnabled(self.cb_qa_enabled.isChecked())
+        self.btn_judge_add.clicked.connect(lambda: self._judges_add_row())
+        self.btn_judge_del = QPushButton("Remove selected judge")
+        self.btn_judge_del.setEnabled(self.cb_qa_enabled.isChecked())
+        self.btn_judge_del.clicked.connect(self._judges_del_selected)
+        jury_btn_row.addWidget(self.btn_judge_add)
+        jury_btn_row.addWidget(self.btn_judge_del)
+        jury_btn_row.addStretch()
+        qa_layout.addLayout(jury_btn_row)
+
+        jury_hint = QLabel(
+            "Judge #1 is always the primary and the foreman (its effort is raised one step for "
+            "disputed pairs). Extra judges: leave the API key empty to use that provider's key pool "
+            "from the main screen. In any Model field type '/' after the id for a reasoning level "
+            "(e.g. gpt-5/low). A dead judge's votes are excluded automatically, the run continues.")
+        jury_hint.setStyleSheet("font-size: 11px; color: #64748b; border: none;")
+        jury_hint.setWordWrap(True)
+        qa_layout.addWidget(jury_hint)
+        # --- end ТЗ-Жюри widgets ---------------------------------------
+
         qa_hint = QLabel("A second model re-reads every translated pair before writing ru_ru: hard errors are retranslated, safe terminology fixes are applied, glossary terms are learned. Skips silently if no keys or unsupported provider.")
         qa_hint.setStyleSheet("font-size: 11px; color: #64748b; border: none;")
         qa_hint.setWordWrap(True)
@@ -1373,6 +1393,7 @@ class SettingsTab(QWidget):
         ui_settings_layout.addWidget(self.cb_resource_pack)
 
         self.resource_pack_desc = QLabel("Saves KubeJS/JSON translations into a clean standalone Resource Pack. WARNING: Some modpacks (like KubeJS in ATM9) ignore resource packs for script translations. If translations don't load in-game, disable this mode to translate directly in-place.")
+        self.resource_pack_desc.setWordWrap(True)
         self.resource_pack_desc.setStyleSheet("font-size: 11px; color: #64748b; border: none; margin-left: 20px;")
         ui_settings_layout.addWidget(self.resource_pack_desc)
         self.layout.addWidget(ui_settings_frame)
@@ -1421,75 +1442,476 @@ class SettingsTab(QWidget):
             self._utility_loader = None
 
     # --- QA audit phase -----------------------------------------------------
+    def _judge_item_text(self, r, c):
+        it = self.judges_table.item(r, c)
+        return (it.text() or "").strip() if it else ""
+
+    def _judge_row_of_combo(self, combo):
+        for r in range(self.judges_table.rowCount()):
+            if self.judges_table.cellWidget(r, 2) is combo:
+                return r
+        return -1
+
+    def _judge_row_of_lineedit(self, w):
+        for r in range(self.judges_table.rowCount()):
+            box = self.judges_table.cellWidget(r, 5)
+            if box is not None and box.lineEdit() is w:
+                return r
+        return -1
+
+    def _judges_load_from_config(self):
+        """Rebuild the judges table: row 0 = the primary QA auditor
+        (config.qa_provider / config.qa_model), rows 1..3 = extra judges
+        from config.qa_judges."""
+        self.judges_table.setRowCount(0)
+        self._judge_loaders = {}
+        self._judge_orig_cmodel = {}
+        # Primary row's own overrides persisted under qa_judge1 (dict):
+        # api_key / base_url / temperature — empty means "pool defaults".
+        j1 = {}
+        raw1 = getattr(self.config, "qa_judge1", "") or ""
+        if isinstance(raw1, str) and raw1.strip():
+            try:
+                parsed = json.loads(raw1)
+                if isinstance(parsed, dict):
+                    j1 = parsed
+            except (ValueError, TypeError):
+                j1 = {}
+        elif isinstance(raw1, dict):
+            j1 = raw1
+        self._judges_add_row(
+            primary=True,
+            provider=(getattr(self.config, "qa_provider", "") or "").strip(),
+            model=(getattr(self.config, "qa_model", "") or "").strip(),
+            base_url=str(j1.get("base_url") or ""),
+            api_key=str(j1.get("api_key") or ""),
+            temperature=j1.get("temperature"))
+        raw = getattr(self.config, "qa_judges", "") or ""
+        judges = []
+        if isinstance(raw, str) and raw.strip():
+            try:
+                judges = json.loads(raw)
+            except (ValueError, TypeError):
+                judges = []
+        elif isinstance(raw, list):
+            judges = raw
+        for j in (judges or [])[:3]:
+            if not isinstance(j, dict):
+                continue
+            self._judges_add_row(
+                enabled=bool(j.get("enabled", True)),
+                name=str(j.get("name") or ""),
+                provider=str(j.get("provider") or ""),
+                base_url=str(j.get("base_url") or ""),
+                api_key=str(j.get("api_key") or ""),
+                model=str(j.get("model") or ""),
+                temperature=j.get("temperature"))
+        if self.cb_qa_enabled.isChecked():
+            for r in range(self.judges_table.rowCount()):
+                self._judge_reload_models(r)
+
+    def _judges_add_row(self, enabled=True, name="", provider="",
+                        base_url="", api_key="", model="", temperature=None,
+                        primary=False):
+        """Append one judge row. Row 0 (primary) edits the QA provider and
+        model; its keys/base URL come from the main screen pools, so those
+        cells stay read-only."""
+        t = self.judges_table
+        if t.rowCount() >= 4:
+            return
+        r = t.rowCount()
+        t.insertRow(r)
+        cb = QCheckBox()
+        cb.setChecked(True if primary else bool(enabled))
+        if primary:
+            cb.setEnabled(False)
+            cb.setToolTip("Judge #1 = primary auditor + foreman — always on while QA is enabled.")
+        t.setCellWidget(r, 0, cb)
+        name_item = QTableWidgetItem("j1 (primary QA model)" if primary
+                                      else (name or f"j{r + 1}"))
+        # All cells are editable now — the primary judge is just row 0,
+        # not a locked summary of the main screen (user request: every
+        # field must accept input).
+        name_item.setFlags(name_item.flags() | Qt.ItemFlag.ItemIsEditable)
+        if primary:
+            name_item.setToolTip("Judge #1 is built from this row's provider/model.")
+        t.setItem(r, 1, name_item)
+        # Provider combo: real provider list instead of raw text editing.
+        prov_combo = QComboBox()
+        prov_combo.setView(QListView())
+        prov_combo.setEditable(False)
+        from config import ConfigManager as _CM
+        prov_combo.addItem("Same as utility (default)", "")
+        for p in _CM.AVAILABLE_PROVIDERS:
+            prov_combo.addItem(p, p)
+        idx = prov_combo.findData(provider)
+        prov_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        prov_combo.setStyleSheet(
+            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
+            " border-radius: 6px; padding: 4px 8px; color: #f2f4f8; }"
+            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
+            "QComboBox QAbstractItemView { background-color: #171920; color: #f2f4f8;"
+            " selection-background-color: #306fcb; selection-color: #ffffff; }")
+        prov_combo.setToolTip(
+            "Provider for this judge's audit requests.\n"
+            "Keys: an empty API key takes this provider's pool from the main screen.")
+        t.setCellWidget(r, 2, prov_combo)
+        prov_combo.currentIndexChanged.connect(
+            lambda _=None, c=prov_combo: self._judge_provider_changed(self._judge_row_of_combo(c)))
+        # Base URL / API key cells — editable for every judge (row 0 too);
+        # empty = take this provider's pool from the main screen.
+        url_item = QTableWidgetItem(base_url or "")
+        key_item = QTableWidgetItem(api_key or "")
+        url_item.setFlags(url_item.flags() | Qt.ItemFlag.ItemIsEditable)
+        key_item.setFlags(key_item.flags() | Qt.ItemFlag.ItemIsEditable)
+        if primary:
+            url_item.setToolTip("Empty = provider base URL; override here if needed.")
+            key_item.setToolTip("Empty = this provider's key pool from the main screen.")
+        else:
+            key_item.setToolTip("Empty = use this provider's key pool from the main screen.")
+        t.setItem(r, 3, url_item)
+        t.setItem(r, 4, key_item)
+        # Model combo: editable, ghost '/effort' suffix, live list per row.
+        model_box = QComboBox()
+        model_box.setEditable(True)
+        model_box.setEnabled(self.cb_qa_enabled.isChecked())
+        model_box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        model_box.setLineEdit(GhostSuffixLineEdit("/low"))
+        model_box.lineEdit().setPlaceholderText(
+            "QA model (empty = same as utility)" if primary else "Model id")
+        model_box.setStyleSheet(
+            "QComboBox { background-color: #171920; border: 1px solid #2b2f3d;"
+            " border-radius: 6px; padding: 4px 8px; color: #f2f4f8; }"
+            "QComboBox:disabled { background-color: #14151a; color: #4b5263; }"
+            "QComboBox QLineEdit { background-color: transparent; color: #f2f4f8; border: none; padding: 0; }"
+            "QLineEdit:disabled { background-color: transparent; color: #4b5263; border: none; }")
+        _comp = QCompleter(self)
+        _comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        _comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        _comp.setFilterMode(Qt.MatchFlag.MatchContains)
+        _comp.popup().setStyleSheet(STYLE_SHEET)
+        model_box.setCompleter(_comp)
+        if model:
+            model_box.setCurrentText(model)
+        model_box.lineEdit().textEdited.connect(
+            lambda text, w=model_box.lineEdit(): self._on_judge_model_text_edited(
+                self._judge_row_of_lineedit(w), text))
+        t.setCellWidget(r, 5, model_box)
+        # Temperature cell — editable for every judge; empty = the QA
+        # temperature spin for row 0, None for extras.
+        temp_val = temperature if isinstance(temperature, (int, float)) else ""
+        titem = QTableWidgetItem("" if temp_val == "" else str(temp_val))
+        titem.setFlags(titem.flags() | Qt.ItemFlag.ItemIsEditable)
+        if primary:
+            titem.setToolTip("Empty = the QA temperature setting above.")
+        t.setItem(r, 6, titem)
+        # ТЗ-v4 A4: per-row Test button — verifies this judge's key+model
+        # (its own key, else the provider pool) with one test question.
+        btn = QPushButton("Test")
+        btn.setFixedHeight(24)
+        btn.setEnabled(self.cb_qa_enabled.isChecked())
+        btn.setToolTip("Verify this judge's key(s) and model with a test question.\n"
+                       "An empty API key tests the provider's whole key pool.")
+        btn.setStyleSheet(
+            "QPushButton { background-color: #26304a; border: 1px solid #3b4a6b;"
+            " border-radius: 6px; padding: 2px 8px; color: #dbe4f3; font-size: 11px; }"
+            "QPushButton:disabled { background-color: #14151a; color: #4b5263; }")
+        btn.clicked.connect(lambda _=False, b=btn: self._judge_test_row(b))
+        t.setCellWidget(r, 7, btn)
+
+    def _judge_test_row(self, btn):
+        """ТЗ-v4 A4: test ONE judge row (its key or the provider pool)."""
+        t = self.judges_table
+        row = None
+        for r in range(t.rowCount()):
+            if t.cellWidget(r, 7) is btn:
+                row = r
+                break
+        if row is None:
+            return
+        # Snapshot the row's settings BEFORE starting the worker (the user
+        # may edit the row while the test runs).
+        spec = self._judge_row_spec(row)
+        if spec is None:
+            btn.setText("…")
+            btn.setToolTip("Nothing to test: set a model for this judge first.")
+            return
+        keys, provider, model, tag = spec
+        specs = [(k, provider, model) for k in keys]
+        if getattr(self, "_judge_test_workers", None) is None:
+            self._judge_test_workers = {}
+        old = self._judge_test_workers.get(row)
+        if old is not None:
+            old.cancelled = True
+            old.quit()
+        btn.setText("…")
+        btn.setEnabled(False)
+        worker = JudgeTestWorker(row, specs)
+        self._judge_test_workers[row] = worker
+        _track_qthread(worker)
+        worker.finished_row.connect(self._on_judge_test_done)
+        worker.start()
+
+    def _judge_row_spec(self, row, require_enabled=False):
+        """(keys, provider, model, tag) snapshot for the Test button; None
+        when the row has no model to test (or is disabled and the caller
+        only wants enabled rows)."""
+        t = self.judges_table
+        if row < 0 or row >= t.rowCount():
+            return None
+        cb = t.cellWidget(row, 0)
+        if require_enabled and cb is not None and not cb.isChecked():
+            return None
+        prov_combo = t.cellWidget(row, 2)
+        provider = ((prov_combo.currentData() or "") if prov_combo is not None else "").strip()
+        if row == 0:
+            model = self.judge1_model()
+        else:
+            box = t.cellWidget(row, 5)
+            model = ((box.currentText() or "").strip() if box is not None
+                     else self._judge_item_text(row, 5))
+        if not model or model in ("Loading live models...", "Enter model name manually"):
+            return None
+        api_key = self._judge_item_text(row, 4)
+        keys = [api_key] if api_key else self._judge_keys_for(provider)
+        keys = [k for k in keys if k]
+        if not keys:
+            return None
+        tag = "j1" if row == 0 else (self._judge_item_text(row, 1) or f"j{row + 1}")
+        return keys, provider, model, tag
+
+    def _on_judge_test_done(self, row, results):
+        """Test button result: OK/FAIL label + tooltip with per-key details."""
+        t = self.judges_table
+        btn = t.cellWidget(row, 7)
+        if btn is None:
+            return
+        btn.setEnabled(self.cb_qa_enabled.isChecked())
+        btn.setText("Test")
+        if not results:
+            btn.setToolTip("No answer — the test failed to run (see app.log).")
+            return
+        ok = sum(1 for status, _ in results.values() if status == "Active")
+        total = len(results)
+        if ok == total:
+            btn.setText("✓ OK")
+            btn.setStyleSheet(
+                "QPushButton { background-color: #1d3a29; border: 1px solid #2e6b45;"
+                " border-radius: 6px; padding: 2px 8px; color: #a4e8bf; font-size: 11px; }"
+                "QPushButton:disabled { background-color: #14151a; color: #4b5263; }")
+        else:
+            btn.setText(f"✗ {ok}/{total}")
+            btn.setStyleSheet(
+                "QPushButton { background-color: #3a1d1d; border: 1px solid #6b2e2e;"
+                " border-radius: 6px; padding: 2px 8px; color: #e8a4a4; font-size: 11px; }"
+                "QPushButton:disabled { background-color: #14151a; color: #4b5263; }")
+        tag = ("j1" if row == 0 else (self._judge_item_text(row, 1) or f"j{row + 1}"))
+        tip_lines = [f"Judge {tag} test results:"]
+        for i, (key, (status, answer)) in enumerate(results.items(), 1):
+            short = f"...{key[-4:]}" if len(key) > 8 else key
+            line = f"[{i}] {short}: {status}"
+            if answer:
+                line += f" — {answer[:70]}"
+            tip_lines.append(line)
+        btn.setToolTip("\n".join(tip_lines))
+
+    def _judges_del_selected(self):
+        """Remove selected extra judges (row 0 = primary, never removed)."""
+        rows = sorted({i.row() for i in self.judges_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            if r <= 0:
+                continue
+            self.judges_table.removeRow(r)
+        # Rows shifted: cancel stale loaders and reset per-row caches.
+        for loader in list(getattr(self, "_judge_loaders", {}).values()):
+            loader.cancelled = True
+        self._judge_loaders = {}
+        self._judge_orig_cmodel = {}
+        # ТЗ-v4 A4: rows shifted — cancel all in-flight row tests too (a
+        # finished_row signal would otherwise land on the wrong button).
+        for worker in list(getattr(self, "_judge_test_workers", {}).values()):
+            worker.cancelled = True
+            worker.quit()
+        self._judge_test_workers = {}
+
+    def _judges_collect(self):
+        """Extra judges (rows 1..3) as dicts for config.qa_judges. Row 0 is
+        the primary QA model — synced separately into config.qa_provider /
+        config.qa_model via judge1_provider() / judge1_model()."""
+        out = []
+        for r in range(1, self.judges_table.rowCount()):
+            prov = self.judges_table.cellWidget(r, 2)
+            box = self.judges_table.cellWidget(r, 5)
+            cb = self.judges_table.cellWidget(r, 0)
+            model = (box.currentText() or "").strip() if box is not None else self._judge_item_text(r, 5)
+            if not model or model in ("Loading live models...", "Enter model name manually"):
+                continue
+            temp_raw = self._judge_item_text(r, 6)
+            try:
+                temp = float(temp_raw) if temp_raw not in ("", "None") else None
+            except ValueError:
+                temp = None
+            api_key = self._judge_item_text(r, 4)
+            if api_key:
+                api_key = _sanitize_judge_key(api_key, f"row {r}")
+            out.append({
+                "name": self._judge_item_text(r, 1) or f"j{r + 1}",
+                "provider": (prov.currentData() or "") if prov is not None else self._judge_item_text(r, 2),
+                "base_url": self._judge_item_text(r, 3),
+                "api_key": api_key,
+                "model": model,
+                "temperature": temp,
+                "enabled": bool(cb.isChecked()) if cb is not None else True,
+            })
+        return out[:3]
+
+    def judge1_provider(self):
+        """Judge #1 provider (row 0 of the table) for the main sync."""
+        prov = self.judges_table.cellWidget(0, 2)
+        return ((prov.currentData() or "") if prov is not None else "").strip()
+
+    def judge1_model(self):
+        """Judge #1 model text (row 0 of the table) for the main sync."""
+        box = self.judges_table.cellWidget(0, 5)
+        text = ((box.currentText() or "") if box is not None else "").strip()
+        if text in ("Loading live models...", "Enter model name manually"):
+            return ""
+        return text
+
+    def judge1_overrides(self):
+        """Judge #1 row overrides: api_key / base_url / temperature.
+        Only non-empty values are stored; empty = pool defaults.
+        The API key passes the central sanitizer (ТЗ-v4 A1)."""
+        out = {}
+        api_key = self._judge_item_text(0, 4)
+        if api_key:
+            api_key = _sanitize_judge_key(api_key, "judge1")
+        if api_key:
+            out["api_key"] = api_key
+        base_url = self._judge_item_text(0, 3)
+        if base_url:
+            out["base_url"] = base_url
+        temp_raw = self._judge_item_text(0, 6)
+        if temp_raw not in ("", "None"):
+            try:
+                out["temperature"] = float(temp_raw)
+            except ValueError:
+                pass
+        return out
+
     def _on_qa_enabled_toggled(self, checked):
-        self.qa_provider_combo.setEnabled(checked)
         self.cb_qa_update_glossary.setEnabled(checked)
         self.qa_batch_spin.setEnabled(checked)
         self.qa_temp_spin.setEnabled(checked)
         self.cb_qa_dataset.setEnabled(checked)
         self.cb_qa_vcache.setEnabled(checked)
-        if not checked:
-            self.qa_model_box.setEnabled(False)
-        else:
-            # Mirror the utility flow: enable the model box according to the
-            # currently selected provider and load models if empty.
-            self._on_qa_provider_changed(self.qa_provider_combo.currentIndex())
+        self.jury_threshold_spin.setEnabled(checked)
+        self.btn_judge_add.setEnabled(checked)
+        self.btn_judge_del.setEnabled(checked)
+        self.judges_table.setEnabled(checked)
+        # Grey the model boxes while off, restore live lists when on.
+        for r in range(self.judges_table.rowCount()):
+            self._judge_reload_models(r)
         # save immediately so the choice survives a crash/close
         self.config.qa_enabled = checked
         self.config.save_to_settings()
 
-    def _qa_keys_for(self, provider: str):
-        """Keys for the QA provider's model list: its own pool, with the
-        utility/main pool as fallback."""
-        if not provider:
-            provider = self.config.utility_provider or self.config.provider
-        if provider == "Mixed Providers":
-            return []
+    def _judge_keys_for(self, provider, api_key=""):
+        """Key for this row's model list: its own key, else the provider pool."""
+        if api_key:
+            return [api_key]
         return self.config.get_api_keys(provider) if provider else []
 
-    def _on_qa_provider_changed(self, index):
-        provider = self.qa_provider_combo.currentData() or ""
-        if getattr(self, "_qa_loader", None):
-            self._qa_loader.cancelled = True
-        self.qa_model_box.blockSignals(True)
-        self.qa_model_box.clear()
+    def _judge_test_specs(self):
+        """(key, provider, model, tag) specs for the Test Keys button.
+
+        Same resolution a real QA run uses (core.parse_qa_judges): the row's
+        own API key first, else that provider's pool from the main screen.
+        Disabled rows and rows without a model are skipped; keys that only
+        differ by an effort suffix are not re-tested (same key+model).
+        """
+        specs = []
+        for r in range(self.judges_table.rowCount()):
+            spec = self._judge_row_spec(r, require_enabled=True)
+            if spec is None:
+                continue
+            keys, provider, model, tag = spec
+            for k in keys:
+                specs.append((k, provider, model, tag))
+        return specs
+
+    def _judge_provider_changed(self, row):
+        self._judge_reload_models(row)
+
+    def _judge_reload_models(self, row):
+        """Refresh one row's model combo for its provider: grey it out for
+        utility/free/per-key providers, load the live model list otherwise
+        (the row's own key first, else the provider pool)."""
+        t = self.judges_table
+        if row < 0 or row >= t.rowCount():
+            return
+        prov_combo = t.cellWidget(row, 2)
+        box = t.cellWidget(row, 5)
+        if prov_combo is None or box is None:
+            return
+        provider = prov_combo.currentData() or ""
+        api_key = self._judge_item_text(row, 4)
+        base_url = self._judge_item_text(row, 3)
+        old = self._judge_loaders.get(row)
+        if old is not None:
+            old.cancelled = True
+            self._judge_loaders.pop(row, None)
+        box.blockSignals(True)
+        keep = (box.currentText() or "").strip()
+        box.clear()
         if not provider or "Google Translate" in provider or provider == "Mixed Providers":
-            # Same as utility / free engine / per-key pool: no model list to load
-            self.qa_model_box.setEnabled(False)
-            self.qa_model_completer.setModel(QStringListModel([]))
-            ph = ("Auditor model (same as utility)" if not provider
+            # Same as utility / free engine / per-key pool: no model list.
+            box.setEnabled(False)
+            ph = ("Model (same as utility)" if not provider
                   else ("Not needed (free engine)" if "Google Translate" in provider
                         else "Defined per key in pool"))
-            self.qa_model_box.setPlaceholderText(ph)
-            self.qa_model_box.lineEdit().setPlaceholderText(ph)
+            box.setPlaceholderText(ph)
+            box.lineEdit().setPlaceholderText(ph)
+            comp = box.completer()
+            if comp is not None:
+                comp.setModel(QStringListModel([]))
         elif not self.cb_qa_enabled.isChecked():
-            # QA off: everything stays grey until the user enables it.
-            self.qa_model_box.setEnabled(False)
+            box.setEnabled(False)
         else:
-            self.qa_model_box.setEnabled(True)
-            ph = "Auditor model (empty = same as utility)"
-            self.qa_model_box.setPlaceholderText(ph)
-            self.qa_model_box.lineEdit().setPlaceholderText(ph)
-            self.qa_model_box.addItem("Loading live models...")
-            self.qa_model_completer.setModel(QStringListModel(["Loading live models..."]))
-            keys = self._qa_keys_for(provider)
+            box.setEnabled(True)
+            ph = "QA model (empty = same as utility)" if row == 0 else "Model id"
+            box.setPlaceholderText(ph)
+            box.lineEdit().setPlaceholderText(ph)
+            keys = self._judge_keys_for(provider, api_key)
             key = keys[0] if keys else None
-            loader = _track_qthread(ModelLoader(provider, key, 0, None))
-            self._qa_loader = loader
-            loader.loaded.connect(self._on_qa_models_loaded)
-            loader.finished.connect(lambda l=loader: self._qa_cleanup_loader(l))
+            loader = _track_qthread(ModelLoader(provider, key, 0, base_url or None))
+            self._judge_loaders[row] = loader
+            loader.loaded.connect(
+                lambda models, err="", lid=0, lp="", r=row, l=loader:
+                    self._on_judge_models_loaded(r, l, models, err, lid, lp))
+            loader.finished.connect(lambda l=loader, r=row: self._judge_cleanup_loader(r, l))
             loader.start()
-        self.qa_model_box.blockSignals(False)
+        if keep:
+            box.setCurrentText(keep)
+        box.blockSignals(False)
 
-    def _qa_cleanup_loader(self, loader):
-        if getattr(self, "_qa_loader", None) is loader:
-            self._qa_loader = None
+    def _judge_cleanup_loader(self, row, loader):
+        if self._judge_loaders.get(row) is loader:
+            self._judge_loaders.pop(row, None)
 
-    def _on_qa_models_loaded(self, models, error_msg="", loader_id=0, loader_provider=""):
-        if getattr(self, "_qa_loader", None) is None:
+    def _on_judge_models_loaded(self, row, loader, models, error_msg="",
+                                loader_id=0, loader_provider=""):
+        if self._judge_loaders.get(row) is not loader:
+            return  # stale loader: row deleted or provider changed meanwhile
+        t = self.judges_table
+        if row >= t.rowCount():
             return
-        self.qa_model_box.blockSignals(True)
-        self.qa_model_box.clear()
+        box = t.cellWidget(row, 5)
+        if box is None:
+            return
+        box.blockSignals(True)
+        keep = (box.currentText() or "").strip()
+        box.clear()
         filtered = []
         if models:
             for m in models:
@@ -1497,31 +1919,36 @@ class SettingsTab(QWidget):
                 if not any(x in m_low for x in ["whisper", "tts", "stablediffusion", "dall-e", "embed", "moderation", "davinci", "babbage", "curie", "ada", "guard", "shield", "rerank", "classify", "classifier", "nli", "sentiment", "bert"]):
                     filtered.append(m)
         if filtered:
-            self.qa_model_box.addItems(filtered)
-            self.qa_model_completer.setModel(QStringListModel(filtered))
+            box.addItems(filtered)
+            comp = box.completer()
+            if comp is not None:
+                comp.setModel(QStringListModel(filtered))
         else:
-            self.qa_model_box.addItem("Enter model name manually")
-        saved = self.settings.value("qa_model", "") or ""
-        if saved:
-            self.qa_model_box.setCurrentText(saved)
-        self.qa_model_box.blockSignals(False)
+            box.addItem("Enter model name manually")
+        if keep:
+            box.setCurrentText(keep)
+        box.blockSignals(False)
 
-    def _on_qa_model_text_edited(self, text):
-        """Same live hint as the main model box: typing "model/" swaps the
-        completer to reasoning-level suggestions, anything else restores the
-        normal model list."""
+    def _on_judge_model_text_edited(self, row, text):
+        """Same live '/' hint as the main model box, per judge row."""
+        t = self.judges_table
+        if row < 0 or row >= t.rowCount():
+            return
+        box = t.cellWidget(row, 5)
+        comp = box.completer() if box is not None else None
+        if comp is None:
+            return
         base, _, tail = text.rpartition("/")
         tail_l = tail.strip().lower()
         is_level_typing = bool(base.strip()) and (tail_l == "" or any(l.startswith(tail_l) for l in REASONING_EFFORT_LEVELS))
         if is_level_typing:
-            if self._qa_orig_completer_model is None:
-                self._qa_orig_completer_model = self.qa_model_completer.model()
-            self.qa_model_completer.setModel(QStringListModel([f"{base.strip()}/{l}" for l in REASONING_EFFORT_LEVELS]))
-            self.qa_model_completer.setCompletionPrefix(text)
-            self.qa_model_completer.complete()
-        elif self._qa_orig_completer_model is not None:
-            self.qa_model_completer.setModel(self._qa_orig_completer_model)
-            self._qa_orig_completer_model = None
+            if row not in self._judge_orig_cmodel:
+                self._judge_orig_cmodel[row] = comp.model()
+            comp.setModel(QStringListModel([f"{base.strip()}/{l}" for l in REASONING_EFFORT_LEVELS]))
+            comp.setCompletionPrefix(text)
+            comp.complete()
+        elif row in self._judge_orig_cmodel:
+            comp.setModel(self._judge_orig_cmodel.pop(row))
 
     def _on_utility_model_text_edited(self, text):
         """Same live hint as the main model box: typing "model/" swaps the
@@ -2088,12 +2515,47 @@ class ModelLoader(QThread):
         if not self.cancelled:
             self.loaded.emit(models, error_msg, self.loader_id, self.provider)
 
+class JudgeTestWorker(QThread):
+    """ТЗ-v4 A4: verify ONE judge row's key+model with a test question.
+
+    Runs the same resolution a real QA run uses (the row's own API key,
+    else the provider's pool) — each pool key gets its own verdict so an
+    empty-key judge shows which pool keys are alive. Emits (row, results)
+    where results maps key -> (status, answer).
+    """
+    finished_row = pyqtSignal(int, dict)
+
+    def __init__(self, row, specs):
+        super().__init__()
+        self.row = row
+        self.specs = specs  # [(key, provider, model), ...]
+        self.cancelled = False
+
+    def run(self):
+        question = random.choice(TEST_QUESTIONS)
+        results = {}
+        try:
+            for key, provider, model in self.specs:
+                if self.cancelled:
+                    return
+                status, answer = asyncio.run(test_key_with_question(provider, key, model, question))
+                if status == "Model Paused":
+                    answer = (answer or "model paused on provider side")[:80]
+                results[key] = (status, answer or "")
+        except Exception as e:
+            logging.getLogger("snbt_localizer.gui").error(f"Judge key test failed: {repr(e)}")
+        if self.cancelled:
+            return
+        self.finished_row.emit(self.row, results)
+
+
 class KeyVerifierWorker(QThread):
     verification_complete = pyqtSignal(dict, dict, str)
 
-    def __init__(self, specs, show_provider=False):
+    def __init__(self, specs, show_provider=False, judge_specs=None):
         super().__init__()
         self.specs = specs
+        self.judge_specs = judge_specs or []
         self.cancelled = False
         self.show_provider = show_provider
 
@@ -2117,6 +2579,20 @@ class KeyVerifierWorker(QThread):
                         answer = f"{answer} | Balance: {balance}" if answer else f"Balance: {balance}"
                 results[key] = status
                 answers[key] = answer
+            # Jury keys (j1..jN from the judges table): verified with each
+            # judge's own model; the tag is shown instead of the key.
+            self.judge_results = {}
+            for key, provider, model, tag in self.judge_specs:
+                if self.cancelled:
+                    break
+                status, answer = asyncio.run(test_key_with_question(provider, key, model, question))
+                if status == "Model Paused":
+                    answer = (answer or "model paused on provider side")[:80]
+                if status == "Active":
+                    balance = asyncio.run(fetch_provider_balance(provider, key))
+                    if balance:
+                        answer = f"{answer} | Balance: {balance}" if answer else f"Balance: {balance}"
+                self.judge_results[tag] = (status, answer or "")
         except Exception as e:
             logging.getLogger("snbt_localizer.gui").error(f"Key verification failed: {repr(e)}")
         finally:
@@ -2259,6 +2735,15 @@ class Worker(QThread):
             self.log.emit(f"Unexpected error: {e}")
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
         finally:
+            # ТЗ-v4 C8/C9: ONE run-wide [QA] total + jury line for the whole
+            # run — the SNBT batch AND every JSON/JSON5 lang dir.
+            try:
+                from core import qa_run_finish
+                qa_run_finish(logger=lambda msg: (
+                                 self.log.emit(msg),
+                                 logging.getLogger("snbt_localizer.core").info(msg)))
+            except Exception:
+                pass
             if self.cache:
                 self.cache.close()
             self.done.emit()
@@ -2298,9 +2783,12 @@ class Worker(QThread):
 
         reset_request_timeout()
         # ТЗ-health: one batch run = one health window (stats + benching).
-        from core import health_reset, health_mark_start
+        # ТЗ-v4 C7-C9: the same scope covers the QA dataset/aggregates —
+        # one dataset jsonl + one final [QA] line for the whole run.
+        from core import health_reset, health_mark_start, qa_run_start
         health_reset()
         health_mark_start()
+        qa_run_start()
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
         m = SNBTManager(
@@ -2397,6 +2885,8 @@ class Worker(QThread):
             try:
                 # ТЗ-health п.4: per-key [POOL] stats into the GUI console
                 # and app.log at the end of the SNBT batch.
+                # ТЗ-v4.5 fix: the QA scope stays OPEN across the JSON phase —
+                # Worker.run closes it once, after every phase is done.
                 from core import health_summary_lines
                 for line in health_summary_lines():
                     self.log.emit(line)
@@ -2414,7 +2904,7 @@ class JSONWorker(QThread):
     done = pyqtSignal()
     progress_batch = pyqtSignal(int, int)
 
-    def __init__(self, base_dir, target_lang_code, translator, cache, modpack, policy, concurrency, batch_size, min_batch_size, max_concurrent_requests, resource_pack_mode=False):
+    def __init__(self, base_dir, target_lang_code, translator, cache, modpack, policy, concurrency, batch_size, min_batch_size, max_concurrent_requests, resource_pack_mode=False, qa_params=None):
         super().__init__()
         self.base_dir = base_dir
         self.target_lang_code = target_lang_code
@@ -2427,6 +2917,10 @@ class JSONWorker(QThread):
         self.min_batch_size = min_batch_size
         self.max_concurrent_requests = max_concurrent_requests
         self.resource_pack_mode = resource_pack_mode
+        # ТЗ-v4.5 fix: process() reads self.qa_params (it forwards the audit
+        # config to JSONManager); the constructor never stored it, so any
+        # caller hit AttributeError on the first run.
+        self.qa_params = qa_params
         self.is_aborted = False
         self.is_paused = False
 
@@ -2578,7 +3072,7 @@ class App(QMainWindow):
         model_layout = QVBoxLayout()
         model_label = QLabel('AI Model — after the model you can type "/" for a reasoning level (e.g. gpt-5/low)')
         model_label.setToolTip('Type "/" after a model id to pick a reasoning level:\n'
-                               '/off /minimal /low /medium /high /xhigh /default\n'
+                               '/off /minimal /low /medium /high /xhigh /max /default\n'
                                'Controls how much the model "thinks" before answering —\n'
                                'lower levels are faster and cheaper.')
         self.model_box = QComboBox()
@@ -2757,7 +3251,15 @@ class App(QMainWindow):
 
         self.settings_tab = SettingsTab(self.config, parent=self)
         self.settings_tab.ui_lang_combo.currentIndexChanged.connect(self.on_ui_language_changed)
-        self.tabs.addTab(self.settings_tab, "Settings")
+        # The Settings page keeps growing (QA, dataset, jury); a scroll area
+        # guarantees every row keeps its natural height — nothing squeezes
+        # or overlaps regardless of window size.
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidget(self.settings_tab)
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.tabs.addTab(settings_scroll, "Settings")
 
         self.credits_tab = CreditsTab()
         self.tabs.addTab(self.credits_tab, "Credits")
@@ -2960,18 +3462,22 @@ class App(QMainWindow):
         self.settings.setValue("utility_provider", utility_provider)
         self.settings.setValue("utility_model", utility_model)
         # QA audit phase
-        qa_provider = (self.settings_tab.qa_provider_combo.currentData() or "").strip()
-        qa_model = self.settings_tab.qa_model_box.currentText().strip()
-        if qa_model in ("Loading live models...", "Enter model name manually"):
-            qa_model = ""
+        qa_provider = self.settings_tab.judge1_provider()
+        qa_model = self.settings_tab.judge1_model()
         self.config.qa_provider = qa_provider
         self.config.qa_model = qa_model
+        # Judge #1 row overrides (api_key / base_url / temperature):
+        # empty cells = pool defaults — stored as a small JSON dict.
+        j1_overrides = self.settings_tab.judge1_overrides()
+        self.config.qa_judge1 = json.dumps(j1_overrides, ensure_ascii=False)
         self.config.qa_enabled = self.settings_tab.cb_qa_enabled.isChecked()
         self.config.qa_update_glossary = self.settings_tab.cb_qa_update_glossary.isChecked()
         self.config.qa_batch_size = self.settings_tab.qa_batch_spin.value()
         self.config.qa_temperature = self.settings_tab.qa_temp_spin.value()
         self.config.qa_dataset = self.settings_tab.cb_qa_dataset.isChecked()
         self.config.qa_verdict_cache = self.settings_tab.cb_qa_vcache.isChecked()
+        self.config.qa_judges = json.dumps(self.settings_tab._judges_collect(), ensure_ascii=False)
+        self.config.qa_jury_threshold = int(self.settings_tab.jury_threshold_spin.value())
         self.settings.setValue("qa_provider", qa_provider)
         self.settings.setValue("qa_model", qa_model)
         self.config.save_to_settings()
@@ -3157,16 +3663,23 @@ class App(QMainWindow):
         self.btn_run.setEnabled(has_files and self.is_model_valid())
 
     def update_batch_progress(self, cur, tot):
-        tot = max(1, tot)
+        """A whole file finished (SNBT) or JSON strings advanced (JSON mode)."""
+        if getattr(self, '_progress_mode', 'snbt') == 'json':
+            # JSONManager reports strings here; the string progress is already
+            # driven by progress_state, so just mark the bar.
+            return
         if hasattr(self, 'files_progress') and cur > 0:
             self.files_progress[cur - 1] = 1.0
+        self._refresh_progress_bar()
 
     def update_chunk_progress(self, file_idx, total_files, chunk_idx, total_chunks):
-        if hasattr(self, 'files_progress'):
-            if total_chunks > 0:
-                self.files_progress[file_idx] = chunk_idx / total_chunks
-            else:
-                self.files_progress[file_idx] = 0.0
+        if not hasattr(self, 'files_progress'):
+            self.files_progress = {}
+        if total_chunks > 0:
+            self.files_progress[file_idx] = min(1.0, chunk_idx / total_chunks)
+        else:
+            self.files_progress[file_idx] = 0.0
+        self._refresh_progress_bar()
 
     def update_lines_progress(self, completed: int, total: int):
         pass
@@ -3175,18 +3688,69 @@ class App(QMainWindow):
         if getattr(self, '_translation_finished', False):
             return
         if "JSON" in current_file_name or "strings" in current_file_name:
-            self.pb_batch.setRange(0, total_strings)
-            self.pb_batch.setValue(completed_strings)
-            self.pb_batch.setFormat(f"{current_file_name}: %v / %m strings")
-        else:
+            # JSON phase: a plain string bar, independent of the SNBT files.
+            self._progress_mode = 'json'
             self.pb_batch.setRange(0, 100)
             if total_strings > 0:
-                progress_percent = int((completed_strings / total_strings) * 100)
-                self.pb_batch.setValue(progress_percent)
-                self.pb_batch.setFormat(f"File {current_file_idx}/{total_files}: {current_file_name} | Strings {completed_strings}/{total_strings} | ETA: {self.format_eta(eta_seconds)}")
+                self.pb_batch.setValue(int((completed_strings / total_strings) * 100))
+                self.pb_batch.setFormat(
+                    f"JSON strings: {completed_strings}/{total_strings} "
+                    f"({int((completed_strings / total_strings) * 100)}%)")
             else:
                 self.pb_batch.setValue(0)
-                self.pb_batch.setFormat("Processing...")
+                self.pb_batch.setFormat("Translating JSON strings...")
+            return
+        self._progress_mode = 'snbt'
+        if total_files:
+            self._progress_total_files = total_files
+        self._progress_total_strings = total_strings
+        self._progress_done_strings = completed_strings
+        self._progress_eta = eta_seconds
+        self._progress_current = current_file_name
+        self._refresh_progress_bar()
+
+    def _refresh_progress_bar(self):
+        """One consistent overall bar for the SNBT phase.
+
+        Driven by STRINGS done / strings total, not by file count: a modpack
+        has many tiny quest files and a few huge ones, so "one file done =
+        equal share" sent the bar to the end while only 10% of the strings
+        were translated. Chunk-level string counts make it move during the
+        network work too. Files are only a fallback when no string total is
+        known yet.
+        """
+        if getattr(self, '_translation_finished', False):
+            return
+        total_files = max(1, getattr(self, '_progress_total_files', 0))
+        fp = getattr(self, 'files_progress', {}) or {}
+        done_files = 0
+        file_frac = 0.0
+        for i in range(total_files):
+            f = max(0.0, min(1.0, fp.get(i, 0.0)))
+            file_frac += f
+            if f >= 1.0:
+                done_files += 1
+        total_str = getattr(self, '_progress_total_strings', 0) or 0
+        done_str = getattr(self, '_progress_done_strings', 0) or 0
+        self.pb_batch.setRange(0, 1000)
+        if total_str > 0:
+            # Never let a miscount read as "400/200": show at most what the
+            # denominator promises, even if a sink over-reported.
+            done_str = min(done_str, total_str)
+            frac = done_str / total_str
+        else:
+            frac = file_frac / total_files
+        self.pb_batch.setValue(int(frac * 1000))
+        eta = getattr(self, '_progress_eta', 0)
+        parts = [f"Files {done_files}/{total_files}"]
+        if total_str > 0:
+            parts.append(f"Strings {done_str}/{total_str}")
+        cur = getattr(self, '_progress_current', '')
+        if cur:
+            parts.append(cur)
+        if eta and eta > 0:
+            parts.append(f"ETA {self.format_eta(eta)}")
+        self.pb_batch.setFormat(" | ".join(parts))
 
     def format_eta(self, eta_seconds):
         if eta_seconds <= 0 or eta_seconds is None:
@@ -3417,7 +3981,19 @@ class App(QMainWindow):
             self.lbl_key_status.setText("Pool Status: No keys to verify")
             return
 
-        self.verifier = _track_qthread(KeyVerifierWorker(specs, show_provider=(provider == "Mixed Providers")))
+        # Test Keys covers the jury too: j1..jN from the judges table are
+        # verified with their own models after the main pool. A key+model
+        # pair already covered by the main pool is not re-asked.
+        judge_specs = []
+        if getattr(self, "settings_tab", None) is not None:
+            seen = {(k, m) for k, p, m in specs}
+            for k, p, m, tag in self.settings_tab._judge_test_specs():
+                if (k, m) in seen:
+                    continue
+                seen.add((k, m))
+                judge_specs.append((k, p, m, tag))
+
+        self.verifier = _track_qthread(KeyVerifierWorker(specs, judge_specs=judge_specs))
         self.verifier.verification_complete.connect(self.on_verification_complete)
         self.verifier.start()
 
@@ -3437,6 +4013,19 @@ class App(QMainWindow):
                     status = results.get(key, "")
                     parts.append(f"[{i}] ({status})" if status and status != "Active" else f"[{i}] —")
             text += f'\nQ: "{question}" → ' + "  ".join(parts)
+        # Jury verdict line: each judge's key verified with its own model
+        # (tags j1..jN come from the judges table).
+        judge_results = getattr(self.verifier, "judge_results", None) if getattr(self, "verifier", None) else None
+        if judge_results:
+            parts = []
+            ok_count = 0
+            for tag, (status, answer) in judge_results.items():
+                if status == "Active":
+                    ok_count += 1
+                    parts.append(f"[{tag}] {'OK' + (' ' + answer if answer else '')}")
+                else:
+                    parts.append(f"[{tag}] ({status})")
+            text += f"\nJudges: {ok_count}/{len(judge_results)} active → " + "  ".join(parts)
         self.lbl_key_status.setText(text)
 
     def key_pool_changed(self):
@@ -3871,13 +4460,29 @@ class App(QMainWindow):
                 log_parts.append("QA off")
             else:
                 qa_provider = self.config.qa_provider or self.config.utility_provider or prov
-                qa_keys = [k for k in (getattr(w, 'translator', None) and w.translator.api_keys) or [] if k]
-                if qa_provider != "Mixed Providers":
-                    pool_keys = self.config.get_api_keys(qa_provider)
-                    if pool_keys:
-                        qa_keys = pool_keys
+                # ТЗ-v4.2 4.1/4.3: the audit has NO private key pool any more —
+                # it runs on the provider pool, exactly like the translation
+                # workerpool. Only a judge's PERSONAL key is carried along,
+                # and even that one is ADDED to the pool, never replacing it.
+                qa_keys = []
+                extra_qa_keys = []
+                # Judge #1 row overrides apply on resume too.
+                raw_j1 = getattr(self.config, "qa_judge1", "") or ""
+                j1_over = {}
+                if isinstance(raw_j1, str) and raw_j1.strip():
+                    try:
+                        parsed = json.loads(raw_j1)
+                        if isinstance(parsed, dict):
+                            j1_over = parsed
+                    except (ValueError, TypeError):
+                        j1_over = {}
+                elif isinstance(raw_j1, dict):
+                    j1_over = raw_j1
+                if j1_over.get("api_key"):
+                    extra_qa_keys.append(str(j1_over["api_key"]))
                 qa_model = self.config.qa_model or self.config.utility_model or (self.model_box.currentText() or "")
                 qp["keys"] = qa_keys
+                qp["extra_keys"] = extra_qa_keys
                 qp["provider"] = qa_provider
                 qp["model"] = qa_model
                 qp["batch_size"] = int(self.settings_tab.qa_batch_spin.value())
@@ -3886,7 +4491,13 @@ class App(QMainWindow):
                 qp["custom_base_url"] = (self.custom_base_url_edit.text()
                                          if qa_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)")
                                          else None)
-                log_parts.append(f"QA {qa_model or '(default)'} {len(qa_keys)} key(s)")
+                if j1_over.get("base_url"):
+                    qp["custom_base_url"] = str(j1_over["base_url"])
+                qp["qa_temperature_override"] = (float(j1_over["temperature"])
+                                                 if isinstance(j1_over.get("temperature"), (int, float))
+                                                 else None)
+                log_parts.append(f"QA {qa_model or '(default)'} shared pool"
+                                 + (f" +{len(extra_qa_keys)} personal key(s)" if extra_qa_keys else ""))
 
         if log_parts:
             self._append_log("[Live-update] applied on resume: " + ", ".join(log_parts))
@@ -4048,6 +4659,14 @@ class App(QMainWindow):
         self.pb_batch.setRange(0, len(files))
         self.pb_batch.setValue(0)
         self.files_progress = {}
+        # Fresh progress state for this run (one consistent bar: see
+        # _refresh_progress_bar).
+        self._progress_mode = 'snbt'
+        self._progress_total_files = len(files)
+        self._progress_total_strings = 0
+        self._progress_done_strings = 0
+        self._progress_eta = 0
+        self._progress_current = ""
         logging.getLogger("snbt_localizer.gui").info(f"Starting localization. Active Provider: {prov}, Active Model: {model or 'N/A'}, Keys in Pool: {len(unique_keys)}")
 
         translator = UnifiedTranslator(
@@ -4139,9 +4758,10 @@ class App(QMainWindow):
                     first_root = find_modpack_root(quest_dirs[0]) if quest_dirs else None
                     if first_root:
                         target_lang_name_, _ = parse_target_lang(target_lang)
-                        # Overwrite re-builds the glossary from scratch, matching
-                        # the policy semantics for strings (cache bypassed).
-                        is_overwrite = policy.lower().split('(')[0].strip() == "overwrite"
+                        # Overwrite bypasses the translation cache, but the
+                        # modpack glossary stays additive-converged (pin
+                        # re-rolls = the old roulette) and the verdict cache is
+                        # content-keyed, so it stays valid across overwrite runs.
                         prescan_params = {
                             "texts": prescan_texts,
                             "root": first_root,
@@ -4162,26 +4782,53 @@ class App(QMainWindow):
                 target_lang_name_, _ = parse_target_lang(target_lang)
                 # Dedicated QA provider > utility provider > main provider.
                 qa_provider = self.config.qa_provider or self.config.utility_provider or prov
-                qa_keys = unique_keys
-                if qa_provider != "Mixed Providers":
-                    pool_keys = self.config.get_api_keys(qa_provider)
-                    if pool_keys:
-                        qa_keys = pool_keys
+                # ТЗ-v4.2 4.1/4.3: no private QA pool — the audit shares the
+                # provider pool with the translation workerpool.
+                qa_keys = []
+                extra_qa_keys = []
                 # Auditor model: dedicated QA model (may carry a "/effort"
                 # suffix typed in the model field) > utility > main.
                 qa_model = self.config.qa_model or self.config.utility_model or model
                 qa_custom_url = custom_url if qa_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None
+                # Judge #1 row overrides typed in the judges table:
+                # its own key / base URL / temperature (empty = pool defaults).
+                j1_over = {}
+                raw_j1 = getattr(self.config, "qa_judge1", "") or ""
+                if isinstance(raw_j1, str) and raw_j1.strip():
+                    try:
+                        parsed = json.loads(raw_j1)
+                        if isinstance(parsed, dict):
+                            j1_over = parsed
+                    except (ValueError, TypeError):
+                        j1_over = {}
+                elif isinstance(raw_j1, dict):
+                    j1_over = raw_j1
+                if j1_over.get("api_key"):
+                    # 4.2: personal judge key JOINS the pool (added, not a
+                    # replacement) — otherwise the audit serializes on it.
+                    extra_qa_keys.append(str(j1_over["api_key"]))
+                if j1_over.get("base_url"):
+                    qa_custom_url = str(j1_over["base_url"])
                 first_root = find_modpack_root(quest_dirs[0]) if quest_dirs else None
                 qa_params = {
+                    # 4.3: kept empty for backward compatibility — the phase
+                    # logs "legacy QA key field ignored" if anything lands here.
                     "keys": qa_keys,
+                    "extra_keys": extra_qa_keys,
                     "provider": qa_provider,
                     "model": qa_model,
                     "custom_base_url": qa_custom_url,
+                    "qa_temperature_override": (float(j1_over["temperature"])
+                                                if isinstance(j1_over.get("temperature"), (int, float))
+                                                else None),
                     "update_glossary": bool(self.config.qa_update_glossary),
                     "batch_size": int(self.config.qa_batch_size),
                     "temperature": float(self.config.qa_temperature),
                     "dataset": bool(self.config.qa_dataset),
                     "verdict_cache": bool(self.config.qa_verdict_cache),
+                    "judges": json.loads(getattr(self.config, "qa_judges", "[]") or "[]"),
+                    "jury_threshold": int(getattr(self.config, "qa_jury_threshold", 2) or 2),
+                    "provider_pool": {prov: list(keys) for prov, keys in self.config.api_keys_pool.items()},
                     "modpack_root": first_root,
                     "lang_name": target_lang_name_,
                 }
