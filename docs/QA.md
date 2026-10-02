@@ -1,118 +1,122 @@
-# QA и Жюри: что и как оценивается
+# QA and Jury: what is evaluated and how
 
-Этот документ описывает, как snbt_localizer проверяет качество перевода: какие
-проблемы ловит машина (бесплатно, до всякой нейросети), что оценивает LLM-судья,
-как работает жюри из нескольких судей и как применяются исправления.
+This document describes how snbt_localizer verifies translation quality: what
+the deterministic machine tier catches (free, before any LLM), what the LLM
+judge evaluates, how a multi-judge jury works, and how fixes are applied.
 
 ---
 
-## 1. Машинный тир (Tier B) — до аудита, 0 токенов
+## 1. Machine tier (Tier B) — before the audit, 0 tokens
 
-Детерминированные проверки. Всё, что они ловят — **hard**: пара немедленно
-переводится заново основным переводчиком, LLM-судья этого текста не видит.
+Deterministic checks. Everything they catch is **hard**: the pair is
+retranslated by the main translator immediately, and the LLM judge never sees
+that text.
 
-| Детектор | Что ловит | Пример |
+| Detector | Catches | Example |
 |---|---|---|
-| `not_target_lang` | ≥90% слов не в алфавите целевого языка | «Craft the Lead Ingot» остался английским |
-| `cjk_symbols` | **Любые** китайские/японские (кана)/корейские (хангыл)/полноширинные символы в не-CJK языке | «Сделай 工作台 тут» — перевод уехал в китайский |
-| `mixed_script` | одно слово из двух алфавитов | «Sсейчас», «Блок你好» |
-| `latin_leak` | латинское слово, которого **нет в источнике** (мод-имена из источника легальны) | «S&lnow» → «Snow» |
-| `garbage_chars` | replacement/zero-width символы | `\ufffd` |
-| UNTRANSLATED (full-copy) | перевод = источник (с вайтлистом мод-имён: minecraft, ae2, create…) | — |
-| `CODES_MISMATCH` | потеряны/добавлены формат-коды `&l`, `&#RRGGBB`, теги | — |
-| `NUMBERS_MISMATCH` | числа/единицы/проценты не совпадают с источником | «10%» → «15%» |
-| `GLUE_ARTIFACT` | слово-дубль в переводе, которого нет в источнике (повтор источника легален) | «предохранители… предохранители» |
+| `not_target_lang` | ≥90% of words are outside the target script | "Craft the Lead Ingot" left in English |
+| `cjk_symbols` | **Any** Chinese / Japanese (kana) / Korean (hangul) / full-width character in a non-CJK target | "Сделай 工作台 тут" — the translation slipped into Chinese |
+| `mixed_script` | one word mixing two alphabets | "Sсейчас", "Блок你好" |
+| `latin_leak` | a latin word that is **not in the source** (mod names from the source are legal) | "S&lnow" → "Snow" |
+| `garbage_chars` | replacement / zero-width characters | `\ufffd` |
+| UNTRANSLATED (full-copy) | translation equals the source (with a mod-name whitelist: minecraft, ae2, create…) | — |
+| `CODES_MISMATCH` | lost/added format codes `&l`, `&#RRGGBB`, tags | — |
+| `NUMBERS_MISMATCH` | numbers/units/percentages differ from the source | "10%" → "15%" |
+| `GLUE_ARTIFACT` | a duplicated word in the translation that the source does not repeat (source repetition is legal) | "предохранители… предохранители" |
 
-Ретрай после скрипт-нарушения: один, через основной переводчик (контекст
-`qa-script-retry`). Если вернулась та же строка — пара уходит в `unresolved`
-честно, молча не пропускается. Исправленная скрипт-пара остаётся в аудите —
-судья перепроверяет уже свежий текст.
+Retry after a script violation: one, through the main translator (context
+`qa-script-retry`). If the same string comes back, the pair is honestly counted
+as `unresolved` — never silently skipped. A script-fixed pair stays in the
+audit: the judge re-checks the fresh text.
 
 ---
 
-## 2. LLM-аудит — two-phase (дешёвая голова, дорогие детали)
+## 2. LLM audit — two-phase (cheap head, expensive details)
 
-**Phase 1 (ids-only):** судья сканирует все пары батчами и возвращает только
-id проблемных — копеечный вызов, schema drift почти исключён.
+**Phase 1 (ids-only):** the judge scans every pair in batches and returns only
+the ids that have a problem — a cheap call, schema drift nearly impossible.
 
-**Phase 2 (details):** по флагам — полный вердикт
+**Phase 2 (details):** on the flagged ids — full verdict
 `{id, category, severity, issue, suggested, glossary_fix}`.
 
-Категории:
-- **hard** (авто-эскалация): `UNTRANSLATED`, `WRONG_DOMAIN` (омонимы:
+Categories:
+- **hard** (auto-escalated): `UNTRANSLATED`, `WRONG_DOMAIN` (homonyms:
   Frame = рама, Rod = стержень), `GRAMMAR`, `MEANING_FLIP`,
-  `SOURCE_GARBAGE` (опечатки источника решаются по смыслу), `TRUNCATED`;
-- **soft** (чинятся детерминированной заменой): `TERM_INCONSISTENT`,
+  `SOURCE_GARBAGE` (source typos resolved by meaning), `TRUNCATED`;
+- **soft** (fixed by a deterministic replacement): `TERM_INCONSISTENT`,
   `GLOSSARY_VIOLATION`, `GLOSSARY_AWKWARD`, `VANILLA_TERM`, `PROPER_NOUN`,
-  `INVENTED_WORD`, `CALQUE`, `STYLE` + синонимы (`MISTRANSLATION`,
-  `CAPITALIZATION`, `FLUENCY`, `OMISSION`, `TERMINOLOGY` — нормализуются).
+  `INVENTED_WORD`, `CALQUE`, `STYLE` + synonyms (`MISTRANSLATION`,
+  `CAPITALIZATION`, `FLUENCY`, `OMISSION`, `TERMINOLOGY` — normalized).
 
-Правила судьи: смысл, не вкус; официальные ванильные термины — авторитет
-(«Всполох», «жители»); мод-имена в `@JEI`-ссылках не переводятся; issue
-обязан быть непустым; suggested сохраняет мультимножество кодов/чисел/тегов.
+Judge rules: meaning, not taste; official vanilla terms are authoritative
+("Всполох", "жители"); mod names in `@JEI` references are not translated; the
+issue must be non-empty; a suggested string preserves the exact multiset of
+codes/numbers/tags.
 
-**Advice без замены → constraint-retry:** если судья дал пояснение, но не
-строку-замену, наход возвращается модели как ограничение (1 ретрай), и
-исправление достраивается.
-
----
-
-## 3. Жюри (jury) — несколько судей
-
-- Судьи: **j1** = основная QA-конфигурация; **j2–j4** = дополнительные, каждый
-  со своим ключом/моделью (таблица «Additional judges» в GUI).
-- Phase 1 гоняется **одинаковым промптом параллельно у всех** — разнообразие
-  даёт моделей, а не промптам.
-- **Консенсус**: порог по умолчанию 2/N. ≥ порога → phase 2 у primary;
-  1 голос → пара **disputed** → **foreman** (j1 с effort+1, нейтральный промпт:
-  ему не говорят, кто флагал). Вердикт foreman финальный: confirmed → конвейер
-  применения, cleared → пара чиста.
-- Выживание: судья умер (мёртвый ключ) → исключается с честной строкой в логе;
-  остался один — одиночный режим; foreman умер → disputed остаются disputed.
-- `glossary_fix` принимается только по консенсусу.
+**Advice without a replacement → constraint-retry:** when the judge explains
+but does not give a replacement string, the finding is returned to the model as
+a constraint (1 retry) and the fix is completed.
 
 ---
 
-## 4. Глоссарий — сходимость терминов
+## 3. Jury — several judges
 
-- **Пины аддитивны навсегда**: существующий пин никогда не переспрашивается
-  (рулетка пере-роллов мертва).
-- **Экстрактор** (авто-пре-скан по заголовкам квестов): берёт многословные
-  термы и редкие слова с заглавной; частотные слова, глаголы, числительные,
-  предлоги/наречия (закрытый класс, 140 слов) — отклоняются с логом
+- Judges: **j1** = the main QA configuration; **j2–j4** = additional ones, each
+  with its own key/model (the "Additional judges" table in the GUI).
+- Phase 1 runs with the **same prompt in parallel for all** — diversity comes
+  from the models, not from the prompts.
+- **Consensus**: threshold 2/N by default. ≥ threshold → phase 2 by the
+  primary; 1 vote → the pair is **disputed** → **foreman** (j1 at effort+1,
+  neutral prompt: it is not told who flagged). The foreman verdict is final:
+  confirmed → the apply pipeline runs, cleared → the pair is clean.
+- Survival: a judge dies (dead key) → excluded with an honest log line; one
+  left → single-judge mode; the foreman dies → disputed pairs stay disputed.
+- `glossary_fix` is accepted only by consensus.
+
+---
+
+## 4. Glossary — term convergence
+
+- **Pins are additive forever**: an existing pin is never re-asked (the
+  re-roll roulette is dead).
+- **Extractor** (auto pre-scan over quest titles): accepts multi-word terms and
+  rare capitalized words; frequent words, verbs, numerals, prepositions/adverbs
+  (a closed class of 140 words) are rejected with a log line
   `[Glossary] pin 'X' rejected (...)`.
-- **Write-гейт** для советов аудитора: частотность НЕ применяется (совет —
-  осознанное решение), но проза/не-терм/склонённые формы режутся; «Power →
-  Энергия» проходит, «and → Энтро-пыль» — нет.
-- **Арбитраж пинов**: строка отклонилась от пина → мини-модель решает: пин
-  хорош → правится строка; пин плох → `glossary_fix` и пин заменяется.
-- Ванильный глоссарий **отключен** (решение владельца): официальные термины —
-  только подсказка в промпте, не принуждение; известный яд (Lead→Поводок,
-  Power→Сила) убран.
+- **Write gate** for auditor advice: frequency is NOT applied (advice is a
+  deliberate decision), but prose/non-terms/declined forms are cut;
+  "Power → Энергия" passes, "and → Энтро-пыль" does not.
+- **Pin arbitration**: a string deviates from a pin → a mini-model decides: the
+  pin is good → the string is fixed; the pin is bad → `glossary_fix` and the
+  pin is replaced.
+- The vanilla glossary is **disabled** (owner's decision): official terms are
+  only a hint in the prompt, not enforcement; the known poisons
+  (Lead→Поводок, Power→Сила) are gone.
 
 ---
 
-## 5. Применение и повторный проход
+## 5. Apply pipeline and the second pass
 
-1. **hard** → ретрай перевода (машина или судья).
-2. **soft + suggested** → детерминированная замена с валидацией
-   кодов/чисел/тегов.
-3. **advice без замены** → constraint-retry.
-4. **pass-2**: все изменённые пары пересканируются (максимум 2 прохода);
-   «pass-2: clean» = ретрай прошёл проверку.
-5. Нерешённое — в `unresolved` с честным счётчиком, не молча.
+1. **hard** → translation retry (machine or judge).
+2. **soft + suggested** → deterministic replacement with code/number/tag
+   validation.
+3. **advice without a replacement** → constraint-retry.
+4. **pass-2**: every changed pair is rescanned (at most 2 passes);
+   "pass-2: clean" = the retry passed the check.
+5. Unresolved items go to `unresolved` with an honest counter, not silently.
 
-Итог прогона — ОДНА строка `[QA] run total` и одна `[JURY] run total` на весь
-прогон (все фазы и файлы), датасет — один jsonl
-(`~/.snbt-tr/datasets/<pack>/<run_ts>.jsonl`), каждая пара с вердиктами.
+The run summary is ONE `[QA] run total` line and one `[JURY] run total` line
+for the entire run (all phases and files); the dataset is one jsonl
+(`~/.snbt-tr/datasets/<pack>/<run_ts>.jsonl`) with a verdict for every pair.
 
 ---
 
-## 6. Отказоустойчивость
+## 6. Resilience
 
-- Таймаут-лестница 90→120→150→180с; батч после таймаута делится пополам.
-- Ключ: 2 подряд failures → bench до конца прогона; при пуле из 1 ключа —
-  cooldown вместо bench. 402/401/403 = смерть ключа, не «scan failed».
-- Scan-failed пары **не помечаются чистыми** в вердикт-кэше.
-- Вердикт-кэш индексирован содержимым пары (source+translation+конфиг):
-  валиден между прогонами, overwrite его не портит.
+- Timeout ladder 90→120→150→180s; a batch is split in half after a timeout.
+- Key: 2 consecutive failures → benched for the rest of the run; with a
+  single-key pool a cooldown is used instead of a bench. 402/401/403 = key
+  death, not "scan failed".
+- Scan-failed pairs are **not** marked clean in the verdict cache.
+- The verdict cache is keyed by pair content (source+translation+config): valid
+  across runs, and overwrite does not poison it.
