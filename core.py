@@ -5116,7 +5116,6 @@ async def ensure_modpack_glossary(
     custom_base_url: Optional[str] = None,
     logger=print,
     check_status=None,
-    force_refresh: bool = False,
 ) -> ModpackGlossary:
     """Pre-scan: extract recurring mod terms, translate the new ones once, save.
 
@@ -5125,11 +5124,10 @@ async def ensure_modpack_glossary(
     the main run — the glossary is best-effort by design.
 
     ТЗ3-1: the pre-scan is ADDITIVE FOREVER. Existing pins are NEVER
-    re-asked (the historical force_refresh roulette — Cloche ->
-    Клеш/Клок/Клош/Колокол/Колпак on every Overwrite run — is dead: the
-    policy may re-translate quest strings, but the modpack's pinned
-    terminology is converged state). The parameter is kept for signature
-    compatibility with the GUI/CLI call sites and IGNORED.
+    re-asked. The historical "force refresh" roulette (Cloche ->
+    Клеш/Клок/Клош/Колокол/Колпак on every Overwrite run) was retired with
+    the parameter itself: the policy may re-translate quest strings, but the
+    modpack's pinned terminology is converged state.
     """
     glossary = ModpackGlossary(modpack_root)
     # ТЗ-v4.6 п.1: report every accept/reject so a false pin is visible in

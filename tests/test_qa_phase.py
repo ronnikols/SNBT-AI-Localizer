@@ -980,8 +980,8 @@ def test_tz3_tier_c_repair_end_to_end(tmp_path=None):
         core.load_vanilla_glossary = orig_load
 
 
-# --- ТЗ3-1: pre-scan is additive even with force_refresh=True ------------------
-def test_tz3_prescan_additive_ignores_force_refresh(tmp_path=None):
+# --- ТЗ3-1: the pre-scan is additive (pins are never re-asked) ----------------
+def test_tz3_prescan_additive(tmp_path=None):
     import tempfile as _t
     from pathlib import Path as _P
     td = tmp_path or _P(_t.mkdtemp())
@@ -1009,7 +1009,7 @@ def test_tz3_prescan_additive_ignores_force_refresh(tmp_path=None):
         async def drive():
             return await core.ensure_modpack_glossary(
                 ["Zephyrium Plate", "Cloche"], str(td), ["k"], "Test", "stub",
-                "Russian", logger=lambda m: None, force_refresh=True)
+                "Russian", logger=lambda m: None)
 
         _a.run(drive())
         g2 = ModpackGlossary(str(td))

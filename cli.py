@@ -1226,7 +1226,6 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                     mixed_pool=utility_mixed,
                     custom_base_url=config.custom_base_url or None,
                     logger=lambda m: logging.getLogger("snbt_localizer.cli").info(m),
-                    force_refresh=resolve_policy(config.policy).lower().split('(')[0].strip() == "overwrite",
                 )
                 if glossary.terms:
                     translator.modpack_glossary_terms = glossary.terms
