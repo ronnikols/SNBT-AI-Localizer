@@ -2192,7 +2192,6 @@ class Worker(QThread):
                         custom_base_url=pp.get("custom_base_url"),
                         logger=self.log.emit,
                         check_status=None,
-                        force_refresh=pp.get("force_refresh", False),
                     ))
                     if glossary.terms:
                         self.translator.modpack_glossary_terms = glossary.terms
@@ -4081,7 +4080,13 @@ class App(QMainWindow):
             for qd in quest_dirs:
                 for snbt_file in [p for p in qd.rglob("*.snbt") if not any(x in p.parts for x in EXCLUDED_DIRS)]:
                     try:
-                        content = snbt_file.read_text(encoding='utf-8')
+                        # Mine the ENGLISH original (.snbt.bak) — after the
+                        # first in-place run the file itself is translated
+                        # and a Russian pre-scan yields 0 candidates.
+                        src = snbt_file.with_suffix('.snbt.bak')
+                        if not (src.exists() and src.stat().st_size > 0):
+                            src = snbt_file
+                        content = src.read_text(encoding='utf-8')
                     except OSError:
                         continue
                     for s in _find_all_snbt_strings(content):
@@ -4146,7 +4151,6 @@ class App(QMainWindow):
                             "lang_name": target_lang_name_,
                             "mixed_pool": utility_mixed,
                             "custom_base_url": custom_url if self.config.utility_provider in ("Custom (OpenAI-compatible)", "Ollama (Local / Free)") else None,
-                            "force_refresh": is_overwrite,
                         }
         except Exception as e:
             self._append_log(f"Glossary pre-scan skipped: {e}")

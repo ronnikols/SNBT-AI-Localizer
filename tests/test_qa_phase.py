@@ -510,6 +510,7 @@ def test_glossary_arbitration_applies_fix():
     try:
         log, lines = collect_logs(None)
         tr = make_translator_stub()
+        tr.modpack_glossary_terms = {"Lead": "Свинец", "Cloche": "Колпак"}
         cache = FakeCache()
         cfg = qa_config(tempfile.gettempdir())
         run_qa_phase(pairs, cfg, tr, cache, log, None)
@@ -1368,6 +1369,7 @@ def test_arb_chunks_of_40_and_parallel_keys():
     try:
         log, lines = collect_logs(None)
         tr = make_translator_stub()
+        tr.modpack_glossary_terms = {"Lead": "Свинец"}
         cache = FakeCache()
         cfg = qa_config(tempfile.gettempdir())
         # 278 pairs, every one misses the 'Lead' pin -> flagged by the pre-check
@@ -1416,6 +1418,7 @@ def test_arb_single_chunk_still_works():
     try:
         log, lines = collect_logs(None)
         tr = make_translator_stub()
+        tr.modpack_glossary_terms = {"Lead": "Свинец"}
         cache = FakeCache()
         cfg = qa_config(tempfile.gettempdir())
         pairs = {"Craft the Lead Ingot": "Создай Свинцовый слиток"}

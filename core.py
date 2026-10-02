@@ -2592,7 +2592,11 @@ class SNBTManager:
                 disk_content = await f.read()
 
             is_ru_file = bak_path.exists() and bak_path.stat().st_size > 0
-            if is_ru_file and not is_overwrite:
+            if is_ru_file:
+                # Source of truth = the clean English backup, for BOTH
+                # complement (translate missing) and overwrite (re-translate
+                # everything). Reading the translated file itself as source
+                # made overwrite a Russian→Russian no-op on re-runs.
                 async with aiofiles.open(bak_path, 'r', encoding='utf-8') as f:
                     content = await f.read()
             else:
@@ -3391,24 +3395,17 @@ def load_translation_dictionary() -> Dict[str, str]:
 _VANILLA_GLOSSARY_CACHE: Optional[Dict[str, str]] = None
 
 def load_vanilla_glossary() -> Dict[str, str]:
-    """Official Minecraft en→ru terms (extracted from the vanilla 1.21.1 lang files).
+    """DISABLED (user directive 2026-10-02): vanilla glossary is off.
 
-    Used to force 1-to-1 official Mojang terminology: 'Ender Pearl' → 'Эндер-жемчуг',
-    'The End' → 'Энд', 'Crafting Table' → 'Верстак', etc.
+    The official-Mojang injection did more harm than good: common-word pins
+    ('Lead'→'Поводок', 'Power'→'Сила') poisoned translations with homonym
+    errors and flooded the QA pre-check with FP flags. Kept as a stub so
+    call sites do not break. The vanilla_ru.json file stays on disk unused.
     """
     global _VANILLA_GLOSSARY_CACHE
-    if _VANILLA_GLOSSARY_CACHE is not None:
-        return _VANILLA_GLOSSARY_CACHE
-    path = get_resource_path("resources/vanilla_ru.json")
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        _VANILLA_GLOSSARY_CACHE = {str(k).strip(): str(v).strip() for k, v in data.items()}
-        _VANILLA_GLOSSARY_CACHE = {k: v for k, v in _VANILLA_GLOSSARY_CACHE.items() if k and v}
-        logger.info(f"Loaded vanilla Minecraft glossary with {len(_VANILLA_GLOSSARY_CACHE)} terms")
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-        logger.warning(f"Failed to load vanilla glossary: {e}")
+    if _VANILLA_GLOSSARY_CACHE is None:
         _VANILLA_GLOSSARY_CACHE = {}
+        logger.info("Vanilla glossary DISABLED (user directive) — returning empty glossary")
     return _VANILLA_GLOSSARY_CACHE
 
 def build_glossary_context(texts: List[str], glossary: Dict[str, str], limit: int = 40, label: str = "Official Minecraft terminology", lenient: bool = False) -> str:
@@ -4150,11 +4147,9 @@ HARD — the string must be retranslated:
   - GRAMMAR: broken agreement — gender/case/declension making the sentence
     incorrect in the target language ("Улучшенное кремни", "шахтёр можно
     использовать", "в Энду").
-  - WRONG_DOMAIN: word chosen from a wrong domain. Pay special attention to
-    English homonyms in the Minecraft context: Lead = the metal свинец (not a
-    dog leash "поводок"), Frame = machine frame/рама (not a video "кадр"),
-    Rod = стержень (not "жезл"), Bolt = болт. The homonym choice must match
-    the subject domain of the string.
+  - WRONG_DOMAIN: word chosen from a wrong domain (an English word read as
+    its other homonym). The homonym choice must match the subject domain
+    of the string.
   - CODES_MISMATCH: format codes in translation do not match source (lost,
     added, duplicated, misplaced).
   - NUMBERS_MISMATCH: numbers, units, percentages, dimensions differ from

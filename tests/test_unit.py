@@ -1088,6 +1088,71 @@ def test_parse_snbt_escaped_quotes():
     assert len(strings) == 1
     assert strings[0]['value'] == 'Hello "World"'
 
+def test_vanilla_glossary_is_disabled():
+    """ТЗ v4.5 п.0.1: the vanilla (Mojang) glossary stays OFF.
+
+    It was disabled by user directive after poisoning translations with
+    homonym pins ('Lead'→'Поводок', 'Power'→'Сила') and flooding the QA
+    pre-check with false positives. The stub must return an empty mapping
+    (not None, not a partial dict) or every call site that merges it into a
+    prompt breaks.
+    """
+    from core import load_vanilla_glossary
+    assert load_vanilla_glossary() == {}
+    assert load_vanilla_glossary() == {}   # cached, still empty
+
+
+def test_overwrite_reads_the_english_bak_as_source(tmp_path):
+    """ТЗ v4.5 п.0.2: on an already-translated file the SOURCE is the .bak
+    English backup for EVERY policy.
+
+    Reading the translated file as source made overwrite a Russian→Russian
+    no-op: the 'translation' was already Russian, so the auditor saw a
+    target-language pair and passed everything through.
+    """
+    from core import SNBTManager
+    import asyncio
+
+    snbt = tmp_path / "quest.snbt"
+    bak = tmp_path / "quest.snbt.bak"
+    bak.write_text('{ title: "Copper Ingot" }', encoding="utf-8")
+    snbt.write_text('{ title: "Медный слиток" }', encoding="utf-8")
+
+    class Tr:
+        provider = "Test"
+        model = "stub"
+        mixed_pool = None
+        api_keys = ["test-key"]
+        target_lang_name = "Russian"
+        modpack_glossary_terms = {}
+        modpack_root = None
+        seen = []
+
+        async def translate(self, texts, logger=print, check_status=None, context=""):
+            Tr.seen.extend(texts)
+            return [f"[ru]{t}" for t in texts]
+
+    class Cache:
+        def get(self, t):
+            return None
+        def save_batch(self, m, modpack=None):
+            pass
+        def close(self):
+            pass
+
+    m = SNBTManager(str(tmp_path), "Groq Cloud (Fast)", "stub")
+    m.translator = Tr()
+    m.cache = Cache()
+    asyncio.run(m.process_file(snbt, True, True, True, logger=lambda *a: None,
+                               policy="Overwrite (Перезаписать)"))
+
+    assert Tr.seen, "nothing was translated"
+    assert "Copper Ingot" in Tr.seen, \
+        f"the source must be the English .bak, got {Tr.seen}"
+    assert not any("Медный слиток" in t for t in Tr.seen), \
+        f"the Russian file leaked in as source: {Tr.seen}"
+
+
 def test_count_translatable_multiline_array():
     from core import SNBTManager
     content = '''description: [

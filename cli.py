@@ -1168,7 +1168,13 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         prescan_texts = []
         for f in all_files:
             try:
-                content = f.read_text(encoding='utf-8')
+                # Mine the ENGLISH original: after the first in-place run the
+                # file itself is translated, and a Russian pre-scan yields 0
+                # candidates (learning would be one-shot forever).
+                src = f.with_suffix('.snbt.bak')
+                if not (src.exists() and src.stat().st_size > 0):
+                    src = f
+                content = src.read_text(encoding='utf-8')
             except OSError:
                 continue
             for s in _find_all_snbt_strings(content):
