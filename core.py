@@ -4731,9 +4731,12 @@ _GLOSSARY_COMMON_WORDS = frozenset({
 # 'Space' -> «Космос» (16 false glossary flags), 'Generates' -> «Генерирует»
 # (13), 'Fuel', 'Pack', 'Base', 'Magic', 'Range', 'Tank', 'Fluid', 'Press'.
 # The generic stop-list above already covers time/making/taste/industrial;
-# this set adds the rest. Legitimate Minecraft nouns (lead, light, power,
-# stone, copper, gold, water, frame, carpet) are deliberately NOT here — they
-# are protected by the rarity rule instead.
+# this set adds the rest. Legitimate Minecraft nouns (lead, stone, copper,
+# gold, water, frame, carpet) are deliberately NOT here — they are protected
+# by the rarity rule instead. 'Light' and 'Power' ARE filtered (they sat in
+# the generic stop-list already, and 'Power' -> «Сила» was one of the poisons
+# of the incident — an explicit auditor pin still gets through the write-path
+# gate, which never applies this list wholesale).
 _GLOSSARY_PROSE_WORDS = frozenset({
     "space", "spaces", "spaced",
     "generates", "generate", "generated", "generating", "generation",
@@ -4851,6 +4854,40 @@ _GLOSSARY_PROSE_WORDS = frozenset({
     "ages", "periods", "durations", "delays", "intervals",
     "schedules", "cycles", "loops", "repeats", "repeated",
 })
+
+
+# ТЗ-v4.7 п.3: closed-class grammar — numerals, prepositions and adverbs.
+# A quest TITLE often starts with one of these ("Into the Deep", "Always
+# Watching"), so the extractor's leading-capital rule alone lets them through.
+# They are never terminology in any context; measured against the live
+# glossaries and the Liminal Industries candidate list the collateral is zero
+# (only the junk pins 'Like'/'Maybe' disappear).
+_GLOSSARY_GRAMMAR_WORDS = frozenset({
+    # numerals / quantifiers / ordinals
+    "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "twenty", "thirty", "forty", "fifty", "hundred",
+    "thousand", "million", "billion", "first", "second", "third", "fourth",
+    "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "last", "next",
+    "many", "some", "few", "several", "all", "each", "every", "both", "half",
+    "quarter", "dozen", "single", "double", "triple", "once", "twice",
+    # prepositions
+    "with", "from", "into", "over", "under", "through", "between", "during",
+    "after", "before", "without", "within", "along", "across", "behind",
+    "beyond", "above", "below", "beneath", "beside", "besides", "among",
+    "amongst", "against", "toward", "towards", "upon", "until", "till",
+    "since", "despite", "except", "inside", "outside", "onto", "off", "out",
+    "up", "down", "around", "about", "past", "per", "via", "than", "like",
+    "unlike", "alongside", "throughout", "underneath", "near",
+    # adverbs
+    "always", "never", "often", "sometimes", "usually", "rarely", "seldom",
+    "quickly", "slowly", "really", "simply", "again", "soon", "here", "there",
+    "now", "then", "already", "still", "yet", "just", "only", "even", "also",
+    "too", "very", "quite", "rather", "almost", "nearly", "enough", "perhaps",
+    "maybe", "probably", "actually", "finally", "suddenly", "early", "late",
+    "together", "apart", "alone",
+})
+
+
 # ТЗ-v4.6 п.1: a SINGLE word may be pinned only when it is rare in the
 # strings it was extracted from — prose repeats, a proper name does not.
 # Measured on the Liminal Industries pre-scan strings (202 titles/subtitles):
@@ -4878,7 +4915,11 @@ def _glossary_pin_allowed(term: str) -> bool:
     # ТЗ-v4.6 п.1: prose nouns/verbs that pinned themselves on live runs
     # ('Space' -> «Космос» 16 false flags, 'Generates' -> «Генерирует» 13,
     # 'Fuel', 'Pack', 'Base', 'Magic') — ordinary English words, not names.
-    return low not in _GLOSSARY_COMMON_WORDS and low not in _GLOSSARY_PROSE_WORDS
+    # ТЗ-v4.7 п.3 adds the closed-class grammar (numerals/prepositions/adverbs)
+    # that a capitalized TITLE lets through.
+    return (low not in _GLOSSARY_COMMON_WORDS
+            and low not in _GLOSSARY_PROSE_WORDS
+            and low not in _GLOSSARY_GRAMMAR_WORDS)
 
 
 def _glossary_pin_verdict(term: str, freq: int) -> tuple:
@@ -8522,6 +8563,42 @@ def _qa_extract_glossary_pins(issue: str, suggested: Optional[str], source: str)
     return pins[:3]
 
 
+def _qa_pin_write_reason(en: str, ru: str) -> str:
+    """ТЗ-v4.7 п.1: gate for a pin the AUDITOR asks to write. '' = allowed.
+
+    The extractor's `_glossary_pin_verdict` is deliberately NOT applied here:
+    an auditor's advice is a deliberate decision about a real string, not the
+    prose auto-extraction the frequency gate exists to tame, so
+    ('Power', 'Энергия') and branch-(c) pin CORRECTIONS must survive.
+
+    What is applied is the part that is true in every context:
+      1. `_qa_pin_reject_reason` (latin/cyrillic, length, fragment,
+         declined form, sentence, known-bad pair) — unchanged;
+      2. hard prose: the verb/prose-noun set from ТЗ-v4.6 plus the
+         closed-class grammar (numerals, prepositions, adverbs) — this is
+         what killed 'and', 'for', 'revealing', 'stress', 'ponder';
+      3. the EN term must be a TERM: capitalized, or a multi-word phrase.
+         Every one of the 10 lowercase junk pins on disk ('cloche',
+         'machinery', 'ritual', ...) fails here.
+
+    `_GLOSSARY_COMMON_WORDS` is deliberately NOT applied: it holds ordinary
+    common nouns ('power', 'light', 'time'), and the incident's poison
+    'Power' -> «Сила» was a WRONG TRANSLATION of a legitimate term, not a
+    junk term — an explicit ('Power', 'Энергия') advice must still pin.
+    """
+    en = (en or "").strip()
+    ru = (ru or "").strip()
+    reason = _qa_pin_reject_reason(en, ru)
+    if reason:
+        return reason
+    low = en.casefold()
+    if low in _GLOSSARY_PROSE_WORDS or low in _GLOSSARY_GRAMMAR_WORDS:
+        return f"common word ('{en}')"
+    if not (en[:1].isupper() or " " in en):
+        return f"not a term ('{en}' is lowercase)"
+    return ""
+
+
 def _qa_add_glossary_pins(pin_candidates: List[Tuple[str, str]], pid, qa_log,
                           update_glossary: bool, modpack_root,
                           allow_correction: bool = False) -> None:
@@ -8549,7 +8626,10 @@ def _qa_add_glossary_pins(pin_candidates: List[Tuple[str, str]], pid, qa_log,
         # ТЗ-v4.1 G13.2: BOTH fields are re-validated right before the write —
         # an explicit pin CORRECTION (branch (c)) must not be able to inject a
         # junk pair that the prose extractor's filters would have rejected.
-        reason = _qa_pin_reject_reason(en, ru)
+        # ТЗ-v4.7 п.1: the gate is the WRITE-path hybrid (reason + hard prose
+        # + capitalised/multi-word), never the extractor's frequency rule —
+        # an auditor's deliberate advice outranks prose auto-extraction.
+        reason = _qa_pin_write_reason(en, ru)
         if reason:
             _QA_COUNTERS["warnings"] += 1
             qa_log(f"[QA] glossary pin rejected ({reason}): {en} -> {ru} — not written")
