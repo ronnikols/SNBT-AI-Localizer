@@ -554,6 +554,89 @@ def test_script_violation_detector():
     assert core._qa_target_script({"lang_code": "de_de"}, batch) == "latin"
 
 
+# --- 15a. CJK battery: wrong-language output is a hard machine verdict ------
+# The user-visible contract: a translation that came out in Chinese/Japanese/
+# Korean (or half of it did) for a non-CJK target is flagged BEFORE the LLM
+# audit and retranslated — the judge never sees it.
+def test_cjk_leak_is_hard_on_cyrillic_target():
+    SV = core._qa_script_violations
+    batch = [
+        {"id": 0, "source": "Craft the table", "translation": "制作工作台"},        # full Chinese
+        {"id": 1, "source": "Craft the table", "translation": "Сделай 工作台 тут"},  # half Chinese
+        {"id": 2, "source": "Craft the table", "translation": "クラフトする"},        # Japanese kana
+        {"id": 3, "source": "Craft the table", "translation": "제작하다"},           # Korean hangul
+        {"id": 4, "source": "Craft the table", "translation": "Ｈｅｌｌｏ мир"},      # full-width forms
+        {"id": 5, "source": "Craft the table", "translation": "Сделай верстак"},    # clean
+    ]
+    ids = {p["id"]: r for p, r in SV(batch, "cyrillic")}
+    for bad_id in (0, 1, 2, 3, 4):
+        assert ids.get(bad_id) == "cjk_symbols", (bad_id, ids)
+    assert 5 not in ids, ids
+
+
+def test_cjk_target_language_rules():
+    # get_target_script mapping
+    assert core.get_target_script("zh_cn") == "cjk"
+    assert core.get_target_script("zh_tw") == "cjk"
+    assert core.get_target_script("ja_jp") == "cjk"
+    assert core.get_target_script("ko_kr") == "hangul"
+    assert core.get_target_script("ru_ru") == "cyrillic"
+    assert core.get_target_script("unknown_lang") == "latin"
+
+    SV = core._qa_script_violations
+    # CJK target: Chinese output is FINE...
+    assert not SV([{"id": 0, "source": "Craft the table", "translation": "制作工作台"}], "cjk")
+    # ...but Russian output in a Chinese target is not_target_lang
+    ids = {p["id"]: r for p, r in SV([{"id": 0, "source": "Craft the table",
+                                       "translation": "Сделай верстак сейчас"}], "cjk")}
+    assert ids.get(0) == "not_target_lang", ids
+    # hangul target: Korean is fine, Latin-only output is not
+    assert not SV([{"id": 0, "source": "Craft the table", "translation": "제작하다"}], "hangul")
+    ids = {p["id"]: r for p, r in SV([{"id": 0, "source": "Craft the table",
+                                       "translation": "Сделай верстак сейчас"}], "hangul")}
+    assert ids.get(0) == "not_target_lang", ids
+
+
+def test_cjk_pair_retranslated_before_audit():
+    # End-to-end: the machine tier catches the Chinese output and the main
+    # translator gets a second chance; the auditor must not see the CJK text.
+    pairs = {
+        "Craft the table": "制作工作台",
+        "All fine here": "Всё хорошо тут",
+    }
+    seen_sources = []
+
+    async def fake_send(batch, prompt, keys, provider, model, custom_base_url, logger, check_status, temperature=None, ids_only=False, **kwargs):
+        if ids_only:
+            return [{"id": p["id"]} for p in batch]
+        seen_sources.extend(p["source"] for p in batch)
+        return []
+
+    orig_send = core._qa_send
+    core._qa_send = fake_send
+    try:
+        class T:
+            provider = "Test"
+            model = "stub"
+            mixed_pool = None
+            modpack_glossary_terms = {}
+
+            async def translate(self, texts, logger=print, check_status=None, context=""):
+                assert context == "qa-script-retry", context
+                return ["Сделай верстак"]
+        log, lines = collect_logs(None)
+        cache = FakeCache()
+        cfg = qa_config(tempfile.gettempdir())
+        run_qa_phase(pairs, cfg, T(), cache, log, None)
+    finally:
+        core._qa_send = orig_send
+    assert pairs["Craft the table"] == "Сделай верстак", pairs
+    assert any("cjk_symbols" in l for l in lines), lines
+    # Design: a script-fixed pair STAYS in the audit (unlike glue/machine
+    # pairs) — the judge re-checks the fresh translation, never the CJK one.
+    assert "Craft the table" in seen_sources, seen_sources
+
+
 # --- 16. БАГ 7: script-artifact pair retranslated before the audit -----------
 def test_script_violation_retranslates():
     pairs = {
