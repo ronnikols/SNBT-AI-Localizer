@@ -429,3 +429,145 @@ def test_v45_stored_glossary_pins_are_filtered_on_load(tmp_path):
     assert "Industrial Mixer" in g.terms, "многословный терм разрешён"
     for bad in ("Time", "Making", "Taste", "Industrial", "Always"):
         assert bad not in g.terms, (bad, g.terms)
+
+
+# --- ТЗ v4.5 fix: один QA-scope на прогон -----------------------------------
+def test_v45_nested_scope_does_not_split_the_run():
+    """Боевой дефект: qa_run_start() стоял и в CLI/GUI (внешний scope), и в
+    JSONManager.process (вложенный) -> на паке со SNBT+JSON фазами прогон
+    печатал ДВЕ строки '[QA] run total' и писал ДВА jsonl датасета.
+
+    Контракт qa_run_open()/qa_run_close(): владеет только внешний вызов,
+    вложенный — молчит. Приёмка ТЗ v4.5 (д) «одна строка за прогон».
+    """
+    out = []
+    owner = core.qa_run_open()          # CLI / GUI: открывает scope
+    assert owner is True
+    nested = core.qa_run_open()         # JSONManager.process внутри прогона
+    assert nested is False, "вложенный вызов обязан НЕ открывать свой scope"
+    nested2 = core.qa_run_open()        # второй JSON-каталог
+    assert nested2 is False
+
+    # накопление идёт ТОЛЬКО через qa_run_note_file (он же и считает файлы)
+    core.qa_run_note_file(25, 0, {"hard": 1, "soft_fixed": 2},
+                          jury_stats={"files": 3, "judges": 1, "live": 1,
+                                      "threshold": 1, "findings": {0: 2},
+                                      "judged": 25, "agreed": 24,
+                                      "confirmed": 2, "disputed": 0})
+    # обе «фазы» пытаются закрыть scope: печатает только владелец
+    core.qa_run_close(nested, logger=out.append)
+    core.qa_run_close(nested2, logger=out.append)
+    assert out == [], "вложенный вызов не имеет права печатать итог"
+
+    core.qa_run_close(owner, logger=out.append)
+    qa_lines = [l for l in out if l.startswith("[QA] run total")]
+    jury_lines = [l for l in out if l.startswith("[JURY] run total")]
+    assert len(qa_lines) == 1, out
+    assert len(jury_lines) == 1, out
+    assert "1 file(s)" in qa_lines[0], qa_lines[0]
+    assert "scanned 25 pair(s)" in qa_lines[0], qa_lines[0]
+    assert "hard 1" in qa_lines[0] and "soft-fixed 2" in qa_lines[0]
+    assert "1 file(s)" in jury_lines[0], jury_lines[0]
+    assert "2 finding(s)" in jury_lines[0], jury_lines[0]
+    assert core._QA_RUN_STATE.get("run_id") is None, "scope обязан закрыться"
+
+
+def test_v45_standalone_json_run_owns_its_scope():
+    """JSONManager.process можно звать в одиночку (библиотека/тесты): тогда
+    он САМ владеет scope и обязан напечатать итог — иначе одиночный прогон
+    остаётся без [QA]-строки и без закрытия run id."""
+    assert core.qa_run_open() is True
+    core._QA_RUN_STATE.update({"qa_files": 1, "qa_scanned": 4})
+    out = []
+    core.qa_run_close(True, logger=out.append)
+    assert len([l for l in out if l.startswith("[QA] run total")]) == 1, out
+    assert core._QA_RUN_STATE.get("run_id") is None
+
+
+def test_v45_real_json_phase_under_an_outer_scope_prints_once(tmp_path):
+    """E2E боевого дефекта: РЕАЛЬНЫЙ JSONManager.process внутри уже открытого
+    scope (как в CLI/GUI после SNBT-фазы) обязан не открывать свой и не
+    печатать итог. Проверяем и датасет: файл за прогон ровно один."""
+    import json as _json
+    import tests.test_qa_phase as tq
+    import tests.test_tz44 as t44
+
+    lang = tmp_path / "assets" / "test" / "lang"
+    lang.mkdir(parents=True)
+    (lang / "en_us.json").write_text(
+        _json.dumps({"a": "Hello", "b": "World"}), encoding="utf-8")
+    (lang / "ru_ru.json").write_text("{}", encoding="utf-8")
+
+    class Tr(t44.StubTranslator):
+        modpack_root = None
+        target_lang_name = "Russian"
+
+        async def translate(self, texts, logger=print, check_status=None, context=""):
+            return [f"[ru]{t}" for t in texts]
+
+    class Cache(tq.FakeCache):
+        def get(self, t):
+            return None
+
+    logs = []
+    owner = core.qa_run_open()               # внешний владелец (CLI/GUI)
+    assert owner is True
+    run_id_at_open = core._QA_RUN_STATE.get("run_id")
+    orig_scan = core._qa_scan_pairs
+    core._qa_scan_pairs = t44._scan_stub(t44.Recorder(), set())
+    try:
+        mgr = core.JSONManager(tmp_path, "ru_ru", Tr(), Cache(), modpack="test",
+                               policy="Overwrite (Перезаписать)")
+        mgr.qa_params = t44._params()
+        t44._run(mgr.process(log_callback=logs.append))
+        # JSON-фаза НЕ закрыла чужой scope — он всё ещё наш
+        assert core._QA_RUN_STATE.get("run_id") == run_id_at_open, (
+            "вложенная JSON-фаза обязана оставить внешний scope открытым")
+        assert not [l for l in logs if "[QA] run total" in l], logs
+    finally:
+        core._qa_scan_pairs = orig_scan
+        core.qa_run_close(True, logger=logs.append)
+
+    qa_lines = [l for l in logs if l.startswith("[QA] run total")]
+    assert len(qa_lines) == 1, logs
+    assert core._QA_RUN_STATE.get("run_id") is None
+
+
+def test_v45_empty_json_run_under_an_outer_scope_keeps_it_alive(tmp_path):
+    """Край: в каталоге нет lang-каталогов -> JSONManager.process выходит по
+    раннему return 0. Он обязан НЕ тронуть чужой scope (иначе следующий
+    прогон аппендил бы в уже закрытый jsonl), а в одиночном вызове — закрыть
+    свой, иначе run id утекает."""
+    import tests.test_qa_phase as tq
+    import tests.test_tz44 as t44
+
+    class Tr(t44.StubTranslator):
+        modpack_root = None
+        target_lang_name = "Russian"
+
+        async def translate(self, texts, logger=print, check_status=None, context=""):
+            return [f"[ru]{t}" for t in texts]
+
+    class Cache(tq.FakeCache):
+        def get(self, t):
+            return None
+
+    def fresh():
+        m = core.JSONManager(tmp_path, "ru_ru", Tr(), Cache(), modpack="t",
+                             policy="Overwrite (Перезаписать)")
+        m.qa_params = t44._params()
+        return m
+
+    # A) под внешним scope
+    logs = []
+    owner = core.qa_run_open()
+    run_id = core._QA_RUN_STATE.get("run_id")
+    t44._run(fresh().process(log_callback=logs.append))
+    assert core._QA_RUN_STATE.get("run_id") == run_id, "чужой scope закрыт!"
+    assert not [l for l in logs if "run total" in l], logs
+    core.qa_run_close(owner)
+    assert core._QA_RUN_STATE.get("run_id") is None
+
+    # B) одиночный вызов — сам владеет и сам закрывает
+    t44._run(fresh().process(log_callback=[].append))
+    assert core._QA_RUN_STATE.get("run_id") is None, "run id утёк"

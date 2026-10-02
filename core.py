@@ -3273,6 +3273,9 @@ class JSONManager:
         # ТЗ-health: one JSON run = one health window; the summary is
         # emitted right before the shared clients close.
         # ТЗ-v4 C7-C9: QA run scope (dataset + run totals) opens here too.
+        # ТЗ-v4.5 fix: only when no outer scope is already open — a CLI/GUI
+        # run owns ONE scope for all phases, so the JSON phase must not
+        # restart it (that split the run into 2 [QA] lines + 2 jsonl files).
         health_reset()
         health_mark_start()
         # ТЗ-v4.1 F12.1: tell the health module how wide this run's pool is.
@@ -3280,12 +3283,17 @@ class JSONManager:
         # instead of benching the only key the run has.
         health_set_pool_size(len(getattr(self.translator, "mixed_pool", None) or [])
                              or len(getattr(self.translator, "api_keys", None) or []))
-        qa_run_start()
+        _owns_qa_scope = qa_run_open()
         log_callback(f"Strategy: {self.policy.upper()}"
                      f"{' — cache BYPASSED (all strings re-translated)' if self.policy == 'overwrite' else ''}")
         lang_dirs = self._find_lang_dirs()
         if not lang_dirs:
             log_callback(f"No lang directories with en_us.json found in {self.base_dir}")
+            # ТЗ-v4.5 fix: this return sits BEFORE the try/finally below, so a
+            # standalone caller must release the scope it just opened itself —
+            # otherwise the run id leaks and the next run's dataset appends to
+            # this run's jsonl.
+            qa_run_close(_owns_qa_scope)
             return 0
 
         total_translated = 0
@@ -3588,8 +3596,10 @@ class JSONManager:
                 prefetch.abort()
             # ТЗ-v4 C8/C9: run-wide [QA] totals + jury lines for every JSON
             # file of this run, into the GUI console and app.log.
+            # ТЗ-v4.5 fix: only the scope OWNER prints/closes — a nested JSON
+            # phase leaves the single aggregate to the outer CLI/GUI run.
             try:
-                qa_run_finish(logger=lambda msg: (
+                qa_run_close(_owns_qa_scope, logger=lambda msg: (
                     log_callback(msg),
                     logging.getLogger("snbt_localizer.core").info(msg)))
             except Exception:
@@ -5443,6 +5453,33 @@ def qa_run_start() -> str:
     _QA_RUN_STATE["qa_files"] = 0
     _QA_RUN_STATE["qa_jury"] = []
     return run_id
+
+
+def qa_run_open() -> bool:
+    """Open the run scope only when nobody has one open yet.
+
+    A CLI/GUI run owns ONE scope that must span every phase and every file
+    (SNBT batch, then every JSON/JSON5 lang dir). JSONManager.process is also
+    callable on its own (library/tests), so it may not blindly call
+    qa_run_start(): nested scopes split the run into several "[QA] run total"
+    lines and several dataset jsonl files. Returns True when THIS caller
+    created the scope and therefore owns closing it with qa_run_finish().
+    """
+    if _QA_RUN_STATE.get("run_id"):
+        return False
+    qa_run_start()
+    return True
+
+
+def qa_run_close(owned: bool, logger=None) -> Optional[dict]:
+    """Close the run scope iff `owned` (the qa_run_open contract).
+
+    Always a no-op for a nested caller: the outer owner prints the ONE
+    aggregate line for the whole run once every phase is done.
+    """
+    if not owned:
+        return None
+    return qa_run_finish(logger=logger)
 
 
 def _qa_jury_run_line(stats: dict) -> str:

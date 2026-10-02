@@ -2645,6 +2645,15 @@ class Worker(QThread):
             from pathlib import Path
             from core import JSONManager, parse_target_lang, set_temperature
 
+            # ТЗ-v4.5 fix: the QA scope belongs to the WHOLE run — the SNBT
+            # batch AND the JSON/JSON5 phase below (and a JSON-only pack, where
+            # Worker.process never runs). Opening it in process() left the
+            # scope unopened for JSON-only packs and, worse, a nested
+            # qa_run_open() there returned False and overwrote the owner flag,
+            # so nothing ever closed the scope.
+            from core import qa_run_open
+            self._owns_qa_scope = qa_run_open()
+
             # Apply the GUI temperature setting to every provider payload.
             set_temperature(self.temperature)
 
@@ -2736,10 +2745,12 @@ class Worker(QThread):
             logging.getLogger("snbt_localizer.gui").error(f"Unexpected error: {e}")
         finally:
             # ТЗ-v4 C8/C9: ONE run-wide [QA] total + jury line for the whole
-            # run — the SNBT batch AND every JSON/JSON5 lang dir.
+            # run — the SNBT batch AND every JSON/JSON5 lang dir. This is the
+            # only place the GUI closes the scope (ТЗ-v4.5 fix).
             try:
-                from core import qa_run_finish
-                qa_run_finish(logger=lambda msg: (
+                from core import qa_run_close
+                qa_run_close(getattr(self, "_owns_qa_scope", False),
+                             logger=lambda msg: (
                                  self.log.emit(msg),
                                  logging.getLogger("snbt_localizer.core").info(msg)))
             except Exception:
@@ -2783,12 +2794,11 @@ class Worker(QThread):
 
         reset_request_timeout()
         # ТЗ-health: one batch run = one health window (stats + benching).
-        # ТЗ-v4 C7-C9: the same scope covers the QA dataset/aggregates —
-        # one dataset jsonl + one final [QA] line for the whole run.
-        from core import health_reset, health_mark_start, qa_run_start
+        # ТЗ-v4.5 fix: the QA scope is owned by Worker.run (it spans the JSON
+        # phase too) — this method must NOT open or close one.
+        from core import health_reset, health_mark_start
         health_reset()
         health_mark_start()
-        qa_run_start()
         target_lang_name, target_lang_code = parse_target_lang(self.target_lang)
         first_key = self.keys[0] if self.keys else ""
         m = SNBTManager(

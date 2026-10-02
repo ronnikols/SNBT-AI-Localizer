@@ -1122,10 +1122,12 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
     reset_request_timeout()
     # ТЗ-health: one CLI run = one health window (stats + benching).
     # ТЗ-v4 C7-C9: QA run scope (one dataset + run totals) opens here too.
-    from core import health_reset, health_mark_start, qa_run_start, qa_run_finish
+    # ТЗ-v4.5 fix: ONE scope for the whole run (SNBT + every JSON dir) — the
+    # JSON phase must not open its own, or the run reports two [QA] totals.
+    from core import health_reset, health_mark_start, qa_run_open, qa_run_close
     health_reset()
     health_mark_start()
-    qa_run_start()
+    _owns_qa_scope = qa_run_open()
     file_progress = {idx: 0.0 for idx in range(total_files)}
     _mp_glossary_terms = None  # pinned by the pre-scan, carried into the JSON5 phase
 
@@ -1304,11 +1306,16 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
         from core import close_shared_httpx_clients
         await close_shared_httpx_clients()
         logging.getLogger("snbt_localizer.cli").error("Критическая ошибка: все ключи невалидны. Перевод прерван.")
-        qa_run_finish(logger=lambda msg: (
+        # ТЗ-v4.5 fix: close the run scope on the way out — an aborted run must
+        # still report what it managed to inspect (and must not leave the run
+        # id open for the next invocation to inherit).
+        qa_run_close(_owns_qa_scope, logger=lambda msg: (
             logging.getLogger("snbt_localizer.cli").info(msg), print(msg)))
         return 1
     # ТЗ-health п.4: per-key [POOL] stats into the console and app.log
     # at the end of the SNBT batch (CLI prints via logging + stdout).
+    # ТЗ-v4.5 fix: the QA scope stays OPEN across the JSON phase — one
+    # [QA]/[JURY] run total and one dataset jsonl for the whole run.
     try:
         from core import health_summary_lines
         for line in health_summary_lines():
@@ -1365,7 +1372,9 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
                 )
             except Exception as e:
                 logging.getLogger("snbt_localizer.cli").error(f"JSON translation failed for {base_dir}: {e}")
-                qa_run_finish(logger=lambda msg: (
+                # ТЗ-v4.5 fix: release the scope we own (a nested JSON scope
+                # was already closed by JSONManager.process itself).
+                qa_run_close(_owns_qa_scope, logger=lambda msg: (
                     logging.getLogger("snbt_localizer.cli").info(msg), print(msg)))
                 return 1
 
@@ -1394,9 +1403,9 @@ async def run_translation(config: ConfigManager, provider: str, model: str | Non
 
     # ТЗ-v4 C8/C9: ONE run-wide [QA] total + jury line for the whole run
     # (SNBT batch AND every JSON/JSON5 lang dir), into the console and
-    # app.log.
+    # app.log. ТЗ-v4.5 fix: this is the ONLY place the CLI closes the scope.
     try:
-        qa_run_finish(logger=lambda msg: (
+        qa_run_close(_owns_qa_scope, logger=lambda msg: (
             logging.getLogger("snbt_localizer.cli").info(msg), print(msg)))
     except Exception:
         pass
