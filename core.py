@@ -16,7 +16,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 def get_resource_path(relative_path):
     import os
@@ -143,6 +143,8 @@ PROVIDER_DEFAULTS = {
     "OpenCode": "deepseek-v4-flash",
     "Crusoe Cloud": "zai/GLM-5.3-Flash",
     "RunInfra": "glm-5-3-flash",
+    "Shisa": "shisa-ai/shisa-v2.1-llama3.3-70b",
+    "Corvex": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "Custom (OpenAI-compatible)": "",
 }
 
@@ -215,7 +217,8 @@ def reset_request_timeout() -> None:
 # on the same key bench it for the rest of the run (ТЗ-health п.2). All
 # counters reset at the start of a run; the summary is emitted by the
 # caller at the end of the phase/run.
-_HEALTH_RESET_LOCK = asyncio.Lock()
+# (no import-time asyncio primitives here: a Lock created at import would
+# bind to whatever loop was current then)
 
 
 def health_reset() -> None:
@@ -469,13 +472,19 @@ _SINGLE_KEY_MAX_TIMEOUTS: int = 4
 
 
 def _health_log(logger, message: str) -> None:
-    """[TIMING]/[TIMEOUT]/[POOL] lines go to BOTH the GUI logger and app.log."""
+    """[TIMING]/[TIMEOUT]/[POOL] lines: callback for the live view + exactly
+    one `logging` record for app.log. The record carries `_cb_shown` so the
+    GUI/CLI console filters can skip it (the callback already displayed it);
+    when the callback itself writes the file (qa_log), no record is emitted
+    at all — otherwise the line lands in app.log twice."""
     if logger:
         try:
             logger(message)
         except Exception:
             pass
-    logging.getLogger("snbt_localizer.core").info(message)
+    if not getattr(logger, "_writes_file", False):
+        logging.getLogger("snbt_localizer.core").info(
+            message, extra={"_cb_shown": True})
 
 
 def _health_fmt_s(duration: float) -> str:
@@ -866,6 +875,8 @@ def get_provider_class(provider: str, custom_base_url: Optional[str] = None) -> 
         "OpenCode": OpenCodeProvider(),
         "Crusoe Cloud": OpenAIProvider(base_url),
         "RunInfra": OpenAIProvider(base_url),
+        "Shisa": OpenAIProvider(base_url),
+        "Corvex": OpenAIProvider(base_url),
         "Custom (OpenAI-compatible)": OpenAIProvider(base_url),
     }
     return provider_map.get(provider, OpenAIProvider(base_url))
@@ -1012,6 +1023,10 @@ async def test_key_with_question(provider: str, api_key: str, model: str, questi
             return "Invalid", ""
         if code == 429:
             return "Rate Limited", ""
+        if code == 402:
+            # Payment Required: credits/limits exhausted (routine on pooled
+            # providers like Corvex/RunInfra) — a key issue, not a network one
+            return "No credits", (_http_error_detail(e.response) or "credits exhausted")[:120]
         # Provider up but the specific model is paused/unavailable server-side
         try:
             err = e.response.json()
@@ -1134,6 +1149,7 @@ def is_valid_custom_instance(path: Path) -> bool:
         for standard in (
             path / "config" / "ftbquests" / "quests",
             path / "minecraft" / "config" / "ftbquests" / "quests",
+            path / ".minecraft" / "config" / "ftbquests" / "quests",
         ):
             if standard.is_dir() and any(standard.glob("*.snbt")):
                 return True
@@ -1151,6 +1167,7 @@ def is_valid_custom_instance(path: Path) -> bool:
 ID_PATTERN = re.compile(r'^#?\w+:[a-z0-9_/]+$')
 UUID_PATTERN = re.compile(r'^[0-9a-fA-F\-]{36}$')
 TAIL_PATTERN = re.compile(r'(?:[.,!?;:\s]|§[0-9a-fk-orA-FK-ORr])+$')
+_DIGITS_RE = re.compile(r'\d+')
 TAG_SHIELD_PATTERN = re.compile(r'#\w+:[a-zA-Z0-9_/-]+')
 
 # --- Minecraft formatting-code shielding -------------------------------------
@@ -1453,113 +1470,98 @@ def parse_target_lang(lang_str):
         return match.group(1).strip(), match.group(2).strip().lower()
     return lang_str, lang_str.lower()[:5]
 
-def _escape_snbt_string(s: str) -> str:
-    s = s.replace('\\', '\\\\').replace('"', '\\"')
+def _escape_snbt_string(s: str, quote: str = '"') -> str:
+    s = s.replace('\\', '\\\\')
+    # Escape the quote char that actually delimits THIS string: escaping the
+    # other one would corrupt single-quoted strings ('...') with junk \".
+    s = s.replace(quote, '\\' + quote)
     s = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
     return s
 
 SNBT_UNESCAPE_MAP = {'n': '\n', 't': '\t', 'r': '\r', 'f': '\f', 'b': '\b', '0': '\0'}
 
+_SNBT_SCAN_OUTSIDE_RE = re.compile(r'[\\"\'._]|[^\W\d_]')
+_SNBT_SCAN_IN_DQ_RE = re.compile(r'[\\"]')
+_SNBT_SCAN_IN_SQ_RE = re.compile(r"[\\']")
+_SNBT_SCAN_WORD_RE = re.compile(r'[\w.\-]*')
+_SNBT_SCAN_WS_RE = re.compile(r'[ \t\n\r]*')
+
 def _find_all_snbt_strings(content: str) -> list:
     results = []
-    i = 0
     n = len(content)
-
+    i = 0
     current_key = None
-    in_string = False
-    string_start = 0
     string_chars = []
-    escape_next = False
+    unescape = SNBT_UNESCAPE_MAP
+    outside_search = _SNBT_SCAN_OUTSIDE_RE.search
+    word_match = _SNBT_SCAN_WORD_RE.match
+    ws_end = lambda p: _SNBT_SCAN_WS_RE.match(content, p).end()
 
-    def skip_whitespace():
-        nonlocal i
-        while i < n and content[i] in ' \t\n\r':
-            i += 1
-
-    def save_string():
-        nonlocal in_string, string_chars, string_start, current_key
-        if in_string:
-            value = ''.join(string_chars)
-            # Lookahead: if a ':' follows the closing quote, this string is a KEY
-            j = i + 1
-            while j < n and content[j] in ' \t\n\r':
-                j += 1
-            if j < n and content[j] == ':':
-                current_key = value
-            else:
-                results.append({
-                    'key': current_key,
-                    'value': value,
-                    'content_start': string_start,
-                    'content_end': i - 1,
-                    'full_start': string_start - 1,
-                    'full_end': i
-                })
-            in_string = False
-            string_chars = []
+    def save_string(end, quote, start):
+        nonlocal current_key
+        value = ''.join(string_chars)
+        j = ws_end(end + 1) if end + 1 < n else end + 1
+        if j < n and content[j] == ':':
+            current_key = value
+        else:
+            results.append({
+                'key': current_key,
+                'value': value,
+                'quote': quote,
+                'content_start': start,
+                'content_end': end - 1,
+                'full_start': start - 1,
+                'full_end': end
+            })
+        string_chars.clear()
 
     while i < n:
+        m = outside_search(content, i)
+        if m is None:
+            break
+        i = m.start()
         c = content[i]
-
-        if escape_next:
-            string_chars.append(SNBT_UNESCAPE_MAP.get(c, c))
-            escape_next = False
-            i += 1
-            continue
-
         if c == '\\':
-            escape_next = True
-            i += 1
+            if i + 1 < n:
+                d = content[i + 1]
+                string_chars.append(unescape.get(d, d))
+            i += 2
             continue
-
-        if in_string:
-            if c == '"':
-                save_string()
-                i += 1
-            else:
-                string_chars.append(c)
-                i += 1
+        if c == '"' or c == "'":
+            quote = c
+            start = i + 1
+            i = start
+            in_search = (_SNBT_SCAN_IN_DQ_RE if c == '"' else _SNBT_SCAN_IN_SQ_RE).search
+            while True:
+                mm = in_search(content, i)
+                if mm is None:
+                    string_chars.append(content[i:])
+                    save_string(n, quote, start)
+                    return results
+                j = mm.start()
+                if j > i:
+                    string_chars.append(content[i:j])
+                if content[j] == '\\':
+                    if j + 1 < n:
+                        d = content[j + 1]
+                        string_chars.append(unescape.get(d, d))
+                        i = j + 2
+                        continue
+                    save_string(n, quote, start)
+                    return results
+                save_string(j, quote, start)
+                i = j + 1
+                break
             continue
-
-        if c == '"':
-            in_string = True
-            string_start = i + 1
-            i += 1
-            continue
-
-        if c == '{' or c == '[':
-            skip_whitespace()
-            i += 1
-            continue
-
-        if c == '}' or c == ']':
-            save_string()
-            skip_whitespace()
-            i += 1
-            continue
-
-        if c == ':':
-            skip_whitespace()
-            i += 1
-            continue
-
         if c.isalpha() or c == '_' or c == '.':
-            key_chars = []
-            while i < n and (content[i].isalnum() or content[i] in '_.-'):
-                key_chars.append(content[i])
-                i += 1
-            skip_whitespace()
+            e = word_match(content, i).end()
+            word = content[i:e]
+            i = ws_end(e)
             if i < n and content[i] == ':':
-                # Bare-word key (e.g. `title: "..."`)
-                current_key = ''.join(key_chars)
-                i += 1
-                skip_whitespace()
-            # Bare-word VALUE (e.g. `type: quest`) must NOT clobber current_key
+                current_key = word
+                i = ws_end(i + 1)
             continue
-
         i += 1
-
-    save_string()
     return results
 
 def parse_snbt_map(content: str) -> Dict[str, str]:
@@ -1651,16 +1653,21 @@ class TranslationCache:
             )
             candidates = cursor.fetchall()
 
-            input_numbers = re.findall(r'\d+', text_without_tail)
+            input_numbers = _DIGITS_RE.findall(text_without_tail)
+            matcher = difflib.SequenceMatcher(None, text_without_tail, "")
 
             for orig, trans in candidates:
-                candidate_numbers = re.findall(r'\d+', orig)
+                candidate_numbers = _DIGITS_RE.findall(orig)
                 if input_numbers != candidate_numbers:
                     continue
 
-                orig_without_tail = re.sub(TAIL_PATTERN, '', orig)
-                ratio = difflib.SequenceMatcher(None, text_without_tail, orig_without_tail).ratio()
-                if ratio >= 0.90:
+                orig_without_tail = TAIL_PATTERN.sub('', orig)
+                matcher.set_seq2(orig_without_tail)
+                # real_quick_ratio/quick_ratio are guaranteed upper bounds of
+                # ratio(): cheap rejection without changing the result.
+                if (matcher.real_quick_ratio() >= 0.90
+                        and matcher.quick_ratio() >= 0.90
+                        and matcher.ratio() >= 0.90):
                     cleaned_trans = re.sub(TAIL_PATTERN, '', trans)
                     candidate = cleaned_trans + tail_input
                     # Skip identity junk: a fuzzy match that "translates" to
@@ -1956,6 +1963,10 @@ def detect_provider(api_key: str, model_name: str = "") -> str:
         return "Crusoe Cloud"
     if api_key.startswith("rp_"):
         return "RunInfra"
+    if api_key.startswith("shsk:"):
+        return "Shisa"
+    if api_key.startswith("sk-corvex-"):
+        return "Corvex"
     if api_key.startswith("sk-proj-") or (api_key.startswith("sk-") and not api_key.startswith("sk-or-")):
         return "OpenAI"
     # Heuristic checks LAST: explicit prefixes must win over format guessing
@@ -2064,6 +2075,10 @@ def get_base_url(provider: str) -> str:
         return "https://api.inference.crusoecloud.com/v1"
     if "RunInfra" in provider:
         return "https://api.runinfra.ai/v1"
+    if "Shisa" in provider:
+        return "https://api.shisa.ai/openai/v1"
+    if "Corvex" in provider:
+        return "https://api.tokenfactory.corvex.cloud/v1"
     if "Mistral" in provider:
         return "https://api.mistral.ai/v1"
     if "Anthropic" in provider:
@@ -2094,6 +2109,8 @@ def resolve_mixed_pool(pairs, saved_keys_by_provider, saved_models_by_provider, 
             "OpenCode",
             "Crusoe Cloud",
             "RunInfra",
+            "Shisa",
+            "Corvex",
             "Google Translate (Free)",
             "Ollama (Local / Free)",
             "Custom (OpenAI-compatible)"
@@ -2356,8 +2373,7 @@ class UnifiedTranslator:
             # originals for the rest - saves a full re-request of the batch.
             payload = getattr(e, "payload", None)
             if isinstance(payload, list) and len(batch) > self.min_batch_size:
-                batch_texts = [text for _, text in batch]
-                salvaged = self._salvage_partial_response(batch_texts, payload, logger, depth)
+                salvaged = self._salvage_partial_response(batch, payload, logger, depth)
                 if salvaged is not None:
                     return salvaged
 
@@ -2378,7 +2394,7 @@ class UnifiedTranslator:
         except Exception:
             raise
 
-    def _salvage_partial_response(self, batch_texts: List[str], payload: list, logger, depth: int) -> Optional[dict]:
+    def _salvage_partial_response(self, batch: List[Tuple[int, str]], payload: list, logger, depth: int) -> Optional[dict]:
         """Align a wrong-length parsed array with the originals.
 
         A model that returns 49 items for 50 inputs usually dropped one
@@ -2390,10 +2406,14 @@ class UnifiedTranslator:
         (the batch loop only saves changed strings when they differ).
 
         Returns {idx: translation} on success, None when alignment is too
-        unreliable (fewer than half of the items align).
+        unreliable (fewer than half of the items align). Keys are the
+        ORIGINAL indices from the (idx, text) batch tuples — NOT local
+        positions — because split batches carry non-zero-based indices and
+        the caller merges results by key.
         """
+        batch_texts = [text for _, text in batch]
+        batch_ids = [idx for idx, _ in batch]
         n = len(batch_texts)
-        m = len(payload)
         items = [str(p) if p is not None else "" for p in payload]
         # Strip __FMT_N__/__TAG_N__ placeholders before comparing: they are
         # shielded formatting/ids, pure noise for similarity ratios.
@@ -2407,6 +2427,11 @@ class UnifiedTranslator:
         # fuzzy ratio with a cutoff, processing in order to respect the
         # model's sequencing.
         used = set()
+        # One matcher per original: SequenceMatcher caches the seq2 index,
+        # so only seq1 changes per item. quick_ratio() bounds ratio() from
+        # above, so pairs that cannot beat best_ratio are skipped cheaply
+        # with identical alignment results.
+        matchers: Dict[int, difflib.SequenceMatcher] = {}
         for i, item in enumerate(items):
             best_idx, best_ratio = -1, 0.55
             for j in range(n):
@@ -2415,12 +2440,18 @@ class UnifiedTranslator:
                 if lower_items[i] == lower_orig[j]:
                     best_idx, best_ratio = j, 1.0
                     break
-                ratio = difflib.SequenceMatcher(None, lower_items[i], lower_orig[j]).ratio()
+                sm = matchers.get(j)
+                if sm is None:
+                    sm = matchers[j] = difflib.SequenceMatcher(None, "", lower_orig[j])
+                sm.set_seq1(lower_items[i])
+                if sm.real_quick_ratio() <= best_ratio or sm.quick_ratio() <= best_ratio:
+                    continue
+                ratio = sm.ratio()
                 if ratio > best_ratio:
                     best_idx, best_ratio = j, ratio
             if best_idx >= 0:
                 used.add(best_idx)
-                result[best_idx] = item
+                result[batch_ids[best_idx]] = item
         if len(result) < max(1, n // 2):
             logger(f"[Salvage] Depth {depth}: only {len(result)}/{n} items aligned — too unreliable, falling back to BinarySplit.")
             return None
@@ -2431,8 +2462,8 @@ class UnifiedTranslator:
         # run retries the leftovers later.
         missing = n - len(result)
         for j in range(n):
-            if j not in result:
-                result[j] = batch_texts[j]
+            if j not in used:
+                result[batch_ids[j]] = batch_texts[j]
         if missing:
             logger(f"[Salvage] Depth {depth}: recovered {len(result) - missing}/{n} items, {missing} left untranslated (picked up by a later complement run).")
         return result
@@ -2754,14 +2785,15 @@ class SNBTManager:
         logger(f"Strategy: {policy_banner.upper()}"
                f"{' — cache BYPASSED (all strings re-translated)' if policy_banner == 'overwrite' else ''}")
         if self.skip_mode:
-            logger(f"[SKIP MODE] Skipping file: {filepath.name}")
             logging.getLogger("snbt_localizer.core").info(f"[SKIP MODE] Skipping file: {filepath.name}")
             return 0
 
         policy_normalized = policy.lower().split('(')[0].strip()
         is_overwrite = policy_normalized == "overwrite"
         lang_pattern = re.compile(r'^[a-z]{2}_[a-z]{2}\.snbt$', re.IGNORECASE)
-        is_loc_file = bool(lang_pattern.match(filepath.name))
+        # Only quests/lang/<locale>.snbt is a localization file; a chapter
+        # that happens to be named like a locale (chapters/wu_qi.snbt) is not
+        is_loc_file = bool(lang_pattern.match(filepath.name)) and filepath.parent.name.lower() == "lang"
         is_ru_file = False
 
         if is_loc_file:
@@ -2842,7 +2874,7 @@ class SNBTManager:
         def apply_mapping_to_content(source_content: str) -> str:
             """Positional replacement by scanner offsets - single pass, join-based.
             Substring .replace() is unsafe: unescaped quotes/values break SNBT."""
-            translatable = _find_all_snbt_strings(source_content)
+            translatable = all_strings if source_content is content else _find_all_snbt_strings(source_content)
             filtered = [
                 s for s in translatable
                 if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc) and s['value'] in mapping
@@ -2854,7 +2886,7 @@ class SNBTManager:
             last = 0
             for s in filtered:
                 parts.append(source_content[last:s['content_start']])
-                parts.append(_escape_snbt_string(mapping[s['value']]))
+                parts.append(_escape_snbt_string(mapping[s['value']], s.get('quote', '"')))
                 last = s['content_end'] + 1
             parts.append(source_content[last:])
             return ''.join(parts)
@@ -2864,25 +2896,19 @@ class SNBTManager:
         def should_translate(text: str) -> bool:
             return self.is_valid(text) and text not in mapping
 
+        # Preserve file order (deterministic chunking/cache keys); a set's
+        # iteration order varies between processes.
+        texts = []
         for s in all_strings:
             if self._is_translatable_key(s['key'], t_titles, t_subs, t_desc):
-                if should_translate(s['value']):
+                if should_translate(s['value']) and s['value'] not in target_texts:
                     target_texts.add(s['value'])
+                    texts.append(s['value'])
 
-        texts = list(target_texts)
         if not texts:
-            logger(f"No new untranslated texts in {filepath.name}.")
             logging.getLogger("snbt_localizer.core").info(f"No new untranslated texts in {filepath.name}.")
-            if is_ru_file and is_overwrite and mapping:
-                final_content = apply_mapping_to_content(content)
-                tmp_path = target_path.with_suffix('.snbt.tmp')
-                try:
-                    async with aiofiles.open(tmp_path, 'w', encoding='utf-8') as f:
-                        await f.write(final_content)
-                    os.replace(tmp_path, target_path)
-                except BaseException:
-                    tmp_path.unlink(missing_ok=True)
-                    raise
+            # (mapping is only pre-filled in complement mode, so there is
+            # nothing to write back in overwrite mode here)
             return 0
 
         if is_overwrite:
@@ -2920,7 +2946,6 @@ class SNBTManager:
             chunk_queue: "asyncio.Queue[int]" = asyncio.Queue()
             for bi in range(len(chunks_list)):
                 chunk_queue.put_nowait(bi)
-            pool_for_workers = list(getattr(self.translator, 'mixed_pool', []) or [None])
             requeued: set = set()
             # Chunk-level progress state: chunks finish out of order but are
             # still APPLIED in original order, so this only drives the bar.
@@ -2955,7 +2980,6 @@ class SNBTManager:
                 except (AbortException, ValueError):
                     raise
                 except Exception as e:
-                    logger(f"Chunk failed ({repr(e)}). Activating instant 1-by-1 fallback...")
                     logging.getLogger("snbt_localizer.core").error(f"Chunk failed ({repr(e)}). Activating instant 1-by-1 fallback...")
                     new_map = {}
                     for item in chunk_to_send:
@@ -2991,7 +3015,8 @@ class SNBTManager:
                             progress_strings += sum(1 for o, t in new_map.items() if o != t)
                             if progress_callback:
                                 progress_callback(progress_done, total_chunks,
-                                                  translated_ok + progress_strings, len(to_trans))
+                                                  translated_ok + progress_strings, len(to_trans),
+                                                  cached=translated_ok)
                     except AbortException:
                         chunk_queue.put_nowait(ci)
                         raise
@@ -3001,7 +3026,6 @@ class SNBTManager:
                             requeued.add(ci)
                             chunk_queue.put_nowait(ci)
                         else:
-                            logger(f"Chunk {ci+1} failed twice ({repr(e)[:120]}) — leaving its strings untranslated")
                             logging.getLogger("snbt_localizer.core").warning(f"Chunk {ci+1} failed twice ({repr(e)[:120]}) — leaving its strings untranslated")
 
             async def _drain_chunks() -> None:
@@ -3024,11 +3048,11 @@ class SNBTManager:
                             progress_strings += sum(1 for o, t in new_map.items() if o != t)
                             if progress_callback:
                                 progress_callback(progress_done, total_chunks,
-                                                  translated_ok + progress_strings, len(to_trans))
+                                                  translated_ok + progress_strings, len(to_trans),
+                                                  cached=translated_ok)
                     except AbortException:
                         raise
                     except Exception as e:
-                        logger(f"Chunk {ci+1} failed in the fallback drain ({repr(e)[:120]}) — leaving its strings untranslated")
                         logging.getLogger("snbt_localizer.core").warning(f"Chunk {ci+1} failed in the fallback drain ({repr(e)[:120]}) — leaving its strings untranslated")
 
             try:
@@ -3063,9 +3087,14 @@ class SNBTManager:
                         logger(f"Translated [{provider_name} / {model_name}]: \"{orig}\" -> \"{trans}\"")
         except AbortException as e:
             reason = f" ({e})" if str(e) else ""
-            logger(f"Aborted processing of {filepath.name}{reason}.")
             logging.getLogger("snbt_localizer.core").warning(f"Aborted processing of {filepath.name}{reason}.")
             # ТЗ-v4.4: a stopped file must not leave audit workers running.
+            if prefetch is not None:
+                prefetch.abort()
+            raise
+        except Exception:
+            # Any unexpected pipeline failure must not leave the QA prefetch
+            # workers burning tokens in the background either.
             if prefetch is not None:
                 prefetch.abort()
             raise
@@ -3086,6 +3115,15 @@ class SNBTManager:
                 if prefetch is not None:
                     await prefetch.finish()
                     qa_params["prefetch"] = prefetch
+                if progress_callback:
+                    # Progress sinks that understand stages show "file (QA)"
+                    # instead of a frozen 100% while the audit runs.
+                    try:
+                        progress_callback(total_chunks, total_chunks,
+                                          translated_ok + progress_strings, len(to_trans),
+                                          cached=translated_ok, stage="qa")
+                    except TypeError:
+                        pass
                 await run_qa_phase_async(qa_pairs, qa_params, self.translator,
                                          self.cache, logger, check_status)
             elif prefetch is not None:
@@ -3326,7 +3364,7 @@ class JSONManager:
                             "pack": {
                                 "pack_format": 15,
                                 "supported_formats": {"min_format": 15, "max_format": 99},
-                                "description": f"SNBT AI Localizer compiled translations"
+                                "description": "SNBT AI Localizer compiled translations"
                             }
                         }, indent=2), encoding="utf-8")
                         logo_path = get_resource_path("resources/logo.png")
@@ -3599,16 +3637,17 @@ class JSONManager:
             # ТЗ-v4.5 fix: only the scope OWNER prints/closes — a nested JSON
             # phase leaves the single aggregate to the outer CLI/GUI run.
             try:
-                qa_run_close(_owns_qa_scope, logger=lambda msg: (
-                    log_callback(msg),
-                    logging.getLogger("snbt_localizer.core").info(msg)))
+                qa_run_close(_owns_qa_scope,
+                             logger=logging.getLogger("snbt_localizer.core").info)
             except Exception:
                 pass
-            # ТЗ-health п.4: per-key [POOL] stats into the GUI console and
-            # app.log at the end of the run, before the shared clients close.
+            # ТЗ-health п.4: per-key [POOL] stats at the end of the run, before
+            # the shared clients close. logging-only: the GUI view (Qt handler)
+            # and the CLI console handler subscribe to this logger tree, so a
+            # log_callback twin would double every line in the CLI (its
+            # callback IS a logging call).
             try:
                 for line in health_summary_lines():
-                    log_callback(line)
                     logging.getLogger("snbt_localizer.core").info(line)
             except Exception:
                 pass
@@ -3780,6 +3819,10 @@ def load_vanilla_glossary() -> Dict[str, str]:
         logger.info("Vanilla glossary DISABLED (user directive) — returning empty glossary")
     return _VANILLA_GLOSSARY_CACHE
 
+_GLOSSARY_STRICT_RE_CACHE: Dict[str, "re.Pattern[str]"] = {}
+_GLOSSARY_LENIENT_RE_CACHE: Dict[str, "re.Pattern[str]"] = {}
+
+
 def build_glossary_context(texts: List[str], glossary: Dict[str, str], limit: int = 40, label: str = "Official Minecraft terminology", lenient: bool = False) -> str:
     """Collect glossary terms actually present in the batch strings.
 
@@ -3796,17 +3839,38 @@ def build_glossary_context(texts: List[str], glossary: Dict[str, str], limit: in
     if not texts or not glossary:
         return ""
     joined = "\n".join(texts)
+    # Lowercase substring prefilter for lenient mode. For ASCII term words,
+    # re.IGNORECASE additionally matches U+0130/U+0131 (dotted/dotless I)
+    # and U+017F (long s) whose lower() differs — skip the prefilter then.
+    joined_lower = (
+        joined.lower()
+        if lenient and not any(c in joined for c in "\u0130\u0131\u017f")
+        else None
+    )
     hits = []
     for term_en, term_ru in glossary.items():
         if len(term_en) < 3:
             continue
         if lenient:
-            body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in term_en.split())
-            pat = r"(?<![A-Za-z])" + body + r"(?![A-Za-z])"
-            if re.search(pat, joined, re.IGNORECASE):
+            if (joined_lower is not None and term_en.isascii()
+                    and not all(w.lower() in joined_lower for w in term_en.split())):
+                continue
+            pat = _GLOSSARY_LENIENT_RE_CACHE.get(term_en)
+            if pat is None:
+                body = r"\s+".join(re.escape(w) + r"(?:es|s)?" for w in term_en.split())
+                pat = re.compile(r"(?<![A-Za-z])" + body + r"(?![A-Za-z])", re.IGNORECASE)
+                _GLOSSARY_LENIENT_RE_CACHE[term_en] = pat
+            if pat.search(joined):
                 hits.append((term_en, term_ru))
-        elif re.search(r'(?<![A-Za-z])' + re.escape(term_en) + r'(?![A-Za-z])', joined):
-            hits.append((term_en, term_ru))
+        elif term_en in joined:
+            # cheap exact-substring prefilter: the strict pattern can only
+            # match where the literal term occurs, so results are unchanged
+            pat = _GLOSSARY_STRICT_RE_CACHE.get(term_en)
+            if pat is None:
+                pat = re.compile(r'(?<![A-Za-z])' + re.escape(term_en) + r'(?![A-Za-z])')
+                _GLOSSARY_STRICT_RE_CACHE[term_en] = pat
+            if pat.search(joined):
+                hits.append((term_en, term_ru))
     if not hits:
         return ""
     # longest English terms first: 'Nether Gold Ore' before 'Gold Ore'
@@ -4433,11 +4497,19 @@ def _qa_glossary_violations(batch: List[dict], vanilla_gloss: Dict[str, str],
             continue
         src_clean = _QA_TAG_RE.sub(' ', FMT_CODE_PATTERN.sub('', src))
         tr_clean = FMT_CODE_PATTERN.sub('', tr)
+        # lowercase substring prefilter (see build_glossary_context): skip
+        # it when U+0130/U+0131/U+017F could match ASCII letters under re.I
+        src_lower = (src_clean.lower()
+                     if not any(c in src_clean for c in "\u0130\u0131\u017f")
+                     else None)
         missed = []
         matched: List[tuple] = []
         for gname, gloss in glossaries:
             for term_en, term_ru in gloss.items():
                 if len(term_en) < 3 or not term_ru:
+                    continue
+                if (src_lower is not None and term_en.isascii()
+                        and not all(w.lower() in src_lower for w in term_en.split())):
                     continue
                 cached = _QA_GLOSSARY_PATTERN_CACHE.get((term_en, term_ru))
                 if cached is None:
@@ -4455,9 +4527,9 @@ def _qa_glossary_violations(batch: List[dict], vanilla_gloss: Dict[str, str],
                     _QA_GLOSSARY_PATTERN_CACHE[(term_en, term_ru)] = (pat, cs_pat)
                     cached = (pat, cs_pat)
                 pat, cs_pat = cached
-                if not pat.search(src_clean):
-                    continue
                 m = pat.search(src_clean)
+                if not m:
+                    continue
                 if m and gname == "modpack":
                     # ТЗ-v4.3 A: a pin inside a longer capitalised phrase is
                     # not a term reference ('Light' in «White Light»,
@@ -5439,6 +5511,10 @@ def _qa_dump_raw(phase: str, batch_label: str, content: str) -> None:
     try:
         _QA_DUMP_DIR.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
+        # Second-resolution timestamps collide when two dumps of the same
+        # phase/batch land within one second; add the ns fraction (dash
+        # separator keeps the name split('_',2)[2]==phase contract).
+        ts += f"-{time.time_ns() % 1_000_000_000:09d}"
         safe_phase = re.sub(r'[^A-Za-z0-9_-]+', '_', phase) or "phase"
         safe_label = re.sub(r'[^A-Za-z0-9_-]+', '_', batch_label) or "x"
         path = _QA_DUMP_DIR / f"{ts}_{safe_phase}_{safe_label}.json"
@@ -5725,6 +5801,12 @@ class QADataSetWriter:
 _qa_httpx_clients: Dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
 
+def _is_dataset_meta_line(line: str) -> bool:
+    """True for the run-meta header line of a QA dataset JSONL file
+    (written with json.dumps -> '"meta": true')."""
+    return '"meta": true' in line or '"meta":true' in line
+
+
 def _get_qa_httpx_client() -> httpx.AsyncClient:
     """Per-loop cached httpx client for the QA phase (read 180s / connect 10s)."""
     loop = asyncio.get_running_loop()
@@ -5858,7 +5940,6 @@ async def _qa_send(batch: List[dict], prompt: str, api_keys: List[str], provider
         if not active_keys:
             raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
         key = active_keys[key_idx % len(active_keys)]
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         try:
             resp = await health_track_call(
                 key, f"QA {phase}", batch_label,
@@ -5999,7 +6080,6 @@ async def _qa_retry_send(candidates: List[dict], prompt: str, api_keys: List[str
         if not active_keys:
             raise RuntimeError("all QA keys benched (2+ consecutive timeouts/failures each) — keys failed")
         key = active_keys[key_idx % len(active_keys)]
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         try:
             resp = await health_track_call(
                 key, f"QA {phase}", batch_label,
@@ -6554,6 +6634,9 @@ class _QAPrefetch:
         self._queues: List["asyncio.Queue"] = [asyncio.Queue() for _ in range(n)]
         self.p2_queue: "asyncio.Queue" = asyncio.Queue()
         self._tasks: List = []
+        # Set at start(); finish()/abort() guard on None, but the attribute
+        # must EXIST even when start() never ran (abort-before-start path).
+        self._p2_task = None
         self._closed = False
         self._n = 0
         self._batch_no = 0
@@ -6875,7 +6958,12 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
 
     def qa_log(msg):
         logger(msg)
-        file_log.info(msg)
+        # _cb_shown: the callback already showed the line in the view/console;
+        # the GUI/CLI console filters drop these records there, app.log keeps
+        # exactly one copy.
+        file_log.info(msg, extra={"_cb_shown": True})
+
+    qa_log._writes_file = True  # tells _health_log not to re-record
 
     # ТЗ-v4.1 F12.3: pairs whose scan/arbitration failed stay FLAGGED. They
     # must reach the unresolved counter and the dataset (action="warning") —
@@ -7621,10 +7709,9 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                                    f"disputed pairs stay flagged as warnings")
                             # ТЗ-v4 A3: the foreman never answered for these
                             # pairs — a failed scan, not a clean verdict.
-                            scan_failed_ids.update(p["id"] for p in batch)
+                            scan_failed_ids.update(p["id"] for p in chunk)
                         return
 
-            foreman_ok = True
             try:
                 async with asyncio.TaskGroup() as tg:
                     for w in range(n_f_workers):
@@ -8239,7 +8326,7 @@ async def _run_qa_phase_async(pairs_dict: Dict[str, str], qa_params: dict, trans
                         if ds_writer.path and ds_writer.path.exists():
                             with open(ds_writer.path, encoding="utf-8") as f:
                                 total = sum(1 for line in f if line.strip()
-                                            and not J_meta_line(line))
+                                            and not _is_dataset_meta_line(line))
                     except Exception:
                         total = n
                     qa_log(f"[QA] dataset: {ds_writer.path} (+{n} this file, {total} records in the run)")
@@ -9053,6 +9140,9 @@ def _qa_bump_effort(model_text: str, effort_override: str = None) -> str:
     """
     model, effort = parse_model_effort(model_text)
     if effort is None:
+        if effort_override:
+            base = model if model else model_text
+            return f"{base}/{effort_override}"
         return model_text
     base = model if model else model_text
     if effort not in _QA_EFFORT_STEPS:
@@ -9264,7 +9354,8 @@ def _qa_drop_summary(batch_label: str, drop_stats: Dict[str, int], batch: List[d
 # Module-level counters: _qa_apply_problems increments them, the phase
 # runner resets/reads them. The QA phase is awaited sequentially inside the
 # manager's event loop — no reentrancy.
-_QA_COUNTERS = {"hard": 0, "soft_fixed": 0, "warnings": 0, "glossary": 0}
+_QA_COUNTERS = {"hard": 0, "soft_fixed": 0, "warnings": 0, "soft_changed_pairs": {},
+                "glossary": 0, "unresolved": 0}
 
 # ТЗ-v4.1 F12.3: pair ids whose scan/arbitration never produced a verdict
 # (transport death, unparseable answer, dead key). "No verdict" is NOT

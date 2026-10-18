@@ -27,17 +27,21 @@ pip install -r requirements.txt
 ## Usage
 
 ### Launch Methods
-- `snbt-tr` - Launches the interactive CLI setup wizard
-- `snbt-tr --gui` - Launches the PyQt6 GUI with dual-tab interface
+- `snbt-tr` - Interactive CLI wizard (instance → provider → key → model → language); opens the GUI when started without a terminal
+- `snbt-tr --gui` - Launches the PyQt6 GUI
 - `snbt-tr [options]` - Unattended batch execution
+
+The CLI shares all settings with the GUI and covers its features: live file/string progress with ETA, key verification with balances (`--verify-keys`), Translation Memory browsing and healing (`--cache stats|list|search|autofix|heal|clear`), QA judge pass (`--qa/--no-qa`, `--qa-provider`, `--qa-model`), title/subtitle/description toggles (`--no-titles/--no-subs/--no-desc`) and a read-only preview (`--dry-run`). Plain output: `--no-color` or `NO_COLOR=1`. Full reference: [CLI_USAGE.md](CLI_USAGE.md).
 
 ### Examples
 ```bash
-snbt-tr --list-models -p groq
-snbt-tr -d /path/to/quests -p groq -k YOUR_API_KEY
-snbt-tr --mix -d /path/to/quests
-snbt-tr --clear-cache
-snbt-tr --fastdir
+snbt-tr --fd                                  # pick an instance, translate with saved settings
+snbt-tr -d "Vortex 1.1.2b" -p groq -k YOUR_API_KEY -l uk
+snbt-tr --mix -d /path/to/modpack
+snbt-tr --fd --dry-run --no-desc
+snbt-tr -p groq --list-models
+snbt-tr --verify-keys
+snbt-tr --cache search --search "Iron Ingot"
 ```
 
 ## Features

@@ -1340,6 +1340,37 @@ def test_runinfra_smart_parse():
     assert cm.smart_parse_key("rp_test\\") == ("rp_test", "glm-5-3-flash")
     assert cm.smart_parse_key("rp_test\\glm") == ("rp_test", "glm")
 
+def test_shisa_provider_support():
+    from core import get_base_url, get_provider_class, detect_provider, PROVIDER_DEFAULTS
+
+    assert get_base_url("Shisa") == "https://api.shisa.ai/openai/v1"
+    assert PROVIDER_DEFAULTS["Shisa"] == "shisa-ai/shisa-v2.1-llama3.3-70b"
+    assert detect_provider("shsk:abc123") == "Shisa"
+
+    provider = get_provider_class("Shisa")
+    assert provider is not None
+
+def test_shisa_smart_parse():
+    from config import ConfigManager
+    cm = ConfigManager.__new__(ConfigManager)
+    assert cm.smart_parse_key("shsk:abc123") == ("shsk:abc123", "shisa-ai/shisa-v2.1-llama3.3-70b")
+    assert cm.smart_parse_key("shsk:abc123\\shisa-ai/shisa-v2.1-unphi4-14b") == ("shsk:abc123", "shisa-ai/shisa-v2.1-unphi4-14b")
+
+def test_salvage_partial_response_keeps_original_indices():
+    """Regression: salvage on a SPLIT batch must key results by the original
+    batch indices (25..49), not local positions (0..24) — otherwise the
+    caller's {**left, **right} merge overwrites the left half and writes
+    translations to the wrong strings (silent data corruption)."""
+    from core import UnifiedTranslator
+    t = UnifiedTranslator.__new__(UnifiedTranslator)
+    batch = [(25, "alpha stone"), (26, "beta brick"), (27, "gamma ore"), (28, "delta dust")]
+    payload = ["alpha stone", "beta brick", "delta dust"]  # model dropped one item
+    res = t._salvage_partial_response(batch, payload, lambda m: None, depth=1)
+    assert sorted(res.keys()) == [25, 26, 27, 28]
+    assert res[25] == "alpha stone" and res[26] == "beta brick" and res[28] == "delta dust"
+    assert res[27] == "gamma ore"  # unaligned gap falls back to the original
+
+
 
 def test_snbt_quote_no_double_escape():
     """Regression: quotes in translations must be escaped exactly once."""
@@ -1467,3 +1498,16 @@ def test_doraw_pool_shrink_no_indexerror():
     result = asyncio.run(translator._do_raw_translation(["hello"], lambda m: None, None))
     assert result == ["ok"]
     assert calls["n"] == 2
+
+def test_snbt_single_quoted_strings_scanned_and_escaped():
+    from core import _find_all_snbt_strings, _escape_snbt_string
+    content = "{ title: 'It\\'s a quest', desc: \"double\", bare: quest }"
+    strings = _find_all_snbt_strings(content)
+    vals = {s['key']: (s['value'], s['quote']) for s in strings}
+    assert vals['title'] == ("It's a quest", "'")
+    assert vals['desc'] == ("double", '"')
+    assert 'bare' not in vals
+    # write-back escaping respects the actual delimiter
+    assert _escape_snbt_string("l'ami", "'") == "l\\'ami"
+    assert _escape_snbt_string('say "hi"', "'") == 'say "hi"'
+    assert _escape_snbt_string('say "hi"') == 'say \\"hi\\"'

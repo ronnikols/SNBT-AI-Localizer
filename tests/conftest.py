@@ -9,6 +9,22 @@ import tempfile
 
 
 @pytest.fixture(scope="session", autouse=True)
+def isolate_glossary_dir(tmp_path_factory):
+    """Redirect the modpack glossary dir to a sandbox for the whole session.
+
+    ModpackGlossary resolves its path from the module-level core.GLOSSARY_DIR
+    (default: ~/.snbt-tr/glossaries — the user's REAL data). Tests creating a
+    glossary would otherwise write pack_*.json into the live dir and read back
+    stale pins from previous runs (order-dependent, flaky)."""
+    import core
+    sandbox = tmp_path_factory.mktemp("glossary-sandbox")
+    old_dir = core.GLOSSARY_DIR
+    core.GLOSSARY_DIR = sandbox
+    yield
+    core.GLOSSARY_DIR = old_dir
+
+
+@pytest.fixture(scope="session", autouse=True)
 def isolate_qsettings_env(tmp_path_factory):
     """Redirect QSettings (NativeFormat) to a sandbox dir for the whole session.
 

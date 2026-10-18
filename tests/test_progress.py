@@ -146,6 +146,11 @@ def test_no_overflow_when_done_exceeds_total():
     s._progress_total_files = 1
     s._progress_total_strings = 200
     _call('update_progress_state', s, 0, 1, "chapter.snbt", 400, 200, 0)
+    # Все строки учтены, но файл ещё не закрыт (QA/запись) — полоса держит 99%,
+    # 100% только когда закрыт каждый файл.
+    assert s.pb_batch.value == 990, s.pb_batch.value
+    s.files_progress = {0: 1.0}
+    _call('update_progress_state', s, 0, 1, "chapter.snbt", 400, 200, 0)
     assert s.pb_batch.value == 1000, s.pb_batch.value
     assert "Strings 200/200" in s.pb_batch.format, s.pb_batch.format
     assert "400/200" not in s.pb_batch.format

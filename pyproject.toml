@@ -7,10 +7,11 @@ name = "snbt-tr"
 version = "1.1.30"
 description = "Advanced SNBT quest localizer using AI key pools"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -19,13 +20,14 @@ dependencies = [
     "aiofiles>=23.1.0",
     "pymorphy3>=2.0.0",
     "pymorphy3-dicts-ru",
+    "rich>=13.0.0",
 ]
 
 [project.scripts]
 snbt-tr = "cli:main"
 
 [tool.setuptools]
-py-modules = ["config", "core", "gui", "cli"]
+py-modules = ["config", "core", "gui", "cli", "cli_ui"]
 packages = ["resources"]
 include-package-data = true
 

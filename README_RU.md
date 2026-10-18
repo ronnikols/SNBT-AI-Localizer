@@ -26,17 +26,21 @@ pip install -r requirements.txt
 ## Использование
 
 ### Способы запуска
-- `snbt-tr` — запускает интерактивный мастер настройки CLI
-- `snbt-tr --gui` — запускает графический интерфейс PyQt6 с двумя вкладками
+- `snbt-tr` — интерактивный мастер CLI (сборка → провайдер → ключ → модель → язык); без терминала открывает GUI
+- `snbt-tr --gui` — запускает графический интерфейс PyQt6
 - `snbt-tr [опции]` — пакетная обработка без диалогов
+
+CLI использует общие с GUI настройки и повторяет его функции: живой прогресс по файлам и строкам с ETA, проверка ключей с балансом (`--verify-keys`), просмотр и лечение памяти переводов (`--cache stats|list|search|autofix|heal|clear`), QA-проверка судьями (`--qa/--no-qa`, `--qa-provider`, `--qa-model`), переключатели заголовков/подзаголовков/описаний (`--no-titles/--no-subs/--no-desc`) и предпросмотр без записи (`--dry-run`). Вывод без цвета: `--no-color` или `NO_COLOR=1`. Полный справочник: [CLI_USAGE.md](CLI_USAGE.md).
 
 ### Примеры
 ```bash
-snbt-tr --list-models -p groq
-snbt-tr -d /путь/к/квестам -p groq -k ВАШ_API_КЛЮЧ
-snbt-tr --mix -d /путь/к/квестам
-snbt-tr --clear-cache
-snbt-tr --fastdir
+snbt-tr --fd                                  # выбрать сборку, перевести с сохранёнными настройками
+snbt-tr -d "Vortex 1.1.2b" -p groq -k ВАШ_API_КЛЮЧ -l ru
+snbt-tr --mix -d /путь/к/модпаку
+snbt-tr --fd --dry-run --no-desc
+snbt-tr -p groq --list-models
+snbt-tr --verify-keys
+snbt-tr --cache search --search "Iron Ingot"
 ```
 
 ## Возможности

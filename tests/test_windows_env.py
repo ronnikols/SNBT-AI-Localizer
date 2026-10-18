@@ -1,16 +1,21 @@
+import os
 import subprocess
-import pytest
+import sys
 
-@pytest.mark.skip(reason="Windows-specific test")
-def test_snbt_tr_in_path():
-    import os
-    # Get the absolute path to the snbt-tr executable
-    snbt_tr_path = os.path.abspath("snbt-tr")
-    
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def test_cli_help_starts():
+    """The CLI entry point (snbt-tr = cli:main) starts and prints its usage."""
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     result = subprocess.run(
-        [snbt_tr_path, "--help"],
+        [sys.executable, os.path.join(ROOT, "cli.py"), "--help"],
         capture_output=True,
-        text=True
+        text=True,
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
     )
-    assert result.returncode == 0
-    assert "usage" in result.stdout.lower() or "snbt" in result.stdout.lower()
+    assert result.returncode == 0, result.stderr
+    assert "usage" in result.stdout.lower()

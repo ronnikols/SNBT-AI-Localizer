@@ -89,11 +89,13 @@ def test_row_cap_four_and_delete_keeps_primary(qapp):
 
 
 def test_primary_row_all_cells_editable(qapp):
-    """m12653: ВСЕ поля судьи №1 редактируются (ключ/URL/температура/имя),
-    пустые ключ/URL = пул провайдера с главного экрана."""
+    """m12653: ВСЕ поля судьи №1 редактируются (ключ/температура/имя),
+    пустые ключ/URL = пул провайдера с главного экрана. Base URL
+    редактируется только для Custom/Ollama — для остальных провайдеров
+    URL резолвится автоматически (stray-значение перебивало бы endpoint)."""
     from PyQt6.QtCore import Qt
     tab = _mk_tab(qapp)
-    for col in (1, 3, 4, 6):
+    for col in (1, 4, 6):
         item = tab.judges_table.item(0, col)
         assert item is not None, f"row0 col{col} item missing"
         assert item.flags() & Qt.ItemFlag.ItemIsEditable, (
@@ -103,15 +105,26 @@ def test_primary_row_all_cells_editable(qapp):
     assert prov is not None
     box = tab.judges_table.cellWidget(0, 5)
     assert box is not None and box.isEditable()
+    # дефолтный провайдер (не Custom/Ollama): URL-ячейка не редактируется
+    url_item = tab.judges_table.item(0, 3)
+    assert not (url_item.flags() & Qt.ItemFlag.ItemIsEditable)
     # overrides: пустые ячейки = {} — пул дефолтов
     assert tab.judge1_overrides() == {}
-    # ввод ключа появляется в overrides
+    # ввод ключа появляется в overrides; stray base_url отбрасывается
     tab.judges_table.item(0, 4).setText("k-j1")
-    tab.judges_table.item(0, 3).setText("https://x.example/v1")
+    url_item.setText("https://x.example/v1")
     tab.judges_table.item(0, 6).setText("0.4")
     ov = tab.judge1_overrides()
-    assert ov == {"api_key": "k-j1", "base_url": "https://x.example/v1",
-                  "temperature": 0.4}
+    assert ov == {"api_key": "k-j1", "temperature": 0.4}
+    # Custom-провайдер: URL-ячейка редактируется и попадает в overrides
+    ci = prov.findData("Custom (OpenAI-compatible)")
+    assert ci >= 0
+    prov.setCurrentIndex(ci)
+    url_item = tab.judges_table.item(0, 3)
+    assert url_item.flags() & Qt.ItemFlag.ItemIsEditable
+    url_item.setText("https://x.example/v1")
+    ov = tab.judge1_overrides()
+    assert ov.get("base_url") == "https://x.example/v1"
 
 
 def test_extra_judge_empty_key_falls_back_to_provider_pool(qapp):

@@ -1,5 +1,6 @@
 import sys
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -34,6 +35,8 @@ PROVIDER_ALIASES = {
     "custom": "Custom (OpenAI-compatible)",
     "crusoe": "Crusoe Cloud",
     "runinfra": "RunInfra",
+    "shisa": "Shisa",
+    "corvex": "Corvex",
 }
 
 PROVIDER_ENDPOINTS = {
@@ -50,6 +53,8 @@ PROVIDER_ENDPOINTS = {
     "OpenCode": "https://opencode.ai/zen/v1/models",
     "Crusoe Cloud": "https://api.inference.crusoecloud.com/v1/models",
     "RunInfra": "https://api.runinfra.ai/v1/models",
+    "Shisa": "https://api.shisa.ai/openai/v1/models",
+    "Corvex": "https://api.tokenfactory.corvex.cloud/v1/models",
     "Custom (OpenAI-compatible)": "",
 }
 
@@ -82,6 +87,8 @@ ENV_KEY_MAP = {
     "OpenCode": "OPENCODE_API_KEY",
     "Crusoe Cloud": "CRUSOE_API_KEY",
     "RunInfra": "RUNINFRA_GATEWAY_KEY",
+    "Shisa": "SHISA_API_KEY",
+    "Corvex": "CORVEX_API_KEY",
     "Custom (OpenAI-compatible)": "",
 }
 
@@ -98,6 +105,8 @@ SETTINGS_KEY_MAP = {
     "OpenCode": "opencode_api_key",
     "Crusoe Cloud": "crusoe_api_key",
     "RunInfra": "runinfra_api_key",
+    "Shisa": "shisa_api_key",
+    "Corvex": "corvex_api_key",
     "Custom (OpenAI-compatible)": "",
 }
 
@@ -115,6 +124,8 @@ class ConfigManager:
         "OpenCode",
         "Crusoe Cloud",
         "RunInfra",
+        "Shisa",
+        "Corvex",
         "Google Translate (Free)",
         "Ollama (Local / Free)",
         "Custom (OpenAI-compatible)"
@@ -302,9 +313,11 @@ class ConfigManager:
         s.setValue("max_concurrent_requests", self.max_concurrent_requests)
         s.setValue("utility_provider", self.utility_provider or "")
         s.setValue("utility_model", self.utility_model or "")
-        s.setValue("qa_enabled", self.qa_enabled)
-        s.setValue("qa_provider", self.qa_provider or "")
-        s.setValue("qa_model", self.qa_model or "")
+        qa_enabled, qa_provider, qa_model = getattr(
+            self, "_persisted_qa", (self.qa_enabled, self.qa_provider, self.qa_model))
+        s.setValue("qa_enabled", qa_enabled)
+        s.setValue("qa_provider", qa_provider or "")
+        s.setValue("qa_model", qa_model or "")
         s.setValue("qa_update_glossary", self.qa_update_glossary)
         s.setValue("qa_batch_size", self.qa_batch_size)
         s.setValue("qa_temperature", self.qa_temperature)
@@ -318,37 +331,70 @@ class ConfigManager:
         s.sync()
 
     def parse_cli_args(self, args: Optional[List[str]] = None):
-        parser = argparse.ArgumentParser(prog='snbt-tr', add_help=False)
-        parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
-        parser.add_argument("-p", "--provider", help="Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova, openai, mistral, anthropic, claude, cohere, opencode, crusoe, runinfra, ollama, local/custom, mixed, mix)")
-        parser.add_argument("-m", "--model", help="Model name (default: provider default)")
-        parser.add_argument("-k", "--key", help="API key(s), comma-separated (env/QSettings fallback)")
-        parser.add_argument("-l", "--lang", default=None, help="Language code (default: ru / saved setting)")
-        parser.add_argument("-d", "--dir", default=None, help="Path to quests directory (default: auto-detect)")
-        parser.add_argument("-c", "--context", default="", help="Custom translation context")
-        parser.add_argument("--policy", default=None, choices=["complement", "overwrite", "skip"],
-                            help="Existing files policy: complement, overwrite, skip (default: saved setting)")
-        parser.add_argument("--concurrency", type=int, default=None,
-                            help="Number of parallel translation threads (1-10, default: saved setting)")
-        parser.add_argument("--list-models", action="store_true", help="List available models for provider and exit")
-        parser.add_argument("--fastdir", "--fd", action="store_true", help="Scan launcher paths, pick instance and translate with saved settings")
-        parser.add_argument("--clear-cache", "--clear", action="store_true", help="Clear translation cache and exit")
-        parser.add_argument("--debug", action="store_true", help="Enable debug logging to console")
-        parser.add_argument('--mix', action='store_true', help='Enable Mixed Provider mode using QSettings key pool')
-        parser.add_argument('--gui', action='store_true', help='Launch Graphical User Interface (GUI)')
-        parser.add_argument("--batch-size", type=int, default=None,
-                            help="Batch size for translation (default: saved setting)")
-        parser.add_argument("--min-batch-size", type=int, default=None,
-                            help="Minimum batch size before failing (default: saved setting)")
-        parser.add_argument("--max-concurrent-requests", type=int, default=None,
-                            help="Max concurrent API requests (default: saved setting)")
-        parser.add_argument("--temperature", type=float, default=None,
-                            help="LLM sampling temperature 0.0-2.0 (default: 0.1)")
-        parser.add_argument("--utility-provider", default=None,
-                            help="Provider for the glossary pre-scan utility model (default: same as main)")
-        parser.add_argument("--utility-model", default=None,
-                            help="Model for the glossary pre-scan utility model (default: same as main)")
-        parser.add_argument("--resource-pack", "-r", action="store_true", help="Enable Resource Pack Mode for JSON translation")
+        parser = argparse.ArgumentParser(
+            prog='snbt-tr', add_help=False,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description="SNBT AI Localizer — translate FTB Quests (.snbt) and KubeJS lang files with LLMs.",
+            epilog=(
+                "examples:\n"
+                "  snbt-tr                         interactive wizard\n"
+                "  snbt-tr --fd                    pick an instance, reuse saved provider/keys\n"
+                "  snbt-tr -p gemini -l uk -d ~/mc/MyPack\n"
+                "  snbt-tr --mix -l ru             all saved providers in one key pool\n"
+                "  snbt-tr -p groq --verify-keys   test saved keys (+QA judges) and balances\n"
+                "  snbt-tr --cache search --search 'Iron Ingot'\n"
+                "  snbt-tr --fd --dry-run          only list the files that would be touched\n"
+            ))
+        g = parser.add_argument_group("general")
+        g.add_argument("-h", "--help", action="help", help="Show this help message and exit")
+        g.add_argument("--version", action="store_true", help="Print version and exit")
+        g.add_argument("--gui", action="store_true", help="Launch the graphical interface")
+        g.add_argument("--debug", action="store_true", help="Debug logging to console")
+        g.add_argument("--no-color", action="store_true", help="Plain output (also NO_COLOR=1)")
+        g.add_argument("-y", "--yes", action="store_true", help="Assume yes for confirmations")
+
+        t = parser.add_argument_group("translation")
+        t.add_argument("-p", "--provider", help="Provider alias (google, gemini, groq, openrouter, nvidia, nim, sambanova, openai, mistral, anthropic, claude, cohere, opencode, crusoe, runinfra, shisa, corvex, ollama, local/custom, mixed, mix)")
+        t.add_argument("-m", "--model", help="Model name (default: provider default)")
+        t.add_argument("-k", "--key", help="API key(s), comma-separated (env/QSettings fallback)")
+        t.add_argument("-l", "--lang", default=None, help="Target language code or alias (default: saved setting)")
+        t.add_argument("-d", "--dir", default=None, help="Modpack / quests directory, or an instance name (default: auto-detect)")
+        t.add_argument("-c", "--context", default="", help="Custom translation context")
+        t.add_argument("--policy", default=None, choices=["complement", "overwrite", "skip"],
+                       help="Existing translations policy (default: saved setting)")
+        t.add_argument("--mix", action="store_true", help="Mixed Providers mode: use every saved key pool")
+        t.add_argument("--fastdir", "--fd", action="store_true", help="Pick an instance and translate with saved settings (no wizard)")
+        t.add_argument("--resource-pack", "-r", action="store_true", help="Resource Pack mode for JSON lang translation")
+        t.add_argument("--dry-run", action="store_true", help="Show what would be translated and exit")
+        t.add_argument("--no-titles", action="store_true", help="Skip quest titles")
+        t.add_argument("--no-subs", action="store_true", help="Skip quest subtitles")
+        t.add_argument("--no-desc", action="store_true", help="Skip quest descriptions")
+
+        a = parser.add_argument_group("advanced")
+        a.add_argument("--concurrency", type=int, default=None, help="Parallel files 1-10 (default: saved setting)")
+        a.add_argument("--batch-size", type=int, default=None, help="Strings per request (default: saved setting)")
+        a.add_argument("--min-batch-size", type=int, default=None, help="Minimum batch size before failing (default: saved setting)")
+        a.add_argument("--max-concurrent-requests", type=int, default=None, help="Max concurrent API requests (default: saved setting)")
+        a.add_argument("--temperature", type=float, default=None, help="LLM sampling temperature 0.0-2.0 (default: 0.1)")
+        a.add_argument("--base-url", default=None, help="Base URL for Custom / Ollama providers")
+        a.add_argument("--utility-provider", default=None, help="Provider for the glossary pre-scan (default: main)")
+        a.add_argument("--utility-model", default=None, help="Model for the glossary pre-scan (default: main)")
+
+        q = parser.add_argument_group("quality audit (QA)")
+        q.add_argument("--qa", dest="qa", action="store_true", default=None, help="Enable the QA judge pass")
+        q.add_argument("--no-qa", dest="qa", action="store_false", help="Disable the QA judge pass")
+        q.add_argument("--qa-provider", default=None, help="QA judge provider alias (default: saved / utility / main)")
+        q.add_argument("--qa-model", default=None, help="QA judge model (default: saved / utility / main)")
+
+        u = parser.add_argument_group("tools")
+        u.add_argument("--list-models", action="store_true", help="List available models for the provider and exit")
+        u.add_argument("--verify-keys", action="store_true", help="Test saved keys (and QA judges), show balances, exit")
+        u.add_argument("--cache", choices=["stats", "list", "search", "clear", "autofix", "heal"], default=None,
+                       help="Translation memory: stats | list | search | clear | autofix | heal")
+        u.add_argument("--search", default=None, help="Query for --cache search/list")
+        u.add_argument("--limit", type=int, default=None, help="Row limit for --cache list/search (default 50)")
+        u.add_argument("--modpack", default=None, help="Modpack filter for --cache list/search")
+        u.add_argument("--clear-cache", "--clear", action="store_true", help="Alias of --cache clear")
 
         parsed = parser.parse_args(args)
 
@@ -394,7 +440,7 @@ class ConfigManager:
             }
             self.policy = mapping.get(parsed.policy, "Complement (Дополнить)")
 
-        if parsed.concurrency:
+        if parsed.concurrency is not None:
             self.concurrency = max(1, min(parsed.concurrency, 10))
 
         if parsed.temperature is not None:
@@ -436,6 +482,30 @@ class ConfigManager:
                     seen.add(k)
                     unique.append(k)
             self.api_keys_pool[self.provider] = unique[:10]
+
+        if parsed.base_url:
+            self.custom_base_url = parsed.base_url.strip()
+        # QA flags are per-run overrides: never persist them into the shared GUI settings
+        self._persisted_qa = (self.qa_enabled, self.qa_provider, self.qa_model)
+        if parsed.qa is not None:
+            self.qa_enabled = bool(parsed.qa)
+        if parsed.qa_provider:
+            alias = parsed.qa_provider.lower()
+            if alias in PROVIDER_ALIASES:
+                self.qa_provider = PROVIDER_ALIASES[alias]
+            elif parsed.qa_provider in self.AVAILABLE_PROVIDERS:
+                self.qa_provider = parsed.qa_provider
+            else:
+                logging.getLogger("snbt_localizer.cli").error(f"Unknown QA provider alias: {parsed.qa_provider}")
+                sys.exit(1)
+            if not parsed.qa_model:
+                self.qa_model = ""
+        if parsed.qa_model:
+            self.qa_model = parsed.qa_model
+            if not self.qa_provider:
+                self.qa_provider = self.provider
+        if parsed.qa_provider or parsed.qa_model:
+            self.qa_enabled = True if parsed.qa is None else self.qa_enabled
 
         return parsed
 
@@ -482,8 +552,10 @@ class ConfigManager:
             ("opencode-", "OpenCode"),
             ("cr_", "Crusoe Cloud"),
             ("rp_", "RunInfra"),
+            ("shsk:", "Shisa"),
             ("AIza", "Google Gemini (Free API)"),
             ("AQ.", "Google Gemini (Free API)"),
+            ("sk-corvex-", "Corvex"),
             ("sk-proj-", "OpenAI"),
             ("sk-ant-", "Anthropic (Claude)"),
             ("sk-", "OpenAI"),

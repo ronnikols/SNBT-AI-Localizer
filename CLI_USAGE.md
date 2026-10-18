@@ -1,116 +1,91 @@
-# SNBT Localizer — CLI Usage
+# SNBT Localizer — CLI
 
-## Synopsis
 ```
 snbt-tr [options]
 ```
 
-## Options
+Without flags in a terminal the CLI opens the interactive wizard (instance → provider → key → model → language).
+Without a terminal (desktop launcher) it opens the GUI. Settings are shared with the GUI (QSettings `MineAI/SNBT-Localizer`).
+Output is colored via `rich`; `--no-color` or `NO_COLOR=1` gives plain text.
 
-### Global Flags
-| Short | Long | Description | Default |
-|-------|------|-------------|---------|
-| `-h` | `--help` | Show this help message and exit | N/A |
-| | `--gui` | Launch Graphical User Interface (PyQt6) with dual-tab interface | False |
-| | `--debug` | Enable debug logging to console | False |
-| | `--mix` | Enable Mixed Provider mode (auto-balancing across configured providers) | False |
-| | `--clear-cache` | Clear translation cache and exit (alias: `--clear`) | N/A |
-| | `--fastdir` | Scan launcher paths for Minecraft instances and exit (alias: `--fd`) | N/A |
+## General
+| Flag | Description |
+|------|-------------|
+| `-h, --help` | Help |
+| `--version` | Print version |
+| `--gui` | Launch the GUI |
+| `--debug` | Debug logs in the console (file log: `~/.snbt_localizer/logs/app.log`) |
+| `--no-color` | Plain output |
+| `-y, --yes` | Assume yes for confirmations |
 
-### Translation Configuration
-| Short | Long | Description | Default |
-|-------|------|-------------|---------|
-| `-p` | `--provider` | Provider alias: `google`, `gemini`, `groq`, `openrouter`, `nvidia`, `nim`, `sambanova`, `openai`, `mistral`, `ollama` | N/A |
-| `-m` | `--model` | Model name (default: provider default) | N/A |
-| `-k` | `--key` | API key(s), comma-separated (fallback: env var, QSettings) | N/A |
-| `-l` | `--lang` | Target language code (default: `ru`) | `ru` |
-| `-d` | `--dir` | Path to quests directory (default: current directory) | `.` |
-| `-c` | `--context` | Custom translation context | "" |
-| | `--policy` | Policy for existing localized files: `complement`, `overwrite`, `skip` | `complement` |
-| | `--concurrency` | Number of parallel translation threads (1-10) | 3 |
-| | `--batch-size` | Number of texts per API request (1-500) | 50 |
-| | `--min-batch` | Minimum batch size for fallback (1-50) | 1 |
+## Translation
+| Flag | Description |
+|------|-------------|
+| `-p, --provider` | Provider alias (table below) |
+| `-m, --model` | Model; `key\model` pairs are accepted in `-k` for Mixed |
+| `-k, --key` | API key(s), comma-separated (fallback: env, saved pool) |
+| `-l, --lang` | Language: `ru`, `uk`, `ru_ru` or `Russian` |
+| `-d, --dir` | Modpack / quests dir or instance name |
+| `-c, --context` | Custom translation context |
+| `--policy` | `complement` / `overwrite` / `skip` |
+| `--mix` | Mixed Providers: all saved key pools |
+| `--fastdir, --fd` | Pick an instance and translate with saved settings |
+| `-r, --resource-pack` | Resource Pack mode for KubeJS lang files |
+| `--dry-run` | Show the files that would be translated; never writes settings |
+| `--no-titles / --no-subs / --no-desc` | Skip titles / subtitles / descriptions (GUI checkboxes) |
 
-## Provider Aliases
-| Alias | Full Name |
-|-------|-----------|
-| `google` | Google Translate (Free) |
-| `gemini` | Google Gemini (Free API) |
-| `ollama` | Ollama (Local / Free) |
-| `groq` | Groq Cloud (Fast) |
-| `openrouter` | OpenRouter (Cloud AI) |
-| `nvidia` | NVIDIA NIM |
-| `nim` | NVIDIA NIM (alias) |
-| `sambanova` | Sambanova |
-| `openai` | OpenAI |
-| `mistral` | Mistral AI |
+## Advanced
+| Flag | Description |
+|------|-------------|
+| `--concurrency N` | Parallel files 1-10 |
+| `--batch-size N`, `--min-batch-size N` | Strings per request / minimum before failing |
+| `--max-concurrent-requests N` | Max concurrent API requests |
+| `--temperature T` | 0.0-2.0 |
+| `--base-url URL` | Base URL for Custom / Ollama |
+| `--utility-provider`, `--utility-model` | Model for the glossary pre-scan |
 
-## Language Codes
-| Code | Language |
-|------|----------|
-| `ru` | Russian (ru_ru) |
-| `en` | English (en_us) |
-| `es` | Spanish (es_es) |
-| `zh` | Chinese Simplified (zh_cn) |
-| `zh-tw` | Chinese Traditional (zh_tw) |
-| `de` | German (de_de) |
-| `fr` | French (fr_fr) |
-| `pt` | Portuguese (pt_br) |
-| `ja` | Japanese (ja_jp) |
-| `ko` | Korean (ko_kr) |
+## Quality audit (QA)
+| Flag | Description |
+|------|-------------|
+| `--qa / --no-qa` | Enable / disable the judge pass for this run (not saved) |
+| `--qa-provider`, `--qa-model` | Judge provider / model for this run |
 
-## Environment Variables
-| Variable | Provider |
-|----------|----------|
-| `GEMINI_API_KEY` | Google Gemini |
-| `GROQ_API_KEY` | Groq |
-| `OPENROUTER_API_KEY` | OpenRouter |
-| `NVIDIA_API_KEY` | NVIDIA NIM (preferred) |
-| `NVIDIA_NIM_API_KEY` | NVIDIA NIM (fallback) |
-| `SAMBANOVA_API_KEY` | Sambanova |
-| `OPENAI_API_KEY` | OpenAI |
-| `MISTRAL_API_KEY` | Mistral AI |
+Judges and jury threshold are configured in the GUI (Settings → QA) and are used by the CLI as-is.
+
+## Tools
+| Flag | Description |
+|------|-------------|
+| `--list-models` | Models of the provider |
+| `--verify-keys` | Test keys (+ QA judges), show balance |
+| `--cache stats` | Translation memory size |
+| `--cache list [--modpack M] [--limit N]` | Browse records |
+| `--cache search --search TEXT` | Search originals / translations |
+| `--cache autofix` | Repair broken records |
+| `--cache heal` | Find wrong-script translations and re-translate them |
+| `--cache clear`, `--clear-cache` | Clear the cache (asks unless `-y`) |
+
+## Provider aliases
+`google`, `gemini`, `ollama`, `groq`, `openrouter`, `nvidia`/`nim`, `sambanova`, `opencode`, `openai`, `mistral`,
+`anthropic`/`claude`, `cohere`, `local`/`custom`, `crusoe`, `runinfra`, `shisa`, `corvex`, `mixed`/`mix`.
+
+## Languages
+`ru`, `uk`, `en`, `es`, `zh`, `zh-tw`, `de`, `fr`, `pt`, `ja`, `ko`.
 
 ## Examples
-
-### List Models
 ```bash
-snbt-tr --list-models -p groq
-snbt-tr --list-models --provider nvidia
+snbt-tr                                   # wizard
+snbt-tr --fd                              # pick instance, saved settings
+snbt-tr -d "Vortex 1.1.2b" -p groq -m llama-3.3-70b-versatile -l uk
+snbt-tr --mix -d ~/modpack -k "gsk_...,nvapi-...\meta/llama-3.3-70b-instruct"
+snbt-tr --fd --dry-run --no-desc
+snbt-tr -p corvex --verify-keys
+snbt-tr --cache search --search "Iron Ingot"
+snbt-tr --cache heal
 ```
 
-### Non-Interactive Translation (CI/CD)
-```bash
-snbt-tr -d ~/modpack -p groq -m llama-3.3-70b-versatile -k $GROQ_KEY -l ru
-snbt-tr --dir /opt/minecraft/quests --provider openrouter --model google/gemma-4-31b:free --key $OPENROUTER_KEY
-```
-
-### Mixed Provider Mode
-```bash
-snbt-tr --mix -d ~/modpack -k "gsk_...,nvapi-...,sk-or-..."
-```
-
-### Interactive Mode (TTY)
-```bash
-snbt-tr -d ~/modpack
-```
-
-### With Custom Context
-```bash
-snbt-tr -d ./quests -p gemini -c "Medieval fantasy modpack with magic and dragons" -l en
-```
-
-### Utility Commands
-```bash
-snbt-tr --clear-cache
-snbt-tr --fastdir
-```
-
-## Exit Codes
+## Exit codes
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Missing/invalid argument, auth error, path error |
-| 2 | Network/API error |
-| 3 | Translation/processing error |
+| 1 | Invalid argument, path, keys or translation error |
 | 130 | Interrupted (Ctrl+C) |
